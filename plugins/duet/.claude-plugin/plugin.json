@@ -1,0 +1,11 @@
+{
+  "name": "duet",
+  "version": "0.1.0",
+  "description": "Pair Claude and Codex as peer agents in adjacent tmux panes. They collaborate by passing messages through a file-backed mailbox with tmux 'doorbell' notifications — a push protocol, not screen-scraping.",
+  "author": {
+    "name": "Jonathan Rosado",
+    "url": "https://github.com/JonathanRosado"
+  },
+  "homepage": "https://github.com/JonathanRosado/duet-agents",
+  "keywords": ["codex", "tmux", "multi-agent", "pair-programming", "orchestration", "duet"]
+}

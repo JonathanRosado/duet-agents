@@ -1,0 +1,14 @@
+{
+  "name": "duet-agents",
+  "owner": {
+    "name": "Jonathan Rosado",
+    "url": "https://github.com/JonathanRosado"
+  },
+  "plugins": [
+    {
+      "name": "duet",
+      "source": "./plugins/duet",
+      "description": "Pair Claude with a live Codex agent in adjacent tmux panes — real-time, bidirectional, push-based collaboration through a file-backed mailbox (no polling, no screen-scraping)."
+    }
+  ]
+}
