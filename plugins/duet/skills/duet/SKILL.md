@@ -1,21 +1,29 @@
 ---
-description: Pair this Claude with a live Codex agent in an adjacent tmux pane for real-time, bidirectional, synchronous collaboration (a "duet"). Messages are delivered inline straight into each agent's prompt (no file to read, no polling), turn-taking keeps them in sync, and either side can interrupt the other. Use when the user wants Claude and Codex to work together interactively, debate an approach, or cross-check each other.
+description: Pair this Claude with a live Codex agent in an adjacent tmux or psmux pane for real-time, bidirectional, synchronous collaboration (a "duet"). Messages are delivered inline straight into each agent's prompt (no file to read, no polling), turn-taking keeps them in sync, and either side can interrupt the other. Use when the user wants Claude and Codex to work together interactively, debate an approach, or cross-check each other.
 ---
 
 # Duet: Claude + Codex, side by side
 
-This pairs you (Claude) with a live **Codex** agent in the adjacent tmux pane. You
-collaborate as peers by exchanging messages that arrive **inline** — each message is
+This pairs you (Claude) with a live **Codex** agent in the adjacent tmux or psmux
+pane. You collaborate as peers by exchanging messages that arrive **inline** — each message is
 injected directly into the recipient's prompt (bracketed paste), so nobody reads a
 file or polls. Turn-taking keeps you in sync; either side can interrupt the other.
 
 ## 0. Preconditions
-- You MUST be inside tmux. If `$TMUX` is empty, STOP and tell the user:
-  "Relaunch me inside tmux first:  `tmux new-session claude`  — then run `/duet:duet`."
+- You MUST be inside tmux or psmux. If `$TMUX` is empty, STOP and tell the user:
+  "Relaunch me in a multiplexer first: macOS/Linux `tmux new-session claude`; Windows `psmux new-session -s duet -- claude`; then run `/duet:duet`."
 - `codex` must be installed and already authenticated.
 
 ## 1. Start
-Run:
+On Windows, run the PowerShell script. If your shell is PowerShell:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-init.ps1"
+
+If your shell is Bash/Git Bash on Windows:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-init.ps1"
+
+On macOS/Linux, run:
 
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-init.sh"
 
@@ -27,7 +35,19 @@ starts the relay. Tell the user Codex is booting, then **send it the first messa
 **Receiving.** A message from Codex arrives as a normal user prompt whose first line
 is `[DUET from codex]`. Everything after is Codex's message — read it, act, reply.
 
-**Sending.** To message Codex (body on stdin):
+**Sending.** To message Codex on Windows (body on stdin). If your shell is PowerShell:
+
+    @'
+    ...your message to Codex...
+    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" codex
+
+If your shell is Bash/Git Bash on Windows:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-send.ps1" codex <<'DUET_EOF'
+    ...your message to Codex...
+    DUET_EOF
+
+To message Codex on macOS/Linux:
 
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex <<'DUET_EOF'
     ...your message to Codex...
@@ -37,7 +57,20 @@ is `[DUET from codex]`. Everything after is Codex's message — read it, act, re
 reply arrives as the next `[DUET from codex]` prompt and wakes you. One message per
 reply; never send twice in a row.
 
-**Interrupting.** To barge in while Codex is mid-task, add `--interrupt`:
+**Interrupting.** To barge in while Codex is mid-task, add `-Interrupt` on
+Windows or `--interrupt` on macOS/Linux:
+
+PowerShell:
+
+    @'
+    Stop - let's reconsider: ...
+    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" codex -Interrupt
+
+Bash/Git Bash on Windows:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-send.ps1" codex -Interrupt <<'DUET_EOF'
+    Stop - let's reconsider: ...
+    DUET_EOF
 
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex --interrupt <<'DUET_EOF'
     Stop — let's reconsider: ...
@@ -54,11 +87,30 @@ also type into either pane at any time — both are theirs.
 ## 4. Ending
 When done (or the user says stop):
 
+On Windows:
+
+PowerShell:
+
+    @'
+    DUET-END - wrapping up. Summary: ...
+    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" codex
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-end.ps1"
+
+Bash/Git Bash on Windows:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-send.ps1" codex <<'DUET_EOF'
+    DUET-END - wrapping up. Summary: ...
+    DUET_EOF
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-end.ps1"
+
+On macOS/Linux:
+
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex <<'DUET_EOF'
     DUET-END — wrapping up. Summary: ...
     DUET_EOF
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-end.sh"
 
 ## Escape hatch
+- Windows: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-status.ps1"` — session state, transcript tail, Codex pane peek.
 - `bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-status.sh"` — session state, transcript tail, Codex pane peek.
-- Full transcript persists at `~/.duet/<timestamp>/transcript.md`.
+- Full transcript persists at `~/.duet/<timestamp>/transcript.md` on macOS/Linux and `~\.duet\<timestamp>\transcript.md` on Windows.

@@ -1,8 +1,8 @@
 # duet-agents
 
 Pair **Claude Code** and **Codex CLI** as two peer agents that collaborate in real
-time, side by side in tmux. You talk to Claude; Claude and Codex talk to each other;
-you watch both work in adjacent panes and can interrupt either one.
+time, side by side in tmux or psmux. You talk to Claude; Claude and Codex talk to
+each other; you watch both work in adjacent panes and can interrupt either one.
 
 This repo is a **Claude Code plugin marketplace**. Installing the `duet` plugin gives
 Claude a `/duet:duet` skill that spins the whole thing up.
@@ -48,7 +48,8 @@ can re-read the thread to recover context.
 
 ## Requirements
 
-- [`tmux`](https://github.com/tmux/tmux)
+- macOS/Linux: [`tmux`](https://github.com/tmux/tmux)
+- Windows: [`psmux`](https://github.com/psmux/psmux)
 - [Claude Code](https://claude.com/claude-code) — `claude` on PATH
 - [Codex CLI](https://github.com/openai/codex) — `codex` on PATH, already authenticated
 
@@ -65,10 +66,19 @@ repo carries Codex's side of the protocol, and the skill briefs it automatically
 
 ## Use
 
-Claude must be running **inside tmux** (that's how both agents get visible panes):
+Claude must be running inside a multiplexer (that's how both agents get visible
+panes).
+
+macOS/Linux:
 
 ```bash
 tmux new-session claude
+```
+
+Windows:
+
+```powershell
+psmux new-session -s duet -- claude
 ```
 
 Then, in that Claude session:
@@ -94,11 +104,16 @@ plugins/duet/
 ├── codex/AGENTS_BRIEF.md             # Codex's durable protocol (-> AGENTS.md at launch)
 ├── claude/CLAUDE_BRIEF.md            # Claude's durable protocol (-> CLAUDE.md at launch)
 └── scripts/
-    ├── duet-init.sh                  # anchor protocol, split window, launch Codex, start relay
-    ├── duet-send.sh                  # send a message inline (direct to Codex; via relay to Claude)
-    ├── duet-relay.sh                 # optional (DUET_RELAY=1): Codex→Claude inject when Codex is sandboxed
-    ├── duet-status.sh                # inspect a running duet
-    └── duet-end.sh                   # tear down + strip the durable blocks
+    ├── duet-init.sh                  # macOS/Linux: anchor protocol, split tmux, launch Codex
+    ├── duet-send.sh                  # macOS/Linux: send a message inline
+    ├── duet-relay.sh                 # macOS/Linux optional relay
+    ├── duet-status.sh                # macOS/Linux: inspect a running duet
+    ├── duet-end.sh                   # macOS/Linux: tear down
+    ├── duet-init.ps1                 # Windows: anchor protocol, split psmux, launch Codex
+    ├── duet-send.ps1                 # Windows: send via psmux send-paste
+    ├── duet-relay.ps1                # Windows optional relay
+    ├── duet-status.ps1               # Windows: inspect a running duet
+    └── duet-end.ps1                  # Windows: tear down
 ```
 
 ## Safety notes
@@ -107,10 +122,10 @@ plugins/duet/
   filesystem + network, no approval prompts (the same footing as a Claude run with
   `--dangerously-skip-permissions`). Tighten it with `DUET_CODEX_SANDBOX` /
   `DUET_CODEX_APPROVAL` (and add `DUET_RELAY=1` if you drop below tmux-socket access).
-- `duet-init.sh` marks the working dir trusted in `~/.codex/config.toml` (exactly what
+- `duet-init.sh` / `duet-init.ps1` marks the working dir trusted in `~/.codex/config.toml` (exactly what
   Codex's own "Yes, continue" writes) so Codex doesn't stall on a trust dialog at boot.
 - The durable blocks in `AGENTS.md`/`CLAUDE.md` are delimited with `DUET:BEGIN/END`
-  markers and removed by `duet-end.sh`; your own content is never touched.
+  markers and removed by `duet-end.sh` / `duet-end.ps1`; your own content is never touched.
 
 ## License
 
