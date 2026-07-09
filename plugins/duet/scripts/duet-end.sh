@@ -2,6 +2,9 @@
 # duet-end.sh — tear down: stop the relay, strip the durable protocol blocks, close
 # Codex's pane. The transcript under ~/.duet/<stamp>/ is kept.
 set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+. "$SELF_DIR/duet-common.sh"
 cfg="${DUET_CONFIG:-$HOME/.duet/current/duet.env}"
 # shellcheck disable=SC1090
 . "$cfg" 2>/dev/null || { echo "duet: no active session"; exit 0; }
@@ -15,8 +18,9 @@ strip(){  # remove the DUET block; delete the file if nothing else remains
 strip "${WORKDIR:-}/AGENTS.md"
 strip "${WORKDIR:-}/CLAUDE.md"
 
-if [ -n "${CODEX_PANE:-}" ]; then
+if [ -n "${CODEX_PANE:-}" ] && _duet_alive "$CODEX_PANE"; then
   tmux send-keys -t "$CODEX_PANE" C-c 2>/dev/null || true
+  sleep 0.3
   tmux kill-pane -t "$CODEX_PANE" 2>/dev/null || true
 fi
 echo "duet: ended. Transcript kept at $DUET_DIR/transcript.md"

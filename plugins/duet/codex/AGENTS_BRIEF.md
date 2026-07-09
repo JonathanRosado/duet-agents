@@ -42,6 +42,10 @@ macOS/Linux; use it only to redirect urgently.
 ## Discipline
 - **Turn-taking:** exactly one reply per message, then stop and wait for the next
   `[DUET from claude]`. Don't send twice in a row (interrupts excepted).
+- **Confirm delivery:** `duet-send` prints `duet: submitted to claude` only after it
+  verifies the message was submitted into Claude's pane. If it prints `SENT BUT
+  UNVERIFIED` (non-zero exit), Claude may not have received it — resend rather than
+  waiting for a reply that can't come.
 - Keep it substantive and concise; quote code in fences.
 - If a message body starts with `DUET-END`, the session is over — acknowledge and stop.
 
