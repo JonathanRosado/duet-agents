@@ -39,6 +39,11 @@ or `--interrupt` after `codex` on macOS/Linux to barge in while Codex is working
 **After you send, END YOUR TURN and wait** — Codex's reply arrives as the next
 `[DUET from codex]` prompt and wakes you. Never send twice in a row.
 
+`duet-send` verifies the message was submitted into Codex's pane before printing
+`duet: submitted to codex`. If it prints `SENT BUT UNVERIFIED` (non-zero exit), the
+message may not have been received — don't wait for a reply; run `duet-status` /
+`duet-doctor` and resend.
+
 ## Recovery
 Lost the thread after `/clear` or compaction? Read `~/.duet/current/transcript.md`
 on macOS/Linux, or the path in `~\.duet\current.txt` on Windows, to catch up, then continue.

@@ -5,11 +5,22 @@
 set -euo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SELF_DIR/.." && pwd)"
+# shellcheck disable=SC1091
+. "$SELF_DIR/duet-common.sh"
 [ -n "${TMUX:-}" ]        || { echo "duet: not inside tmux. Start Claude with:  tmux new-session claude" >&2; exit 3; }
 command -v codex >/dev/null || { echo "duet: 'codex' CLI not found on PATH" >&2; exit 4; }
 
 CLAUDE_PANE="${TMUX_PANE:?duet: no TMUX_PANE}"
 CODEX="$(command -v codex)"
+
+# Reap any prior session's Codex before spawning a new one, so exactly one Codex
+# exists per role and messages can't route to an orphaned, context-less agent
+# (issue #3). Read the OLD current pointer before we repoint it below.
+PREV_ENV="$HOME/.duet/current/duet.env"
+if [ -f "$PREV_ENV" ]; then
+  # shellcheck disable=SC1090
+  ( . "$PREV_ENV"; duet_reap_prev "${DUET_DIR:-}" "${CODEX_PANE:-}" ) || true
+fi
 STAMP="$(date +%Y%m%d-%H%M%S)"
 DUET_DIR="$HOME/.duet/$STAMP"
 mkdir -p "$DUET_DIR/to-claude/delivered"
@@ -45,10 +56,17 @@ CODEX_PANE="$(tmux split-window -h -t "$CLAUDE_PANE" -P -F '#{pane_id}' \
   "cd $(printf %q "$PWD") && exec $(printf %q "$CODEX") --add-dir $(printf %q "$DUET_DIR") -s $(printf %q "$CX_SANDBOX") -a $(printf %q "$CX_APPROVAL")")"
 tmux select-pane -t "$CLAUDE_PANE"
 
+# Record pane pids for diagnostics (duet-status / duet-doctor). Not used to gate
+# sends - tmux reports the transient foreground pid.
+CLAUDE_PANE_PID="$(tmux display-message -p -t "$CLAUDE_PANE" '#{pane_pid}' 2>/dev/null || echo)"
+CODEX_PANE_PID="$(tmux display-message -p -t "$CODEX_PANE" '#{pane_pid}' 2>/dev/null || echo)"
+
 cat > "$DUET_DIR/duet.env" <<EOF
 DUET_DIR=$DUET_DIR
 CLAUDE_PANE=$CLAUDE_PANE
 CODEX_PANE=$CODEX_PANE
+CLAUDE_PANE_PID=$CLAUDE_PANE_PID
+CODEX_PANE_PID=$CODEX_PANE_PID
 PLUGIN_DIR=$PLUGIN_DIR
 WORKDIR=$PWD
 DUET_RELAY=${DUET_RELAY:-}
@@ -64,9 +82,8 @@ fi
 # --- wait for Codex to boot, then kick it to confirm readiness -----------------
 for _ in $(seq 1 25); do tmux capture-pane -t "$CODEX_PANE" -p 2>/dev/null | grep -q 'OpenAI Codex' && break; sleep 1; done
 sleep 5
-printf '%s' "You are briefed via AGENTS.md in this directory. Confirm now by running this shell command: printf ok > $DUET_DIR/codex-ready  — then wait for messages from Claude." \
-  | tmux load-buffer -b duetkick -
-tmux paste-buffer -b duetkick -p -t "$CODEX_PANE"; tmux send-keys -t "$CODEX_PANE" Enter
+kick="You are briefed via AGENTS.md in this directory. Confirm now by running this shell command: printf ok > $DUET_DIR/codex-ready - then wait for messages from Claude."
+duet_send_verified "$CODEX_PANE" "$kick" "" || true
 ready=no; for _ in $(seq 1 30); do [ -f "$DUET_DIR/codex-ready" ] && { ready=yes; break; }; sleep 1; done
 
 if [ "$ready" = yes ]; then
@@ -82,7 +99,8 @@ EOF
 else
 cat <<EOF
 duet: session up but Codex did not confirm readiness in time. Check its pane
-(right split). You can still try sending; if it stalls, run duet-status.sh.
+(right split). You can still try sending; if it stalls, run duet-status.sh or
+duet-doctor.sh.
   claude=$CLAUDE_PANE  codex=$CODEX_PANE   dir=$DUET_DIR
 EOF
 fi

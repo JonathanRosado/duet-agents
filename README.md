@@ -32,8 +32,15 @@ including code fences). The recipient sees a normal prompt — it never reads a 
 there's **no read-hop**, and the conversation is synchronous:
 
 - **Turn-taking** keeps the two in sync — each speaks, then waits.
+- **Verified delivery:** a paste is confirmed to have landed in the peer's composer and
+  been *submitted* (the Enter is retried if it raced the bracketed paste) before the send
+  reports `submitted`; an unconfirmed send says `SENT BUT UNVERIFIED` and exits non-zero
+  instead of a false `delivered`, so a stall is diagnosable. Re-running init reaps the
+  prior session's Codex, so a stale, context-less agent never shadows the current one.
+  `duet-doctor` lists panes and reaps orphans if one ever slips through.
 - **Interruption** is first-class: either side (or you) can barge in with `Esc` +
-  message to redirect the other mid-task.
+  message to redirect the other mid-task (only when the peer is actually busy, so it
+  can't clobber an idle composer).
 - **Symmetric and direct:** both agents run with enough access to drive tmux, so each
   injects straight into the other's pane. Codex runs as a **full peer** by default —
   full filesystem + network, no approval prompts (the same footing as a Claude launched
@@ -104,15 +111,19 @@ plugins/duet/
 ├── codex/AGENTS_BRIEF.md             # Codex's durable protocol (-> AGENTS.md at launch)
 ├── claude/CLAUDE_BRIEF.md            # Claude's durable protocol (-> CLAUDE.md at launch)
 └── scripts/
+    ├── duet-common.sh                # macOS/Linux: shared helpers (verified paste->submit)
     ├── duet-init.sh                  # macOS/Linux: anchor protocol, split tmux, launch Codex
-    ├── duet-send.sh                  # macOS/Linux: send a message inline
+    ├── duet-send.sh                  # macOS/Linux: send a message inline (verified)
     ├── duet-relay.sh                 # macOS/Linux optional relay
     ├── duet-status.sh                # macOS/Linux: inspect a running duet
+    ├── duet-doctor.sh                # macOS/Linux: list panes, reap orphaned agents
     ├── duet-end.sh                   # macOS/Linux: tear down
+    ├── duet-common.ps1               # Windows: shared helpers (verified paste->submit)
     ├── duet-init.ps1                 # Windows: anchor protocol, split psmux, launch Codex
-    ├── duet-send.ps1                 # Windows: send via psmux send-paste
+    ├── duet-send.ps1                 # Windows: send via psmux send-paste (verified)
     ├── duet-relay.ps1                # Windows optional relay
     ├── duet-status.ps1               # Windows: inspect a running duet
+    ├── duet-doctor.ps1               # Windows: list panes, reap orphaned agents
     └── duet-end.ps1                  # Windows: tear down
 ```
 

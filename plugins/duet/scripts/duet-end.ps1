@@ -14,15 +14,12 @@ try {
   exit 0
 }
 
-Write-DuetUtf8NoBom -Path (Join-Path $cfg.DUET_DIR ".ended") -Value ""
 Remove-DuetBlock -Path (Join-Path $cfg.WORKDIR "AGENTS.md")
 Remove-DuetBlock -Path (Join-Path $cfg.WORKDIR "CLAUDE.md")
 
-if ($cfg.CODEX_PANE) {
-  $psmux = Get-DuetPsmux
-  & $psmux send-keys -t $cfg.CODEX_PANE C-c 2>$null | Out-Null
-  & $psmux kill-pane -t $cfg.CODEX_PANE 2>$null | Out-Null
-}
+# Signals the relay to exit and kills the Codex pane - but only if that pane id
+# still belongs to this session's Codex process (pid-guarded).
+Stop-DuetSessionByConfig -Config $cfg -KillCodexPane
 
 Write-Host "duet: ended. Transcript kept at $($cfg.DUET_DIR)\transcript.md"
 exit 0

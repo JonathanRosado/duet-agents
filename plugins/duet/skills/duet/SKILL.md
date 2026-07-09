@@ -31,6 +31,9 @@ This anchors the protocol in `AGENTS.md`/`CLAUDE.md` (so it survives `/clear` an
 compaction), splits the window, launches Codex (which reads its brief at boot), and
 starts the relay. Tell the user Codex is booting, then **send it the first message.**
 
+Re-running init is safe: it reaps the previous session's Codex first, so you never
+end up with a stale, context-less agent shadowing the current one.
+
 ## 2. The protocol
 **Receiving.** A message from Codex arrives as a normal user prompt whose first line
 is `[DUET from codex]`. Everything after is Codex's message — read it, act, reply.
@@ -56,6 +59,13 @@ To message Codex on macOS/Linux:
 **After you send, END YOUR TURN and wait.** Do not keep working or narrate — Codex's
 reply arrives as the next `[DUET from codex]` prompt and wakes you. One message per
 reply; never send twice in a row.
+
+**Delivery is verified.** `duet-send` confirms the message actually landed in the
+peer's composer and was submitted (it retries the Enter if the first raced the paste)
+before printing `duet: submitted to <peer>`. If it instead prints `SENT BUT UNVERIFIED`
+and exits non-zero, the peer may **not** have received it — do NOT assume delivery.
+Check with `duet-status`/`duet-doctor`, confirm the peer's pane is alive, and resend
+rather than waiting forever for a reply that can't come.
 
 **Interrupting.** To barge in while Codex is mid-task, add `-Interrupt` on
 Windows or `--interrupt` on macOS/Linux:
@@ -111,6 +121,10 @@ On macOS/Linux:
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-end.sh"
 
 ## Escape hatch
-- Windows: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-status.ps1"` — session state, transcript tail, Codex pane peek.
+- Windows: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-status.ps1"` — session state (incl. pane liveness), transcript tail, Codex pane peek.
 - `bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-status.sh"` — session state, transcript tail, Codex pane peek.
+- If a peer seems unresponsive or a send reports `UNVERIFIED`, run the doctor to list
+  panes and find/reap orphaned agents:
+  Windows `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-doctor.ps1"` (add `-Reap` to kill orphans);
+  macOS/Linux `bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-doctor.sh"` (add `--reap`).
 - Full transcript persists at `~/.duet/<timestamp>/transcript.md` on macOS/Linux and `~\.duet\<timestamp>\transcript.md` on Windows.

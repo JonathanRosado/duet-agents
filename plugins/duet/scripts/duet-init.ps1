@@ -24,8 +24,25 @@ $psmux = Get-DuetPsmux
 $PluginDir = (Resolve-Path (Join-Path $SelfDir "..")).Path
 $ClaudePane = $env:TMUX_PANE
 $Workdir = (Get-Location).Path
-$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $DuetRoot = Join-Path $HOME ".duet"
+
+# Reap any prior session's agents BEFORE spawning new ones, so there is exactly
+# one Codex per role and messages can't route to an orphaned, context-less agent
+# (issue #3). We never touch the current Claude pane, only the prior Codex pane.
+$PrevConfigPath = Join-Path $DuetRoot "current.env.ps1"
+if (Test-Path -LiteralPath $PrevConfigPath) {
+  try {
+    $prev = Import-DuetConfig -Path $PrevConfigPath
+    if ($prev.CODEX_PANE -and (Test-DuetPaneAlive -Pane $prev.CODEX_PANE)) {
+      Write-Host "duet: reaping previous session's Codex (pane $($prev.CODEX_PANE), dir $($prev.DUET_DIR))"
+    }
+    Stop-DuetSessionByConfig -Config $prev -KillCodexPane
+  } catch {
+    Write-Warning "duet: could not fully reap previous session: $($_.Exception.Message)"
+  }
+}
+
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $DuetDir = Join-Path $DuetRoot $Stamp
 $ToClaude = Join-Path $DuetDir "to-claude"
 $Delivered = Join-Path $ToClaude "delivered"
@@ -89,12 +106,22 @@ if ($LASTEXITCODE -ne 0 -or -not $CodexPane) {
 }
 & $psmux select-pane -t $ClaudePane | Out-Null
 
+# Record the panes' process ids so send-time can confirm a pane id wasn't
+# recycled onto a different process (guards the duplicate-%N routing, issue #3).
+$paneRecords = @(Get-DuetPaneRecords)
+$claudeRec = @($paneRecords | Where-Object { $_.Id -eq $ClaudePane })
+$codexRec = @($paneRecords | Where-Object { $_.Id -eq $CodexPane })
+$ClaudePanePid = if ($claudeRec.Count -gt 0) { $claudeRec[0].Pid } else { "" }
+$CodexPanePid = if ($codexRec.Count -gt 0) { $codexRec[0].Pid } else { "" }
+
 $DuetRelay = if ($env:DUET_RELAY) { $env:DUET_RELAY } else { "" }
 $EnvPath = Join-Path $DuetDir "duet.env.ps1"
 $EnvText = @"
 `$DUET_DIR = $(ConvertTo-DuetPsLiteral $DuetDir)
 `$CLAUDE_PANE = $(ConvertTo-DuetPsLiteral $ClaudePane)
 `$CODEX_PANE = $(ConvertTo-DuetPsLiteral $CodexPane)
+`$CLAUDE_PANE_PID = $(ConvertTo-DuetPsLiteral $ClaudePanePid)
+`$CODEX_PANE_PID = $(ConvertTo-DuetPsLiteral $CodexPanePid)
 `$PLUGIN_DIR = $(ConvertTo-DuetPsLiteral $PluginDir)
 `$WORKDIR = $(ConvertTo-DuetPsLiteral $Workdir)
 `$DUET_RELAY = $(ConvertTo-DuetPsLiteral $DuetRelay)
@@ -124,7 +151,7 @@ for ($i = 0; $i -lt 25; $i++) {
 Start-Sleep -Seconds 5
 $ReadyFile = Join-Path $DuetDir "codex-ready"
 $kick = "You are briefed via AGENTS.md in this directory. Confirm now by running this shell command: Set-Content -LiteralPath $(ConvertTo-DuetPsLiteral $ReadyFile) -Value ok -NoNewline ; then wait for messages from Claude."
-Send-DuetPaste -Pane $CodexPane -Text $kick
+$null = Send-DuetPaste -Pane $CodexPane -Text $kick
 
 $ready = $false
 for ($i = 0; $i -lt $ReadyTimeoutSeconds; $i++) {
@@ -148,7 +175,8 @@ Barge in while Codex is working with -Interrupt.
 } else {
   @"
 duet: session up but Codex did not confirm readiness in time. Check its pane
-(right split). You can still try sending; if it stalls, run duet-status.ps1.
+(right split). You can still try sending; if it stalls, run duet-status.ps1 or
+duet-doctor.ps1.
   claude=$ClaudePane  codex=$CodexPane   dir=$DuetDir
 "@
 }
