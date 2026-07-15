@@ -73,11 +73,36 @@ if (-not $Reap) {
   exit 0
 }
 
+# Reap at the OS-process level, not the pane level. On the Windows/psmux build a
+# recycled/aliased pane id makes `kill-pane` misroute onto the live Claude pane
+# (it can tear down this very session); Stop-Process on the pane's foreground pid
+# is precise and cannot misroute. We never touch a pid that is the current Claude,
+# a multiplexer, or an ancestor of a protected pane (see Test-DuetPidProtected).
+$table = Get-DuetProcessTable
+$protected = @($PID)
+foreach ($pane in @($selfPane, $curClaude, $curCodex)) {
+  if (-not $pane) { continue }
+  foreach ($p in @(Get-DuetPanePidSet -Pane $pane)) {
+    $n = 0; if ([int]::TryParse($p, [ref]$n)) { $protected += $n }
+  }
+}
 foreach ($o in $orphans) {
   Write-Host "reaping $($o.Id) (pid $($o.Pid), $($o.Cmd)) ..."
-  & $psmux send-keys -t $o.Id C-c 2>$null | Out-Null
-  Start-Sleep -Milliseconds 300
-  & $psmux kill-pane -t $o.Id 2>$null | Out-Null
+  $killed = @(); $spared = @()
+  foreach ($p in ($o.Pid -split '\s+')) {
+    $n = 0
+    if (-not [int]::TryParse($p, [ref]$n)) { continue }
+    if (Test-DuetPidProtected -TargetPid $n -ProtectedPids ([int[]]$protected) -Table $table) {
+      $spared += $n
+    } else {
+      try { Stop-Process -Id $n -Force -ErrorAction Stop; $killed += $n } catch { $spared += $n }
+    }
+  }
+  if ($killed.Count -gt 0) {
+    Write-Host "  killed pid(s) [$($killed -join ',')]"
+  } else {
+    Write-Host "  spared [$($spared -join ',')] - protected (current Claude / multiplexer / ancestor); not killed"
+  }
 }
 Write-Host "done."
 exit 0

@@ -244,6 +244,70 @@ function Send-DuetPaste {
 # relay to exit and kills its Codex pane so exactly one agent exists per role.
 # --------------------------------------------------------------------------
 
+function Get-DuetPanePidSet {
+  # The set of process ids (as strings) currently backing a pane id, unioned and
+  # tokenized. On the Windows/psmux build `pane_pid` can be a space-joined list
+  # (shell + children) and one pane id may appear on several records, so we
+  # flatten everything into a de-duplicated set of single pids.
+  param([string]$Pane)
+  if (-not $Pane) { return @() }
+  # Capture by PLAIN assignment (no pipe, no @()): Get-DuetPaneRecords returns a
+  # `,$array`-wrapped value. A pipeline hands it over as a single item, and even
+  # `@(...)` re-wraps it into one merged element - both make Where-Object/foreach
+  # see the whole array instead of each record. Plain assignment is exactly what
+  # the comma trick is designed for and yields the individual records.
+  $recs = Get-DuetPaneRecords
+  $found = @()
+  foreach ($rec in $recs) {
+    if ($rec.Id -ne $Pane) { continue }
+    foreach ($p in ($rec.Pid -split '\s+')) {
+      if ($p) { $found += $p }
+    }
+  }
+  return @($found | Select-Object -Unique)
+}
+
+function Get-DuetProcessTable {
+  # Snapshot of every process as pid -> @{ Parent=<ppid>; Name=<name> }. Isolated
+  # in its own function so tests can stub it. Used only by the Windows/psmux reap
+  # to reason about process ancestry before killing anything.
+  $table = @{}
+  foreach ($p in (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+    $table[[int]$p.ProcessId] = @{ Parent = [int]$p.ParentProcessId; Name = [string]$p.Name }
+  }
+  return $table
+}
+
+function Test-DuetPidProtected {
+  # True when killing $TargetPid could endanger the current Claude session, i.e.
+  # the pid is one of the protected pids, an ancestor of a protected pid, or a
+  # multiplexer / Claude process. Unknown pids are treated as protected (never
+  # kill something we cannot reason about). This is what makes the reap safe on a
+  # build where a recycled pane id could otherwise route a kill onto our own pane.
+  param(
+    [Parameter(Mandatory=$true)][int]$TargetPid,
+    [int[]]$ProtectedPids = @(),
+    [hashtable]$Table = $null
+  )
+  if ($TargetPid -le 0) { return $true }
+  if (-not $Table -or -not $Table.ContainsKey($TargetPid)) { return $true }
+  $name = [string]$Table[$TargetPid].Name
+  if ($name -match '(?i)^(psmux|tmux|claude)') { return $true }
+  if ($ProtectedPids -contains $TargetPid) { return $true }
+  # Ancestor-of-protected? Walk each protected pid up toward the root; if the walk
+  # passes through the target, killing the target would tear a protected pid down.
+  foreach ($pp in $ProtectedPids) {
+    $cur = $pp
+    $seen = @{}
+    while ($cur -gt 0 -and $Table.ContainsKey($cur) -and -not $seen[$cur]) {
+      if ($cur -eq $TargetPid) { return $true }
+      $seen[$cur] = $true
+      $cur = [int]$Table[$cur].Parent
+    }
+  }
+  return $false
+}
+
 function Stop-DuetSessionByConfig {
   param(
     [Parameter(Mandatory=$true)]$Config,
@@ -255,12 +319,48 @@ function Stop-DuetSessionByConfig {
     Write-DuetUtf8NoBom -Path (Join-Path $Config.DUET_DIR ".ended") -Value ""
   } catch { }
   if ($KillCodexPane -and $Config.CODEX_PANE) {
-    $psmux = Get-DuetPsmux
-    if (Test-DuetPaneAlive -Pane $Config.CODEX_PANE) {
-      & $psmux send-keys -t $Config.CODEX_PANE C-c 2>$null | Out-Null
-      Start-Sleep -Milliseconds 300
-      & $psmux kill-pane -t $Config.CODEX_PANE 2>$null | Out-Null
+    $target = $Config.CODEX_PANE
+    $self   = $env:TMUX_PANE
+    if (-not $self) { $self = $Config.CLAUDE_PANE }
+
+    # SAFETY: Windows/psmux self-kill guard --------------------------------------
+    # On this build a *dead* Codex pane's id can be recycled or aliased onto the
+    # live Claude pane, and pane-level ops (`kill-pane`, `capture-pane`) then
+    # MISROUTE to the current pane - so a blind `kill-pane` on the recorded Codex
+    # id tears down THIS Claude session (the "re-init kills the shell and Codex
+    # never comes up" bug). We therefore never touch the pane; instead we reap the
+    # orphan Codex at the OS-process level (Stop-Process is precise and cannot
+    # misroute), and only for pids that are provably NOT the current Claude, a
+    # multiplexer, or an ancestor of our pane. A pane whose pids we cannot safely
+    # kill is left for interactive `duet-doctor.ps1 -Reap`.
+    if ($self -and $target -eq $self) {
+      Write-Warning "duet: not reaping $target - it is the current pane."
+    } elseif ($Config.CLAUDE_PANE -and $target -eq $Config.CLAUDE_PANE) {
+      Write-Warning "duet: not reaping $target - it is the recorded Claude pane."
+    } elseif (Test-DuetPaneAlive -Pane $target) {
+      $table = Get-DuetProcessTable
+      $protected = @($PID)
+      foreach ($p in @(Get-DuetPanePidSet -Pane $self)) {
+        $n = 0; if ([int]::TryParse($p, [ref]$n)) { $protected += $n }
+      }
+      $killed = @()
+      $spared = @()
+      foreach ($p in @(Get-DuetPanePidSet -Pane $target)) {
+        $n = 0
+        if (-not [int]::TryParse($p, [ref]$n)) { continue }
+        if (Test-DuetPidProtected -TargetPid $n -ProtectedPids ([int[]]$protected) -Table $table) {
+          $spared += $n
+        } else {
+          try { Stop-Process -Id $n -Force -ErrorAction Stop; $killed += $n } catch { $spared += $n }
+        }
+      }
+      if ($killed.Count -gt 0) {
+        Write-Host "duet: reaped orphan Codex process id(s) [$($killed -join ',')] for pane $target"
+      } else {
+        Write-Warning "duet: no safely-killable orphan process for pane $target (spared [$($spared -join ',')]). If a real orphan remains, run duet-doctor.ps1 -Reap."
+      }
     }
+    # ---------------------------------------------------------------------------
   }
 }
 
