@@ -100,7 +100,21 @@ $CodexCommand = @(
   "& $(ConvertTo-DuetPsLiteral $CodexPath) --add-dir $(ConvertTo-DuetPsLiteral $DuetDir) -s $(ConvertTo-DuetPsLiteral $CxSandbox) -a $(ConvertTo-DuetPsLiteral $CxApproval)"
 ) -join "; "
 
-$CodexPane = (& $psmux split-window -h -t $ClaudePane -P -F "#{pane_id}" -- powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $CodexCommand).Trim()
+# psmux 3.3.3 on Windows does NOT exec `split-window -- <exe> <args>` directly. Its
+# default shell is `powershell.exe -NoLogo -Command "<...>"`, and it space-joins
+# everything after `--` into that single outer -Command string. Passing our own
+# `powershell.exe ... -Command <inline>` therefore gets DOUBLE-WRAPPED into
+# `powershell -NoLogo -Command "powershell ... -Command <inline>"`, and the inline
+# command's quotes/parens/semicolons are mangled by the second parse -> Codex never
+# launches and the pane dies instantly. Writing the launch command to a .ps1 and
+# invoking it with `-File <path>` sidesteps this: a script path has no nested quoting
+# for the outer -Command to mangle. The path is single-quoted (ConvertTo-DuetPsLiteral)
+# so it still survives the outer -Command's space tokenization when $HOME\.duet
+# contains a space (e.g. a Windows username with a space).
+$CodexLauncher = Join-Path $DuetDir "launch-codex.ps1"
+Write-DuetUtf8NoBom -Path $CodexLauncher -Value $CodexCommand
+
+$CodexPane = (& $psmux split-window -h -t $ClaudePane -P -F "#{pane_id}" -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File $(ConvertTo-DuetPsLiteral $CodexLauncher)).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $CodexPane) {
   throw "duet: failed to split psmux pane for Codex"
 }
