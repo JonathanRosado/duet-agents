@@ -1,6 +1,6 @@
 {
   "name": "duet",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pair Claude and Codex as peer agents in adjacent tmux or psmux panes. They collaborate through inline prompt delivery with a durable transcript, not screen-scraping.",
   "author": {
     "name": "Jonathan Rosado",
