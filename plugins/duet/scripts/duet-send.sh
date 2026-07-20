@@ -7,7 +7,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF_DIR/duet-common.sh"
 
 usage(){
-  echo "usage: duet-send.sh <recipient-name|leader|all> [--interrupt] [--from <name>]" >&2
+  echo "usage: duet-send.sh <recipient-name|leader|all> [--interrupt] [--from <name>] [--session <id|dir|duet.env>]" >&2
 }
 
 recipient_token="${1:-}"
@@ -15,6 +15,7 @@ recipient_token="${1:-}"
 [ -n "$recipient_token" ] || { usage; exit 2; }
 interrupt=""
 from=""
+session_arg=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --interrupt) interrupt=1; shift ;;
@@ -23,25 +24,49 @@ while [ "$#" -gt 0 ]; do
       from="$2"
       shift 2
       ;;
+    --session)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      session_arg="$2"
+      shift 2
+      ;;
     *) usage; echo "duet: unknown option '$1'" >&2; exit 2 ;;
   esac
 done
 
-state_root="${DUET_STATE_ROOT:-$HOME/.duet}"
-cfg="${DUET_CONFIG:-$state_root/current/duet.env}"
-[ -f "$cfg" ] || { echo "duet: no session ($cfg); run duet-init first." >&2; exit 1; }
+caller_session_pin="${DUET_SESSION:-}"
+caller_self="${DUET_SELF:-}"
+# Capture this before a foreign config can redirect _duet_tmux.
+duet_capture_caller_identity 2>/dev/null || true
+saved_caller_socket="${DUET_CALLER_SOCKET:-}"
+saved_caller_server_pid="${DUET_CALLER_SERVER_PID:-}"
+saved_caller_pane="${DUET_CALLER_PANE:-}"
+saved_caller_pane_pid="${DUET_CALLER_PANE_PID:-}"
+
+duet_resolve_config "$session_arg" 0 || exit 1
+cfg="$DUET_RESOLVED_CONFIG"
+unset DUET_DIR WORKDIR PLUGIN_DIR DUET_TMUX_SOCKET DUET_TMUX_SERVER_PID
+unset DUET_SESSION DUET_SESSION_ID DUET_INITIATOR DUET_INITIATOR_PANE DUET_WORKDIR_KEY
 # shellcheck disable=SC1090
 . "$cfg"
+DUET_CONFIG="$cfg"
+duet_validate_loaded_session "$caller_session_pin" "$cfg" || exit 7
 [ ! -f "$DUET_DIR/.ended" ] || { echo "duet: session has ended; refusing to enqueue." >&2; exit 1; }
 [ -f "$DUET_DIR/roster.tsv" ] || { echo "duet: session roster is missing." >&2; exit 1; }
 duet_read_leader_state
 duet_daemon_alive || { echo "duet: delivery daemon is not alive; message was not queued." >&2; exit 6; }
 
 pane_name=""
-if [ -n "${TMUX_PANE:-}" ]; then
-  pane_name="$(duet_roster_name_for_pane "$TMUX_PANE")"
+actual_session=""
+if duet_caller_roster_name; then
+  pane_name="$DUET_CALLER_NAME"
+else
+  DUET_CALLER_SOCKET="$saved_caller_socket"
+  DUET_CALLER_SERVER_PID="$saved_caller_server_pid"
+  DUET_CALLER_PANE="$saved_caller_pane"
+  DUET_CALLER_PANE_PID="$saved_caller_pane_pid"
+  actual_session="$(duet_find_caller_session "$DUET_STATE_ROOT" 2>/dev/null || true)"
 fi
-self_name="${DUET_SELF:-}"
+self_name="$caller_self"
 if [ -n "$pane_name" ] && [ -n "$self_name" ] && [ "$pane_name" != "$self_name" ]; then
   echo "duet: identity mismatch: pane $TMUX_PANE is '$pane_name' but DUET_SELF is '$self_name'." >&2
   exit 7
@@ -60,14 +85,18 @@ if [ -n "$from" ]; then
     echo "duet: --from '$from' does not match DUET_SELF '$self_name'." >&2
     exit 7
   fi
+  if [ -z "$known_sender" ] && [ -n "$actual_session" ]; then
+    echo "duet: caller belongs to '$actual_session', not pinned session '$DUET_SESSION_ID'; override refused." >&2
+    exit 7
+  fi
   if [ -z "$known_sender" ] && [ -z "${DUET_ALLOW_FROM_OVERRIDE:-}" ]; then
-    echo "duet: caller pane is not in this roster; set DUET_ALLOW_FROM_OVERRIDE=1 for explicit admin/test sends." >&2
+    echo "duet: caller pane is not a member of session '$DUET_SESSION_ID'; actual session: ${actual_session:-unknown}." >&2
     exit 7
   fi
   sender="$from"
 else
   [ -n "$known_sender" ] || {
-    echo "duet: cannot resolve sender from TMUX_PANE; use an explicit authorized --from override." >&2
+    echo "duet: caller is not a member of session '$DUET_SESSION_ID'; actual session: ${actual_session:-unknown}." >&2
     exit 7
   }
   sender="$known_sender"

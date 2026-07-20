@@ -13,10 +13,13 @@ SCRIPTS_DIR="$PLUGIN_DIR/scripts"
 SEND_SCRIPT="$SCRIPTS_DIR/duet-send.sh"
 DELIVERD_SCRIPT="$SCRIPTS_DIR/duet-deliverd.sh"
 END_SCRIPT="$SCRIPTS_DIR/duet-end.sh"
+INIT_SCRIPT="$SCRIPTS_DIR/duet-init.sh"
 
 TMP_BASE="${TMPDIR:-/tmp}"
 TMP_BASE="${TMP_BASE%/}"
+TMP_BASE="$(cd "$TMP_BASE" && pwd -P)" || exit 1
 TEST_ROOT="$(mktemp -d "$TMP_BASE/duet-m2-transport.XXXXXX")" || exit 1
+TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)" || exit 1
 STATE_ROOT="$TEST_ROOT/state"
 WORK_ROOT="$TEST_ROOT/work"
 TMUX_LABEL="duet-m2-$PPID-${RANDOM:-0}"
@@ -67,6 +70,15 @@ wait_for_file(){
   return 1
 }
 
+wait_for_file_value(){
+  local file="$1" expected="$2" loops="${3:-100}" i
+  for i in $(seq 1 "$loops"); do
+    [ "$(cat "$file" 2>/dev/null || true)" = "$expected" ] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
 wait_for_process_exit(){
   local pid="$1" loops="${2:-100}" i
   for i in $(seq 1 "$loops"); do
@@ -107,7 +119,9 @@ cleanup(){
     kill -0 "$pid" 2>/dev/null || continue
     command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
     case "$command_line" in
-      *"$TEST_ROOT"/owner-mismatch-helper.sh*) kill -TERM "$pid" 2>/dev/null || true ;;
+      *"$TEST_ROOT"/owner-mismatch-helper.sh*|*"$TEST_ROOT"/*/duet-deliverd.sh*)
+        kill -TERM "$pid" 2>/dev/null || true
+        ;;
     esac
   done
   command tmux -L "$TMUX_LABEL" kill-server >/dev/null 2>&1 || true
@@ -119,7 +133,8 @@ cleanup(){
     *) printf 'duet test: refused unsafe cleanup path %s\n' "$TEST_ROOT" >&2 ;;
   esac
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
 
 if ! command -v tmux >/dev/null 2>&1; then
   printf 'SKIP: tmux is not installed\n'
@@ -137,6 +152,15 @@ WORKER_ONE_PANE="$(command tmux -L "$TMUX_LABEL" split-window -d -P -F '#{pane_i
   -t "$TMUX_SESSION" 'exec /bin/bash --noprofile --norc')"
 WORKER_TWO_PANE="$(command tmux -L "$TMUX_LABEL" split-window -d -P -F '#{pane_id}' \
   -t "$TMUX_SESSION" 'exec /bin/bash --noprofile --norc')"
+# A live, no-echo pane lets the real daemon inspect a queued message without
+# running a protocol payload as a shell command. It is used only by the daemon
+# restart assertion and is never placed in later fixtures.
+RESTART_PANE="$(command tmux -L "$TMUX_LABEL" split-window -d -P -F '#{pane_id}' \
+  -t "$TMUX_SESSION" "exec /bin/bash --noprofile --norc -c 'stty -echo; exec sleep 600'")"
+INIT_PANE_PID="$(command tmux -L "$TMUX_LABEL" display-message -p -t "$INIT_PANE" '#{pane_pid}')"
+WORKER_ONE_PANE_PID="$(command tmux -L "$TMUX_LABEL" display-message -p -t "$WORKER_ONE_PANE" '#{pane_pid}')"
+WORKER_TWO_PANE_PID="$(command tmux -L "$TMUX_LABEL" display-message -p -t "$WORKER_TWO_PANE" '#{pane_pid}')"
+RESTART_PANE_PID="$(command tmux -L "$TMUX_LABEL" display-message -p -t "$RESTART_PANE" '#{pane_pid}')"
 TMUX_SOCKET="$(command tmux -L "$TMUX_LABEL" display-message -p '#{socket_path}')"
 TMUX_SERVER_PID="$(command tmux -L "$TMUX_LABEL" display-message -p '#{pid}')"
 
@@ -144,15 +168,19 @@ TMUX_SERVER_PID="$(command tmux -L "$TMUX_LABEL" display-message -p '#{pid}')"
 . "$SCRIPTS_DIR/duet-common.sh"
 
 create_state(){
-  local name="$1" queue env_tmp
+  local name="$1" queue env_tmp workdir_active
   DUET_DIR="$STATE_ROOT/$name"
   DUET_SESSION_ID="$name"
+  DUET_SESSION="$name"
   DUET_STATE_ROOT="$STATE_ROOT"
   WORKDIR="$WORK_ROOT/$name"
   DUET_TMUX_SOCKET="$TMUX_SOCKET"
   DUET_TMUX_SERVER_PID="$TMUX_SERVER_PID"
-  mkdir -p "$DUET_DIR" "$WORKDIR"
-  for queue in claude codex-1 kimi-1 leader; do
+  mkdir -p "$DUET_DIR" "$WORKDIR" "$DUET_STATE_ROOT/workdirs"
+  DUET_WORKDIR_KEY="$(duet_workdir_key "$WORKDIR")"
+  workdir_active="$DUET_STATE_ROOT/workdirs/$DUET_WORKDIR_KEY.active"
+  printf '%s\n' "$DUET_DIR" > "$workdir_active"
+  for queue in claude codex-1 kimi-1 leader promotions; do
     mkdir -p "$DUET_DIR/inbox/$queue/delivered" \
       "$DUET_DIR/inbox/$queue/failed" \
       "$DUET_DIR/inbox/$queue/quarantine" \
@@ -162,9 +190,9 @@ create_state(){
   printf 'term\t0\nleader\tclaude\n' > "$DUET_DIR/leader"
   {
     printf 'name\tharness\tpane_id\tpane_pid\trank\tspawned\n'
-    printf 'claude\tclaude\t%s\t0\t0\t0\n' "$INIT_PANE"
-    printf 'codex-1\tcodex\t%s\t0\t1\t1\n' "$WORKER_ONE_PANE"
-    printf 'kimi-1\tkimi\t%s\t0\t2\t1\n' "$WORKER_TWO_PANE"
+    printf 'claude\tclaude\t%s\t%s\t0\t0\n' "$INIT_PANE" "$INIT_PANE_PID"
+    printf 'codex-1\tcodex\t%s\t%s\t1\t1\n' "$WORKER_ONE_PANE" "$WORKER_ONE_PANE_PID"
+    printf 'kimi-1\tkimi\t%s\t%s\t2\t1\n' "$WORKER_TWO_PANE" "$WORKER_TWO_PANE_PID"
   } > "$DUET_DIR/roster.tsv"
   env_tmp="$DUET_DIR/duet.env"
   {
@@ -174,21 +202,27 @@ create_state(){
     printf 'PLUGIN_DIR=%q\n' "$PLUGIN_DIR"
     printf 'DUET_TMUX_SOCKET=%q\n' "$DUET_TMUX_SOCKET"
     printf 'DUET_TMUX_SERVER_PID=%q\n' "$DUET_TMUX_SERVER_PID"
+    printf 'DUET_SESSION=%q\n' "$DUET_SESSION"
     printf 'DUET_SESSION_ID=%q\n' "$DUET_SESSION_ID"
+    printf 'DUET_WORKDIR_KEY=%q\n' "$DUET_WORKDIR_KEY"
     printf 'DUET_INITIATOR=%q\n' claude
     printf 'DUET_INITIATOR_PANE=%q\n' "$INIT_PANE"
   } > "$env_tmp"
   ln -sfn "$DUET_DIR" "$DUET_STATE_ROOT/current"
   CURRENT_CONFIG="$env_tmp"
-  export DUET_DIR DUET_SESSION_ID DUET_STATE_ROOT WORKDIR PLUGIN_DIR
+  export DUET_DIR DUET_SESSION DUET_SESSION_ID DUET_WORKDIR_KEY
+  export DUET_STATE_ROOT WORKDIR PLUGIN_DIR
   export DUET_TMUX_SOCKET DUET_TMUX_SERVER_PID
 }
 
 start_actual_daemon(){
   local retry_base="${1:-30}" i
-  DUET_CONFIG="$CURRENT_CONFIG" DUET_DELIVERY_RETRY_BASE="$retry_base" \
+  DUET_CONFIG="$CURRENT_CONFIG" DUET_SESSION="$DUET_SESSION_ID" \
+    DUET_DELIVERY_RETRY_BASE="$retry_base" \
     DUET_DELIVERY_POLL_INTERVAL=0.05 \
-    bash "$DELIVERD_SCRIPT" > "$DUET_DIR/daemon.stdout" 2>&1 &
+    bash "$DELIVERD_SCRIPT" --session "$CURRENT_CONFIG" \
+    --session-id "$DUET_SESSION_ID" \
+    > "$DUET_DIR/daemon.stdout" 2>&1 &
   STARTED_DAEMON_LAUNCH_PID=$!
   ACTIVE_DAEMON_PIDS="$ACTIVE_DAEMON_PIDS $STARTED_DAEMON_LAUNCH_PID"
   STARTED_DAEMON_PID=""
@@ -229,6 +263,27 @@ run_case(){
   fi
 }
 
+run_fixture_init(){
+  local workdir="$1" state_root="$2" fixture_path="$3"
+  (
+    cd "$workdir" || exit 1
+    env -u DUET_CONFIG -u DUET_SESSION -u DUET_SESSION_ID -u DUET_DIR \
+      -u DUET_WORKDIR_KEY -u WORKDIR -u PLUGIN_DIR \
+      -u CODEX_PANE -u CODEX_PANE_PID \
+      PATH="$fixture_path" HOME="$TEST_ROOT/init-home" \
+      TMUX="$TMUX_SOCKET,$TMUX_SERVER_PID,0" TMUX_PANE="$INIT_PANE" \
+      DUET_STATE_ROOT="$state_root" DUET_CODEX_SKIP_PRETRUST=1 \
+      DUET_TEST_REAL_TMUX="${DUET_TEST_REAL_TMUX:-}" \
+      DUET_TEST_REAL_LN="${DUET_TEST_REAL_LN:-}" \
+      DUET_TEST_CURRENT_LINK="${DUET_TEST_CURRENT_LINK:-}" \
+      DUET_TEST_INIT_PANE="${DUET_TEST_INIT_PANE:-}" \
+      DUET_TEST_PID_MARKER="${DUET_TEST_PID_MARKER:-}" \
+      BASH_ENV="${DUET_TEST_BASH_ENV:-}" \
+      DUET_BOOT_TIMEOUT=2 DUET_READY_TIMEOUT=2 \
+      bash "$INIT_SCRIPT" codex
+  )
+}
+
 test_concurrent_enqueue_identity_restart(){
   local box output_dir pids="" pid i rc file sequence expected_id actual_id
   local expected_body_with_sentinel expected_body first index
@@ -249,7 +304,7 @@ test_concurrent_enqueue_identity_restart(){
 
   for i in $(seq 1 64); do
     (
-      unset TMUX_PANE DUET_SELF
+      unset TMUX TMUX_PANE DUET_SELF
       export DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT
       export DUET_ALLOW_FROM_OVERRIDE=1
       printf 'producer=%03d\nline two\tTAB\ntrailing newline\n' "$i" \
@@ -312,27 +367,29 @@ test_concurrent_enqueue_identity_restart(){
 
   before_count="$(transcript_count "$DUET_DIR/transcript.md")"
   (
-    unset TMUX_PANE DUET_SELF DUET_ALLOW_FROM_OVERRIDE
+    unset TMUX TMUX_PANE DUET_SELF DUET_ALLOW_FROM_OVERRIDE
     export DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT
     printf 'unresolved\n' | bash "$SEND_SCRIPT" leader
   ) > "$output_dir/unresolved.out" 2>&1
   rc=$?
   assert_eq 7 "$rc" "unresolved sender rejection"
 
-  printf 'mismatch self\n' | DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+  printf 'mismatch self\n' | DUET_CONFIG="$CURRENT_CONFIG" DUET_SESSION="$DUET_SESSION_ID" \
+    DUET_STATE_ROOT="$DUET_STATE_ROOT" TMUX="$TMUX_SOCKET,$TMUX_SERVER_PID,0" \
     TMUX_PANE="$INIT_PANE" DUET_SELF=codex-1 \
     bash "$SEND_SCRIPT" codex-1 > "$output_dir/self-mismatch.out" 2>&1
   rc=$?
   assert_eq 7 "$rc" "TMUX_PANE and DUET_SELF mismatch rejection"
 
-  printf 'mismatch from\n' | DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+  printf 'mismatch from\n' | DUET_CONFIG="$CURRENT_CONFIG" DUET_SESSION="$DUET_SESSION_ID" \
+    DUET_STATE_ROOT="$DUET_STATE_ROOT" TMUX="$TMUX_SOCKET,$TMUX_SERVER_PID,0" \
     TMUX_PANE="$INIT_PANE" DUET_SELF=claude \
     bash "$SEND_SCRIPT" leader --from codex-1 > "$output_dir/from-mismatch.out" 2>&1
   rc=$?
   assert_eq 7 "$rc" "known pane and --from mismatch rejection"
 
   (
-    unset TMUX_PANE DUET_SELF
+    unset TMUX TMUX_PANE DUET_SELF
     export DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT DUET_ALLOW_FROM_OVERRIDE=1
     printf 'hub violation\n' | bash "$SEND_SCRIPT" kimi-1 --from codex-1
   ) > "$output_dir/hub.out" 2>&1
@@ -343,7 +400,7 @@ test_concurrent_enqueue_identity_restart(){
   assert_eq 64 "$(cat "$box/.counter")" "rejected sends do not advance counter"
 
   (
-    unset TMUX_PANE DUET_SELF
+    unset TMUX TMUX_PANE DUET_SELF
     export DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT DUET_ALLOW_FROM_OVERRIDE=1
     printf 'sequence sixty-five\n' | bash "$SEND_SCRIPT" claude --from codex-1
   ) > "$output_dir/valid.out" 2>&1
@@ -362,19 +419,23 @@ test_concurrent_enqueue_identity_restart(){
   assert_no_file "$DUET_DIR/daemon.pid" "daemon pid cleanup"
   assert_no_file "$DUET_DIR/.daemon.lock" "daemon singleton lock cleanup"
 
-  # Make the symbolic leader deliberately dead before restart. The restarted
-  # real daemon may advance retry metadata, but cannot paste into a test shell.
+  # Give the leader a live no-echo pane. The restarted daemon must inspect the
+  # pending head and persist the uncertain-submit fence without executing a
+  # protocol payload in a Bash fixture or triggering failover.
   roster_tmp="$DUET_DIR/.roster.test"
-  awk -F '\t' 'BEGIN { OFS="\t" } $1 == "claude" { $3="%999999" } { print }' \
+  awk -F '\t' -v pane="$RESTART_PANE" -v pid="$RESTART_PANE_PID" \
+    'BEGIN { OFS="\t" } $1 == "claude" { $3=pane; $4=pid } { print }' \
     "$DUET_DIR/roster.tsv" > "$roster_tmp"
   mv "$roster_tmp" "$DUET_DIR/roster.tsv"
   if ! start_actual_daemon 30; then
     fail "actual daemon did not restart"
     return
   fi
-  if ! wait_for_file "$box/N-0000000001.msg.tries" 100; then
-    fail "restarted daemon did not inspect pending head"
+  if ! wait_for_file_value "$box/N-0000000001.msg.phase" ENTER_ONLY 120; then
+    fail "restarted daemon did not finish inspecting pending head"
   fi
+  assert_eq ENTER_ONLY "$(cat "$box/N-0000000001.msg.phase" 2>/dev/null || true)" \
+    "restart preserves uncertain-submit phase"
   assert_eq 65 "$(direct_message_count "$box")" "pending queue survives daemon restart"
   assert_eq "$restart_id" \
     "$(awk -F '\t' '$1 == "id" { print $2; exit }' "$box/N-0000000001.msg")" \
@@ -652,7 +713,7 @@ test_uncertain_dead_fencing(){
 }
 
 test_daemon_stop_owner_mismatch(){
-  local helper helper_pid owner_pid output rc
+  local helper helper_pid owner_pid output rc other_dir other_script other_pid
   create_state stop-owner-mismatch
   helper="$TEST_ROOT/owner-mismatch-helper.sh"
   output="$TEST_ROOT/owner-mismatch.err"
@@ -691,18 +752,448 @@ test_daemon_stop_owner_mismatch(){
   rm -f "$DUET_DIR/daemon.pid" "$DUET_DIR/.daemon.lock"
   kill -TERM "$helper_pid" 2>/dev/null || true
   wait "$helper_pid" 2>/dev/null || true
+
+  # A live daemon from a different state root may share this session basename.
+  # The canonical --session config path is part of process identity.
+  other_dir="$TEST_ROOT/other-root/$DUET_SESSION_ID"
+  other_script="$TEST_ROOT/other-root/duet-deliverd.sh"
+  mkdir -p "$other_dir"
+  : > "$other_dir/duet.env"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' "trap 'exit 0' INT TERM"
+    printf '%s\n' 'while :; do sleep 1; done'
+  } > "$other_script"
+  chmod +x "$other_script"
+  bash "$other_script" --session "$other_dir/duet.env" \
+    --session-id "$DUET_SESSION_ID" &
+  other_pid=$!
+  ACTIVE_HELPER_PIDS="$ACTIVE_HELPER_PIDS $other_pid"
+  printf '%s\n' "$other_pid" > "$DUET_DIR/daemon.pid"
+  printf '%s\tforeign-root\n' "$other_pid" > "$DUET_DIR/.daemon.lock"
+  if ( . "$SCRIPTS_DIR/duet-common.sh"; duet_daemon_alive ); then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 1 "$rc" "daemon liveness rejects same id from another config path"
+  if duet_stop_daemon "$DUET_DIR" 1 > /dev/null 2> "$output"; then rc=0; else rc=$?; fi
+  assert_eq 1 "$rc" "daemon stop rejects same id from another config path"
+  kill -0 "$other_pid" 2>/dev/null \
+    || fail "foreign-root daemon was signaled"
+  rm -f "$DUET_DIR/daemon.pid" "$DUET_DIR/.daemon.lock"
+  kill -TERM "$other_pid" 2>/dev/null || true
+  wait "$other_pid" 2>/dev/null || true
+}
+
+test_daemon_metachar_path_identity(){
+  local ordinary_state_root="$STATE_ROOT" meta_root helper helper_pid decoy_pid
+  local decoy_config rc output
+  meta_root="$TEST_ROOT/state[*?]"
+  STATE_ROOT="$meta_root"
+  create_state daemon-meta
+  helper="$TEST_ROOT/meta-helper/duet-deliverd.sh"
+  output="$TEST_ROOT/daemon-meta.err"
+  mkdir -p "$(dirname "$helper")"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' '[ "$1" = --session ] || exit 2'
+    printf '%s\n' '[ "$3" = --session-id ] || exit 2'
+    printf '%s\n' "trap 'exit 0' INT TERM"
+    printf '%s\n' 'while :; do sleep 1; done'
+  } > "$helper"
+  chmod +x "$helper"
+
+  # This differs from the canonical path by dropping the bracket delimiters.
+  # A process-identity fence must compare the argument literally, never accept
+  # it as an expansion of pattern characters in the configured state root.
+  decoy_config="$TEST_ROOT/state*/daemon-meta/duet.env"
+  bash "$helper" --session "$decoy_config" --session-id "$DUET_SESSION_ID" &
+  decoy_pid=$!
+  ACTIVE_HELPER_PIDS="$ACTIVE_HELPER_PIDS $decoy_pid"
+  mkdir "$DUET_DIR/.daemon.lock"
+  printf '%s\tmeta-path-decoy\n' "$decoy_pid" > "$DUET_DIR/.daemon.lock/owner"
+  printf '%s\n' "$decoy_pid" > "$DUET_DIR/daemon.pid"
+  if ( . "$SCRIPTS_DIR/duet-common.sh"; duet_daemon_alive ); then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 1 "$rc" "daemon liveness rejects a non-literal config path"
+  if duet_stop_daemon "$DUET_DIR" 1 > /dev/null 2> "$output"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 1 "$rc" "daemon stop rejects a non-literal config path"
+  kill -0 "$decoy_pid" 2>/dev/null \
+    || fail "config-path decoy was signaled by daemon stop"
+  kill -TERM "$decoy_pid" 2>/dev/null || true
+  wait "$decoy_pid" 2>/dev/null || true
+  rm -f "$DUET_DIR/daemon.pid" "$DUET_DIR/.daemon.lock/owner"
+  rmdir "$DUET_DIR/.daemon.lock" 2>/dev/null || true
+
+  bash "$helper" --session "$CURRENT_CONFIG" --session-id "$DUET_SESSION_ID" &
+  helper_pid=$!
+  ACTIVE_HELPER_PIDS="$ACTIVE_HELPER_PIDS $helper_pid"
+  mkdir "$DUET_DIR/.daemon.lock"
+  printf '%s\tmeta-path\n' "$helper_pid" > "$DUET_DIR/.daemon.lock/owner"
+  printf '%s\n' "$helper_pid" > "$DUET_DIR/daemon.pid"
+
+  if ( . "$SCRIPTS_DIR/duet-common.sh"; duet_daemon_alive ); then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 0 "$rc" \
+    "daemon liveness treats *, ?, and [ in canonical config path literally"
+  if duet_stop_daemon "$DUET_DIR" 1 > /dev/null 2> "$output"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 0 "$rc" \
+    "daemon stop treats *, ?, and [ in canonical config path literally"
+  if ! wait_for_process_exit "$helper_pid" 40; then
+    fail "daemon under metacharacter state root was not stopped"
+    kill -TERM "$helper_pid" 2>/dev/null || true
+  fi
+  wait "$helper_pid" 2>/dev/null || true
+  STATE_ROOT="$ordinary_state_root"
+}
+
+test_stale_lock_symlink_escape(){
+  local fixture lock victim atomic_target rc
+  fixture="$TEST_ROOT/stale-lock-escape"
+  lock="$fixture/session/.delivery.lock"
+  victim="$fixture/victim.claim-outside"
+  mkdir -p "$(dirname "$lock")" "$victim"
+  printf '999999999\tforeign-owner\n' > "$victim/owner"
+  ln -s ../victim.claim-outside "$lock"
+
+  if duet_lock_acquire "$lock" 20; then rc=0; else rc=$?; fi
+  assert_eq 0 "$rc" "stale hostile symlink is recoverable"
+  assert_file "$victim/owner" "stale-lock cleanup cannot escape lock directory"
+  if [ "$rc" -eq 0 ]; then
+    duet_lock_release "$lock" || fail "recovered stale lock could not be released"
+  fi
+
+  atomic_target="$fixture/atomic-target"
+  mkdir "$atomic_target"
+  if duet_atomic_write "$atomic_target" unsafe >/dev/null 2>&1; then rc=0; else rc=$?; fi
+  assert_eq 1 "$rc" "atomic publication rejects a directory destination"
+  [ -d "$atomic_target" ] \
+    || fail "atomic publication replaced its directory destination"
+  [ -z "$(find "$atomic_target" -mindepth 1 -print -quit 2>/dev/null)" ] \
+    || fail "atomic publication moved its temp file inside a directory destination"
+}
+
+test_init_path_publication_and_cleanup_fences(){
+  local fake_bin fake_ln_bin fake_bash_env real_tmux real_ln state work key outside sentinel
+  local output rc anchor_target anchor_body worker_pane actual_pid before_panes after_panes
+  fake_bin="$TEST_ROOT/init-fake-bin"
+  fake_ln_bin="$TEST_ROOT/init-fake-ln-bin"
+  fake_bash_env="$fake_ln_bin/bash-env"
+  real_tmux="$(command -v tmux)"
+  real_ln="$(command -v ln)"
+  mkdir -p "$fake_bin" "$fake_ln_bin" "$TEST_ROOT/init-home"
+
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' "printf 'OpenAI Codex\\n'"
+    printf '%s\n' 'for _ in $(seq 1 100); do'
+    printf '%s\n' '  if [ -f "${DUET_CONFIG:-}" ]; then'
+    printf '%s\n' '    . "$DUET_CONFIG"'
+    printf '%s\n' "    printf 'ok\\n' > \"\$DUET_DIR/ready/\$DUET_SELF\""
+    printf '%s\n' '    break'
+    printf '%s\n' '  fi'
+    printf '%s\n' '  sleep 0.02'
+    printf '%s\n' 'done'
+    printf '%s\n' "trap 'exit 0' INT TERM"
+    printf '%s\n' 'while :; do sleep 1; done'
+  } > "$fake_bin/codex"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'args=("$@")'
+    printf '%s\n' 'target=""; is_display=""; is_pid=""; i=0'
+    printf '%s\n' 'while [ "$i" -lt "${#args[@]}" ]; do'
+    printf '%s\n' '  case "${args[$i]}" in'
+    printf '%s\n' '    display-message) is_display=1 ;;'
+    printf '%s\n' "    '#{pane_pid}') is_pid=1 ;;"
+    printf '%s\n' '    -t) i=$((i + 1)); target="${args[$i]:-}" ;;'
+    printf '%s\n' '  esac'
+    printf '%s\n' '  i=$((i + 1))'
+    printf '%s\n' 'done'
+    printf '%s\n' 'if [ "$is_display" = 1 ] && [ "$is_pid" = 1 ] \
+  && [ -n "${DUET_TEST_PID_MARKER:-}" ] \
+  && [ "$target" != "${DUET_TEST_INIT_PANE:-}" ]; then'
+    printf '%s\n' '  if [ -f "$DUET_TEST_PID_MARKER" ]; then'
+    printf '%s\n' "    printf '999999999\\n'"
+    printf '%s\n' '    exit 0'
+    printf '%s\n' '  fi'
+    printf '%s\n' "  printf '%s\\n' \"\$target\" > \"\$DUET_TEST_PID_MARKER\""
+    printf '%s\n' 'fi'
+    printf '%s\n' 'exec "$DUET_TEST_REAL_TMUX" "${args[@]}"'
+  } > "$fake_bin/tmux"
+  {
+    printf '%s\n' 'ln(){'
+    printf '%s\n' '  local last=""'
+    printf '%s\n' '  for last in "$@"; do :; done'
+    printf '%s\n' '  if [ "$last" = "$DUET_TEST_CURRENT_LINK" ]; then return 0; fi'
+    printf '%s\n' '  command "$DUET_TEST_REAL_LN" "$@"'
+    printf '%s\n' '}'
+  } > "$fake_bash_env"
+  chmod +x "$fake_bin/codex" "$fake_bin/tmux"
+
+  work="$TEST_ROOT/init-no-home-work"
+  mkdir -p "$work"
+  output="$TEST_ROOT/init-no-home.out"
+  if (
+    cd "$work" || exit 1
+    env -u HOME -u DUET_STATE_ROOT -u DUET_CONFIG -u DUET_SESSION \
+      PATH="$fake_bin:$PATH" DUET_TEST_REAL_TMUX="$real_tmux" \
+      TMUX="$TMUX_SOCKET,$TMUX_SERVER_PID,0" TMUX_PANE="$INIT_PANE" \
+      bash "$INIT_SCRIPT" codex
+  ) > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "missing HOME and state root is rejected cleanly"
+  assert_contains "$output" 'set DUET_STATE_ROOT or HOME' \
+    "missing state-root fallback diagnostic"
+
+  output="$TEST_ROOT/init-root-state.out"
+  if DUET_TEST_REAL_TMUX="$real_tmux" \
+      run_fixture_init "$work" / "$fake_bin:$PATH" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "filesystem root cannot be the state root"
+  assert_contains "$output" 'refusing to use / as DUET_STATE_ROOT' \
+    "filesystem-root state diagnostic"
+
+  state="$TEST_ROOT/init-"$'bad\tstate'
+  work="$TEST_ROOT/init-control-work"
+  mkdir -p "$state" "$work"
+  output="$TEST_ROOT/init-control-state.out"
+  if DUET_TEST_REAL_TMUX="$real_tmux" \
+      run_fixture_init "$work" "$state" "$fake_bin:$PATH" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "control character in canonical state root is rejected"
+  assert_contains "$output" 'DUET_STATE_ROOT contains a control character' \
+    "state-root control-character diagnostic"
+  assert_no_file "$state/workdirs" "invalid state root is rejected before registry creation"
+
+  # An active record may be lexically under the state root while resolving
+  # elsewhere. Neither a symlink nor a dot-dot spelling may reach duet.env.
+  state="$TEST_ROOT/init-prev-state"
+  work="$TEST_ROOT/init-prev-work"
+  outside="$TEST_ROOT/init-prev-outside"
+  sentinel="$outside/config-sourced"
+  mkdir -p "$state/workdirs" "$work" "$outside"
+  key="$(duet_workdir_key "$work")"
+  {
+    printf 'touch %q\n' "$sentinel"
+    printf 'DUET_DIR=%q\n' "$outside"
+    printf 'WORKDIR=%q\n' "$work"
+  } > "$outside/duet.env"
+  ln -s "$outside" "$state/escaped"
+  printf '%s\n' "$state/escaped" > "$state/workdirs/$key.active"
+  output="$TEST_ROOT/init-prev-symlink.out"
+  if DUET_TEST_REAL_TMUX="$real_tmux" \
+      run_fixture_init "$work" "$state" "$fake_bin:$PATH" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "symlinked predecessor escape is rejected"
+  assert_no_file "$sentinel" "symlinked predecessor config is never sourced"
+
+  printf '%s\n' "$state/../init-prev-outside" > "$state/workdirs/$key.active"
+  output="$TEST_ROOT/init-prev-dotdot.out"
+  if DUET_TEST_REAL_TMUX="$real_tmux" \
+      run_fixture_init "$work" "$state" "$fake_bin:$PATH" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "dot-dot predecessor escape is rejected"
+  assert_no_file "$sentinel" "dot-dot predecessor config is never sourced"
+
+  mkdir -p "$state/inside"
+  ln -s "$outside/duet.env" "$state/inside/duet.env"
+  printf '%s\n' "$state/inside" > "$state/workdirs/$key.active"
+  output="$TEST_ROOT/init-prev-config-symlink.out"
+  if DUET_TEST_REAL_TMUX="$real_tmux" \
+      run_fixture_init "$work" "$state" "$fake_bin:$PATH" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "symlinked predecessor config is rejected"
+  assert_no_file "$sentinel" "symlinked predecessor config target is never sourced"
+
+  state="$TEST_ROOT/init-legacy-config-state"
+  mkdir -p "$state/legacy"
+  ln -s "$outside/duet.env" "$state/legacy/duet.env"
+  output="$TEST_ROOT/init-legacy-config-symlink.out"
+  if DUET_TEST_REAL_TMUX="$real_tmux" \
+      run_fixture_init "$work" "$state" "$fake_bin:$PATH" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "symlinked legacy-scan config is rejected"
+  assert_no_file "$sentinel" "symlinked legacy-scan target is never sourced"
+
+  # Refusing an instruction-file symlink must leave both the link and target
+  # byte-for-byte intact, including text that resembles a duet anchor.
+  state="$TEST_ROOT/init-anchor-state"
+  work="$TEST_ROOT/init-anchor-work"
+  anchor_target="$TEST_ROOT/init-anchor-target"
+  anchor_body=$'keep\n<!-- DUET:BEGIN test -->\ndo-not-edit\n<!-- DUET:END -->'
+  mkdir -p "$state" "$work"
+  printf '%s' "$anchor_body" > "$anchor_target"
+  ln -s "$anchor_target" "$work/AGENTS.md"
+  output="$TEST_ROOT/init-anchor.out"
+  if DUET_TEST_REAL_TMUX="$real_tmux" \
+      run_fixture_init "$work" "$state" "$fake_bin:$PATH" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -ne 0 ] || fail "symlinked anchor unexpectedly allowed init"
+  assert_contains "$output" 'refusing symlinked anchor file' \
+    "symlinked anchor refusal diagnostic"
+  assert_eq "$anchor_body" "$(cat "$anchor_target")" \
+    "symlinked anchor target is unchanged"
+  [ -L "$work/AGENTS.md" ] || fail "symlinked AGENTS.md was replaced"
+
+  # Make the pane PID appear changed only during failure cleanup. A real
+  # current/ directory must abort publication, and cleanup must preserve the
+  # pane whose current process no longer matches the PID captured at spawn.
+  state="$TEST_ROOT/init-current-dir-state"
+  work="$TEST_ROOT/init-current-dir-work"
+  mkdir -p "$state/current" "$work"
+  output="$TEST_ROOT/init-current-dir.out"
+  if DUET_TEST_REAL_TMUX="$real_tmux" \
+      DUET_TEST_INIT_PANE="$INIT_PANE" \
+      DUET_TEST_PID_MARKER="$TEST_ROOT/init-worker-pane" \
+      run_fixture_init "$work" "$state" "$fake_bin:$PATH" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "real current directory rejects publication"
+  assert_contains "$output" 'publication path is a directory' \
+    "real current directory refusal diagnostic"
+  assert_eq "" "$(ls -A "$state/current" 2>/dev/null || true)" \
+    "publication does not create a symlink inside current directory"
+  worker_pane="$(cat "$TEST_ROOT/init-worker-pane" 2>/dev/null || true)"
+  actual_pid="$(command tmux -L "$TMUX_LABEL" display-message -p \
+    -t "$worker_pane" '#{pane_pid}' 2>/dev/null || true)"
+  [ -n "$actual_pid" ] || fail "PID-mismatched init worker was killed during cleanup"
+  [ -z "$worker_pane" ] \
+    || command tmux -L "$TMUX_LABEL" kill-pane -t "$worker_pane" 2>/dev/null || true
+
+  # A successful ln(1) status is insufficient: publication is complete only
+  # when readlink reports the exact session directory.
+  state="$TEST_ROOT/init-readlink-state"
+  work="$TEST_ROOT/init-readlink-work"
+  mkdir -p "$state" "$work"
+  state="$(cd "$state" && pwd -P)"
+  before_panes="$(command tmux -L "$TMUX_LABEL" list-panes -a -F '#{pane_id}' | wc -l | tr -d ' ')"
+  output="$TEST_ROOT/init-readlink.out"
+  if DUET_TEST_REAL_TMUX="$real_tmux" DUET_TEST_REAL_LN="$real_ln" \
+      DUET_TEST_CURRENT_LINK="$state/current" \
+      DUET_TEST_BASH_ENV="$fake_bash_env" \
+      run_fixture_init "$work" "$state" "$fake_bin:$PATH" \
+      > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "unverified current publication is rejected"
+  assert_contains "$output" 'could not publish the current-session convenience link' \
+    "unverified publication diagnostic"
+  assert_no_file "$state/current" "unverified current link is not accepted"
+  after_panes="$(command tmux -L "$TMUX_LABEL" list-panes -a -F '#{pane_id}' | wc -l | tr -d ' ')"
+  assert_eq "$before_panes" "$after_panes" \
+    "PID-matched init worker is removed after publication failure"
+}
+
+test_end_legacy_pane_pid_fences(){
+  local configured_pane configured_pid ambient_pane ambient_pid output rc actual_pid
+
+  configured_pane="$(command tmux -L "$TMUX_LABEL" split-window -d -P -F '#{pane_id}' \
+    -t "$TMUX_SESSION" 'exec sleep 600')"
+  configured_pid="$(command tmux -L "$TMUX_LABEL" display-message -p \
+    -t "$configured_pane" '#{pane_pid}')"
+  create_state legacy-configured-pane
+  rm -f "$DUET_DIR/roster.tsv"
+  : > "$DUET_DIR/.ended"
+  {
+    printf 'CODEX_PANE=%q\n' "$configured_pane"
+    printf 'CODEX_PANE_PID=%q\n' "$configured_pid"
+  } >> "$CURRENT_CONFIG"
+  output="$TEST_ROOT/end-legacy-configured.out"
+  if DUET_CONFIG="$CURRENT_CONFIG" DUET_SESSION="$DUET_SESSION_ID" \
+      TMUX_PANE="$INIT_PANE" bash "$END_SCRIPT" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 0 "$rc" "config-pinned legacy teardown succeeds"
+  actual_pid="$(command tmux -L "$TMUX_LABEL" display-message -p \
+    -t "$configured_pane" '#{pane_pid}' 2>/dev/null || true)"
+  assert_eq "" "$actual_pid" "config-pinned legacy pane and PID are reaped"
+
+  ambient_pane="$(command tmux -L "$TMUX_LABEL" split-window -d -P -F '#{pane_id}' \
+    -t "$TMUX_SESSION" 'exec sleep 600')"
+  ambient_pid="$(command tmux -L "$TMUX_LABEL" display-message -p \
+    -t "$ambient_pane" '#{pane_pid}')"
+  create_state legacy-ambient-pane
+  rm -f "$DUET_DIR/roster.tsv"
+  : > "$DUET_DIR/.ended"
+  output="$TEST_ROOT/end-legacy-ambient.out"
+  if DUET_CONFIG="$CURRENT_CONFIG" DUET_SESSION="$DUET_SESSION_ID" \
+      CODEX_PANE="$ambient_pane" CODEX_PANE_PID="$ambient_pid" \
+      TMUX_PANE="$INIT_PANE" bash "$END_SCRIPT" > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 0 "$rc" "legacy teardown ignores inherited pane identity"
+  actual_pid="$(command tmux -L "$TMUX_LABEL" display-message -p \
+    -t "$ambient_pane" '#{pane_pid}' 2>/dev/null || true)"
+  assert_eq "$ambient_pid" "$actual_pid" \
+    "inherited CODEX_PANE and CODEX_PANE_PID cannot select a victim"
+  command tmux -L "$TMUX_LABEL" kill-pane -t "$ambient_pane" 2>/dev/null || true
 }
 
 test_already_ended_finalization(){
-  local output_dir roster_tmp first_rc second_rc alive_panes
+  local output_dir roster_tmp first_rc second_rc alive_panes stale_worker_pid actual_pid
   create_state already-ended
   output_dir="$TEST_ROOT/already-ended-output"
   mkdir -p "$output_dir"
 
-  # Preserve the shared fixture panes for the subsequent drain test; this case
-  # exercises already-ended finalization rather than spawned-pane ownership.
+  # Preserve the shared fixture panes for the subsequent drain test. One row
+  # deliberately retains spawned=1 and the live pane ID with a stale PID,
+  # modeling a pane ID reused by a replacement process after the roster write.
   roster_tmp="$DUET_DIR/.roster.test"
-  awk -F '\t' 'BEGIN { OFS="\t" } NR > 1 { $6=0 } { print }' \
+  stale_worker_pid=$((10#$WORKER_ONE_PANE_PID + 1000000))
+  awk -F '\t' -v stale="$stale_worker_pid" 'BEGIN { OFS="\t" }
+    NR > 1 {
+      $6=0
+      if ($1 == "codex-1") { $4=stale; $6=1 }
+    }
+    { print }
+  ' \
     "$DUET_DIR/roster.tsv" > "$roster_tmp"
   mv "$roster_tmp" "$DUET_DIR/roster.tsv"
   : > "$DUET_DIR/.ended"
@@ -716,11 +1207,13 @@ test_already_ended_finalization(){
     printf '<!-- DUET:BEGIN test -->\nremove-ended-claude\n<!-- DUET:END -->\n'
   } > "$WORKDIR/CLAUDE.md"
 
-  DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+  DUET_CONFIG="$CURRENT_CONFIG" DUET_SESSION="$DUET_SESSION_ID" \
+    DUET_STATE_ROOT="$DUET_STATE_ROOT" \
     TMUX_PANE="$INIT_PANE" bash "$END_SCRIPT" \
     > "$output_dir/first.out" 2> "$output_dir/first.err"
   first_rc=$?
-  DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+  DUET_CONFIG="$CURRENT_CONFIG" DUET_SESSION="$DUET_SESSION_ID" \
+    DUET_STATE_ROOT="$DUET_STATE_ROOT" \
     TMUX_PANE="$INIT_PANE" bash "$END_SCRIPT" \
     > "$output_dir/second.out" 2> "$output_dir/second.err"
   second_rc=$?
@@ -744,6 +1237,12 @@ test_already_ended_finalization(){
   alive_panes="$(command tmux -L "$TMUX_LABEL" list-panes -a -F '#{pane_id}')"
   printf '%s\n' "$alive_panes" | grep -qxF "$INIT_PANE" \
     || fail "initiator pane was killed by already-ended finalization"
+  printf '%s\n' "$alive_panes" | grep -qxF "$WORKER_ONE_PANE" \
+    || fail "replacement process in reused pane ID was killed during teardown"
+  actual_pid="$(command tmux -L "$TMUX_LABEL" display-message -p \
+    -t "$WORKER_ONE_PANE" '#{pane_pid}' 2>/dev/null || true)"
+  assert_eq "$WORKER_ONE_PANE_PID" "$actual_pid" \
+    "pane-PID fence preserves replacement process during repeated teardown"
 }
 
 test_drain_admission_barrier(){
@@ -760,7 +1259,11 @@ test_drain_admission_barrier(){
   {
     printf '%s\n' '#!/usr/bin/env bash'
     printf '%s\n' 'set -u'
-    printf '%s\n' 'dir="$1"'
+    printf '%s\n' '[ "$1" = --session ] || exit 2'
+    printf '%s\n' 'config="$2"'
+    printf '%s\n' '[ "$3" = --session-id ] || exit 2'
+    printf '%s\n' 'session_id="$4"'
+    printf '%s\n' 'dir="$5"'
     printf '%s\n' 'cleanup(){'
     printf '%s\n' '  recorded="$(cat "$dir/daemon.pid" 2>/dev/null || true)"'
     printf '%s\n' '  [ "$recorded" != "$$" ] || rm -f "$dir/daemon.pid"'
@@ -773,7 +1276,7 @@ test_drain_admission_barrier(){
     printf '%s\n' 'trap cleanup EXIT'
     printf '%s\n' "trap 'exit 0' INT TERM"
     printf '%s\n' 'while [ ! -f "$dir/.ended" ]; do'
-    printf '%s\n' '  if [ -f "$2" ]; then'
+    printf '%s\n' '  if [ -f "$6" ]; then'
     printf '%s\n' '    for box in "$dir"/inbox/*; do'
     printf '%s\n' '      [ -d "$box" ] || continue'
     printf '%s\n' '      for file in "$box"/N-*.msg "$box"/I-*.msg; do'
@@ -788,8 +1291,9 @@ test_drain_admission_barrier(){
   } > "$fake_script"
   chmod +x "$fake_script"
 
-  fake_pid="$(bash -c 'nohup bash "$1" "$2" "$3" >/dev/null 2>&1 & echo $!' \
-    duet-test "$fake_script" "$DUET_DIR" "$release_file")"
+  fake_pid="$(bash -c 'nohup bash "$1" --session "$2" --session-id "$3" "$4" "$5" >/dev/null 2>&1 & echo $!' \
+    duet-test "$fake_script" "$CURRENT_CONFIG" "$DUET_SESSION_ID" \
+    "$DUET_DIR" "$release_file")"
   ACTIVE_DAEMON_PIDS="$ACTIVE_DAEMON_PIDS $fake_pid"
   mkdir "$DUET_DIR/.daemon.lock"
   printf '%s\tfake\n' "$fake_pid" > "$DUET_DIR/.daemon.lock/owner"
@@ -808,7 +1312,7 @@ test_drain_admission_barrier(){
   } > "$WORKDIR/CLAUDE.md"
 
   (
-    unset TMUX_PANE DUET_SELF
+    unset TMUX TMUX_PANE DUET_SELF
     export DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT DUET_ALLOW_FROM_OVERRIDE=1
     printf 'final queued message\n' | bash "$SEND_SCRIPT" codex-1 --from claude
   ) > "$output_dir/initial.out" 2>&1
@@ -817,7 +1321,8 @@ test_drain_admission_barrier(){
   before_counter="$(cat "$DUET_DIR/inbox/codex-1/.counter")"
   before_transcript="$(transcript_count "$DUET_DIR/transcript.md")"
 
-  DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+  DUET_CONFIG="$CURRENT_CONFIG" DUET_SESSION="$DUET_SESSION_ID" \
+    DUET_STATE_ROOT="$DUET_STATE_ROOT" \
     TMUX_PANE="$INIT_PANE" DUET_DRAIN_TIMEOUT=5 \
     bash "$END_SCRIPT" > "$output_dir/end.out" 2> "$output_dir/end.err" &
   end_pid=$!
@@ -827,7 +1332,7 @@ test_drain_admission_barrier(){
   fi
 
   (
-    unset TMUX_PANE DUET_SELF
+    unset TMUX TMUX_PANE DUET_SELF
     export DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT DUET_ALLOW_FROM_OVERRIDE=1
     printf 'must be rejected\n' | bash "$SEND_SCRIPT" codex-1 --from claude
   ) > "$output_dir/rejected.out" 2>&1
@@ -869,6 +1374,11 @@ run_case 'malformed body64 rejection' test_malformed_body_rejected
 run_case 'terminal counter rollback rejection' test_terminal_counter_rollback_rejected
 run_case 'uncertain landing DEAD fencing' test_uncertain_dead_fencing
 run_case 'daemon stop owner mismatch fence' test_daemon_stop_owner_mismatch
+run_case 'daemon metacharacter path identity fence' test_daemon_metachar_path_identity
+run_case 'stale lock symlink escape fence' test_stale_lock_symlink_escape
+run_case 'init path, publication, anchor, and cleanup fences' \
+  test_init_path_publication_and_cleanup_fences
+run_case 'legacy end pane/PID environment fences' test_end_legacy_pane_pid_fences
 run_case 'already-ended idempotent finalization' test_already_ended_finalization
 run_case 'drain admission barrier and safe teardown' test_drain_admission_barrier
 

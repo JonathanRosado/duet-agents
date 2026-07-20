@@ -37,13 +37,19 @@ command -v tmux >/dev/null 2>&1 || { echo "duet: tmux not found on PATH" >&2; ex
 [ "$#" -gt 0 ] || set -- codex
 [ "$#" -ge 1 ] && [ "$#" -le 4 ] || { usage; exit 2; }
 
-WORKDIR="$PWD"
+WORKDIR="$(pwd -P)"
 INITIATOR_NAME=claude
 INITIATOR_PANE="${TMUX_PANE:?duet: initiating pane has no TMUX_PANE}"
 DUET_TMUX_SOCKET="$(tmux display-message -p -t "$INITIATOR_PANE" '#{socket_path}')"
 WINDOW_ID="$(_duet_tmux display-message -p -t "$INITIATOR_PANE" '#{window_id}')"
 DUET_TMUX_SERVER_PID="$(_duet_tmux display-message -p '#{pid}')"
-DUET_STATE_ROOT="${DUET_STATE_ROOT:-$HOME/.duet}"
+if [ -z "${DUET_STATE_ROOT:-}" ]; then
+  [ -n "${HOME:-}" ] || {
+    echo "duet: set DUET_STATE_ROOT or HOME before starting a session." >&2
+    exit 7
+  }
+  DUET_STATE_ROOT="$HOME/.duet"
+fi
 
 workers=("$@")
 worker_names=()
@@ -69,28 +75,194 @@ for harness in "${workers[@]}"; do
 done
 
 mkdir -p "$DUET_STATE_ROOT"
-
-# Reap only spawned panes from the previous session under this state root. The
-# current initiating pane is an unconditional exemption, including malformed
-# or legacy rosters.
-PREV_ENV="$DUET_STATE_ROOT/current/duet.env"
-if [ -f "$PREV_ENV" ]; then
-  caller_pane="$INITIATOR_PANE"
-  if ! (
-    unset DUET_DIR WORKDIR PLUGIN_DIR DUET_TMUX_SOCKET DUET_TMUX_SERVER_PID CODEX_PANE
-    # shellcheck disable=SC1090
-    . "$PREV_ENV"
-    duet_reap_session "${DUET_DIR:-}" "${WORKDIR:-}" "${DUET_TMUX_SOCKET:-}" \
-      "$caller_pane" "${CODEX_PANE:-}" "${DUET_TMUX_SERVER_PID:-}"
-  ); then
-    echo "duet: previous session could not be stopped safely; init aborted." >&2
+DUET_STATE_ROOT="$(cd "$DUET_STATE_ROOT" && pwd -P)"
+if [ "$DUET_STATE_ROOT" = / ]; then
+  echo "duet: refusing to use / as DUET_STATE_ROOT." >&2
+  exit 7
+fi
+case "$DUET_STATE_ROOT" in
+  *$'\t'*|*$'\r'*|*$'\n'*)
+    echo "duet: DUET_STATE_ROOT contains a control character; init aborted." >&2
     exit 7
+    ;;
+esac
+mkdir -p "$DUET_STATE_ROOT/workdirs"
+DUET_WORKDIR_KEY="$(duet_workdir_key "$WORKDIR")"
+WORKDIR_ACTIVE="$DUET_STATE_ROOT/workdirs/$DUET_WORKDIR_KEY.active"
+WORKDIR_LOCK="$DUET_STATE_ROOT/workdirs/$DUET_WORKDIR_KEY.lock"
+workdir_lock_held=""
+
+release_workdir_lock(){
+  [ -n "$workdir_lock_held" ] || return 0
+  if duet_lock_release "$WORKDIR_LOCK"; then
+    workdir_lock_held=""
+    return 0
+  fi
+  return 1
+}
+
+# Locate a pre-A8 predecessor only by inspecting immutable session configs and
+# matching their canonical workdir. Never consult current as routing state.
+legacy_predecessor_candidate(){
+  local env="${1:?config required}" expected="${2:?expected workdir required}"
+  local expected_root="$DUET_STATE_ROOT" config_parent config_dir config_workdir
+  local DUET_DIR="" WORKDIR="" PLUGIN_DIR="" DUET_TMUX_SOCKET=""
+  local DUET_TMUX_SERVER_PID="" DUET_SESSION="" DUET_SESSION_ID=""
+  local DUET_WORKDIR_KEY="" CODEX_PANE="" CODEX_PANE_PID=""
+
+  config_parent="$(cd "$(dirname "$env")" && pwd -P)" || return 1
+  case "$config_parent" in
+    "$expected_root"/*) : ;;
+    *) return 1 ;;
+  esac
+  # shellcheck disable=SC1090
+  . "$env" 2>/dev/null || return 1
+  [ -n "$DUET_DIR" ] && [ -n "$WORKDIR" ] || return 1
+  config_dir="$(cd "$DUET_DIR" 2>/dev/null && pwd -P)" || return 1
+  config_workdir="$(cd "$WORKDIR" 2>/dev/null && pwd -P)" || return 1
+  [ "$config_dir" = "$config_parent" ] || return 1
+  [ "$config_workdir" = "$expected" ] || return 1
+  printf '%s' "$config_dir"
+}
+
+find_legacy_predecessor(){
+  local env candidate match="" count=0 expected_workdir="$WORKDIR"
+  for env in "$DUET_STATE_ROOT"/*/duet.env; do
+    if [ -L "$env" ]; then
+      echo "duet: refusing symlinked legacy session config: $env" >&2
+      return 1
+    fi
+    [ -f "$env" ] || continue
+    [ "$(basename "$(dirname "$env")")" != current ] || continue
+    [ ! -f "$(dirname "$env")/.ended" ] || continue
+    candidate="$(legacy_predecessor_candidate "$env" "$expected_workdir")" \
+      || continue
+    [ -n "$candidate" ] || continue
+    count=$((count + 1))
+    match="$candidate"
+  done
+  if [ "$count" -gt 1 ]; then
+    echo "duet: multiple live legacy sessions claim workdir $WORKDIR; refusing ambiguous reap." >&2
+    return 1
+  fi
+  printf '%s' "$match"
+}
+
+workdir_lock_attempts="${DUET_WORKDIR_LOCK_ATTEMPTS:-4000}"
+case "$workdir_lock_attempts" in ''|*[!0-9]*) workdir_lock_attempts=4000;; esac
+duet_lock_acquire "$WORKDIR_LOCK" "$workdir_lock_attempts" || {
+  echo "duet: another init/end owns the workdir transition lock." >&2
+  exit 7
+}
+workdir_lock_held=1
+trap 'release_workdir_lock 2>/dev/null || true' EXIT
+
+PREV_DIR=""
+PREV_DIR_RECORDED=""
+if [ -f "$WORKDIR_ACTIVE" ]; then
+  PREV_DIR="$(cat "$WORKDIR_ACTIVE" 2>/dev/null || true)"
+  case "$PREV_DIR" in
+    ''|*$'\n'*)
+      echo "duet: corrupt active-session record for workdir $WORKDIR; init aborted." >&2
+      exit 7
+      ;;
+  esac
+else
+  PREV_DIR="$(find_legacy_predecessor)" || exit 7
+fi
+
+if [ -n "$PREV_DIR" ]; then
+  PREV_DIR_RECORDED="$PREV_DIR"
+  PREV_DIR="$(cd "$PREV_DIR" 2>/dev/null && pwd -P)" || {
+    echo "duet: active session path is unavailable; init aborted." >&2
+    exit 7
+  }
+  case "$PREV_DIR" in
+    "$DUET_STATE_ROOT"/*) : ;;
+    *) echo "duet: active session is outside DUET_STATE_ROOT; init aborted." >&2; exit 7 ;;
+  esac
+  PREV_ENV="$PREV_DIR/duet.env"
+  if [ -L "$PREV_ENV" ]; then
+    echo "duet: active session config is a symlink; init aborted." >&2
+    exit 7
+  fi
+  [ -f "$PREV_ENV" ] || {
+    echo "duet: active session config is missing: $PREV_ENV" >&2
+    exit 7
+  }
+  caller_pane="$INITIATOR_PANE"
+  expected_workdir="$WORKDIR"
+  expected_prev_dir="$(cd "$PREV_DIR" && pwd -P)"
+  if ! (
+    config_path="$PREV_ENV"
+    config_parent="$(cd "$(dirname "$config_path")" && pwd -P)" || exit 1
+    unset DUET_DIR WORKDIR PLUGIN_DIR DUET_TMUX_SOCKET DUET_TMUX_SERVER_PID
+    unset DUET_SESSION DUET_SESSION_ID DUET_WORKDIR_KEY CODEX_PANE CODEX_PANE_PID
+    # shellcheck disable=SC1090
+    . "$config_path"
+    [ -n "${DUET_DIR:-}" ] && [ -n "${WORKDIR:-}" ] || exit 1
+    config_dir="$(cd "$DUET_DIR" 2>/dev/null && pwd -P)" || exit 1
+    config_workdir="$(cd "$WORKDIR" 2>/dev/null && pwd -P)" || exit 1
+    [ "$config_dir" = "$config_parent" ] || exit 1
+    [ "$config_dir" = "$expected_prev_dir" ] || exit 1
+    [ "$config_workdir" = "$expected_workdir" ] || exit 1
+    duet_reap_session "$config_dir" "$config_workdir" "${DUET_TMUX_SOCKET:-}" \
+      "$caller_pane" "${CODEX_PANE:-}" "${DUET_TMUX_SERVER_PID:-}" \
+      "${CODEX_PANE_PID:-}"
+  ); then
+    echo "duet: same-workdir predecessor could not be validated/reaped; init aborted." >&2
+    exit 7
+  fi
+  if [ -f "$WORKDIR_ACTIVE" ] \
+      && [ "$(cat "$WORKDIR_ACTIVE" 2>/dev/null || true)" = "$PREV_DIR_RECORDED" ]; then
+    rm -f "$WORKDIR_ACTIVE"
   fi
 fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 DUET_DIR="$(mktemp -d "$DUET_STATE_ROOT/$STAMP-XXXXXX")"
 DUET_SESSION_ID="$(basename "$DUET_DIR")"
+DUET_SESSION="$DUET_SESSION_ID"
+
+init_complete=""
+cleanup_on_exit(){
+  local status=$? i pane recorded_pid actual_pid current_target active_target cleanup_safe=1
+  if [ -z "$init_complete" ]; then
+    : > "$DUET_DIR/.ended" 2>/dev/null || true
+    if ! duet_stop_daemon "$DUET_DIR" 20; then
+      echo "duet: init cleanup left panes intact because the daemon could not be fenced." >&2
+      cleanup_safe=""
+    fi
+    if [ -n "$cleanup_safe" ]; then
+      # Bash 3.2 + nounset rejects an ordinary expansion of an empty array.
+      for i in ${worker_panes[@]+"${!worker_panes[@]}"}; do
+        pane="${worker_panes[$i]}"
+        recorded_pid="${worker_pids[$i]:-}"
+        [ -n "$pane" ] || continue
+        [ "$pane" = "$INITIATOR_PANE" ] && continue
+        [ -n "$recorded_pid" ] || continue
+        actual_pid="$(_duet_tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)"
+        [ "$actual_pid" = "$recorded_pid" ] \
+          && _duet_tmux kill-pane -t "$pane" 2>/dev/null || true
+      done
+      active_target="$(cat "$WORKDIR_ACTIVE" 2>/dev/null || true)"
+      if [ -z "$active_target" ] || [ "$active_target" = "$DUET_DIR" ]; then
+        duet_strip_session_anchors "$WORKDIR" || true
+        [ "$active_target" != "$DUET_DIR" ] || rm -f "$WORKDIR_ACTIVE"
+      fi
+      if duet_lock_acquire "$DUET_STATE_ROOT/.current.lock" 80 2>/dev/null; then
+        current_target="$(readlink "$DUET_STATE_ROOT/current" 2>/dev/null || true)"
+        [ "$current_target" != "$DUET_DIR" ] || rm -f "$DUET_STATE_ROOT/current"
+        duet_lock_release "$DUET_STATE_ROOT/.current.lock" 2>/dev/null || true
+      fi
+    fi
+  fi
+  release_workdir_lock 2>/dev/null || true
+  return "$status"
+}
+trap cleanup_on_exit EXIT
+trap 'exit 130' INT TERM
+
 mkdir -p "$DUET_DIR/ready"
 : > "$DUET_DIR/transcript.md"
 printf '# Duet assignments\n\nTerm 0 leader: claude\n' > "$DUET_DIR/assignments.md"
@@ -109,24 +281,38 @@ mkdir -p "$DUET_DIR/inbox/$INITIATOR_NAME/delivered" \
          "$DUET_DIR/inbox/leader/delivered" \
          "$DUET_DIR/inbox/leader/failed" \
          "$DUET_DIR/inbox/leader/quarantine" \
-         "$DUET_DIR/inbox/leader/superseded"
+         "$DUET_DIR/inbox/leader/superseded" \
+         "$DUET_DIR/inbox/promotions/delivered" \
+         "$DUET_DIR/inbox/promotions/failed" \
+         "$DUET_DIR/inbox/promotions/quarantine" \
+         "$DUET_DIR/inbox/promotions/superseded"
 
 # Leadership state is human-readable but never sourced as shell code.
 leader_tmp="$(mktemp "$DUET_DIR/.leader.XXXXXX")"
 printf 'term\t0\nleader\t%s\n' "$INITIATOR_NAME" > "$leader_tmp"
-mv -f "$leader_tmp" "$DUET_DIR/leader"
+if ! duet_publish_temp_file "$leader_tmp" "$DUET_DIR/leader"; then
+  rm -f "$leader_tmp" 2>/dev/null || true
+  echo "duet: could not publish initial leadership state." >&2
+  exit 7
+fi
+duet_watchdog_write 0 "$INITIATOR_NAME" 0
 
 render_brief(){
   local line
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line//@DUET_DIR@/$DUET_DIR}"
     line="${line//@PLUGIN@/$PLUGIN_DIR}"
+    line="${line//@DUET_SESSION@/$DUET_SESSION}"
     printf '%s\n' "$line"
   done < "$PLUGIN_DIR/briefs/ENSEMBLE_BRIEF.md"
 }
 
 append_anchor(){
   local file="${1:?anchor file required}"
+  if [ -L "$file" ]; then
+    echo "duet: refusing symlinked anchor file: $file" >&2
+    return 1
+  fi
   touch "$file"
   duet_strip_anchor_file "$file"
   {
@@ -135,28 +321,6 @@ append_anchor(){
     printf '<!-- DUET:END -->\n'
   } >> "$file"
 }
-
-init_complete=""
-cleanup_on_exit(){
-  local status=$? pane current_target
-  [ -n "$init_complete" ] && return "$status"
-  : > "$DUET_DIR/.ended" 2>/dev/null || true
-  if ! duet_stop_daemon "$DUET_DIR" 20; then
-    echo "duet: init cleanup left panes intact because the daemon could not be fenced." >&2
-    return "$status"
-  fi
-  for pane in "${worker_panes[@]}"; do
-    [ -n "$pane" ] || continue
-    [ "$pane" = "$INITIATOR_PANE" ] && continue
-    _duet_alive "$pane" && _duet_tmux kill-pane -t "$pane" 2>/dev/null || true
-  done
-  duet_strip_session_anchors "$WORKDIR" || true
-  current_target="$(readlink "$DUET_STATE_ROOT/current" 2>/dev/null || true)"
-  [ "$current_target" = "$DUET_DIR" ] && rm -f "$DUET_STATE_ROOT/current"
-  return "$status"
-}
-trap cleanup_on_exit EXIT
-trap 'exit 130' INT TERM
 
 append_anchor "$WORKDIR/AGENTS.md"
 append_anchor "$WORKDIR/CLAUDE.md"
@@ -194,7 +358,11 @@ for i in "${!workers[@]}"; do
     "${worker_names[$i]}" "${workers[$i]}" "${worker_panes[$i]}" \
     "${worker_pids[$i]}" "$((i + 1))" >> "$roster_tmp"
 done
-mv -f "$roster_tmp" "$DUET_DIR/roster.tsv"
+if ! duet_publish_temp_file "$roster_tmp" "$DUET_DIR/roster.tsv"; then
+  rm -f "$roster_tmp" 2>/dev/null || true
+  echo "duet: could not publish the session roster." >&2
+  exit 7
+fi
 
 env_tmp="$(mktemp "$DUET_DIR/.env.XXXXXX")"
 {
@@ -204,14 +372,39 @@ env_tmp="$(mktemp "$DUET_DIR/.env.XXXXXX")"
   printf 'PLUGIN_DIR=%q\n' "$PLUGIN_DIR"
   printf 'DUET_TMUX_SOCKET=%q\n' "$DUET_TMUX_SOCKET"
   printf 'DUET_TMUX_SERVER_PID=%q\n' "$DUET_TMUX_SERVER_PID"
+  printf 'DUET_SESSION=%q\n' "$DUET_SESSION"
   printf 'DUET_SESSION_ID=%q\n' "$DUET_SESSION_ID"
+  printf 'DUET_WORKDIR_KEY=%q\n' "$DUET_WORKDIR_KEY"
   printf 'DUET_INITIATOR=%q\n' "$INITIATOR_NAME"
   printf 'DUET_INITIATOR_PANE=%q\n' "$INITIATOR_PANE"
 } > "$env_tmp"
-mv -f "$env_tmp" "$DUET_DIR/duet.env"
-ln -sfn "$DUET_DIR" "$DUET_STATE_ROOT/current"
+if ! duet_publish_temp_file "$env_tmp" "$DUET_DIR/duet.env"; then
+  rm -f "$env_tmp" 2>/dev/null || true
+  echo "duet: could not publish the session config." >&2
+  exit 7
+fi
+duet_atomic_write "$WORKDIR_ACTIVE" "$DUET_DIR"
+if ! duet_lock_acquire "$DUET_STATE_ROOT/.current.lock" 80; then
+  echo "duet: could not acquire the current-session publication lock." >&2
+  exit 7
+fi
+current_link="$DUET_STATE_ROOT/current"
+if [ -d "$current_link" ] && [ ! -L "$current_link" ]; then
+  duet_lock_release "$DUET_STATE_ROOT/.current.lock" 2>/dev/null || true
+  echo "duet: current-session publication path is a directory; refusing to publish." >&2
+  exit 7
+fi
+if ! ln -sfn "$DUET_DIR" "$current_link" \
+    || [ "$(readlink "$current_link" 2>/dev/null || true)" != "$DUET_DIR" ]; then
+  duet_lock_release "$DUET_STATE_ROOT/.current.lock" 2>/dev/null || true
+  echo "duet: could not publish the current-session convenience link." >&2
+  exit 7
+fi
+duet_lock_release "$DUET_STATE_ROOT/.current.lock"
 
-DUET_CONFIG="$DUET_DIR/duet.env" nohup bash "$PLUGIN_DIR/scripts/duet-deliverd.sh" \
+DUET_CONFIG="$DUET_DIR/duet.env" DUET_SESSION="$DUET_SESSION" \
+  nohup bash "$PLUGIN_DIR/scripts/duet-deliverd.sh" \
+  --session "$DUET_DIR/duet.env" --session-id "$DUET_SESSION_ID" \
   >/dev/null 2>&1 &
 daemon_boot_pid=$!
 disown 2>/dev/null || true
@@ -237,7 +430,11 @@ for i in "${!workers[@]}"; do
   boot_state=timeout
   for _ in $(seq 1 "$boot_timeout"); do
     if ! _duet_alive "$pane"; then boot_state=dead; break; fi
-    if _duet_tmux capture-pane -p -t "$pane" 2>/dev/null | grep -qE "$DUET_HARNESS_BOOT_RE"; then
+    # Tiling 3-5 agents can shrink a pane enough that the startup banner sits
+    # just above the visible viewport before this loop runs. Search a bounded
+    # slice of history so a ready TUI is not misclassified as a boot timeout.
+    if _duet_tmux capture-pane -p -S -200 -t "$pane" 2>/dev/null \
+        | grep -qE "$DUET_HARNESS_BOOT_RE"; then
       boot_state=ready
       break
     fi
@@ -249,8 +446,9 @@ for i in "${!workers[@]}"; do
   printf -v kick '[DUET boot]\nYou are %s (harness: %s). Read %s and %s/leader. Confirm readiness now by running exactly this shell command: printf '\''ok\\n'\'' > %s . Then wait for a task from the leader.' \
     "$name" "$harness" "$DUET_HARNESS_BRIEF_FILE" "$DUET_DIR" "$ready_path_q"
   kick_state=failed
-  if kick_output="$(printf '%s' "$kick" | DUET_CONFIG="$DUET_DIR/duet.env" \
-      bash "$SELF_DIR/duet-send.sh" "$name" --from "$INITIATOR_NAME")"; then
+  if kick_output="$(printf '%s' "$kick" \
+      | DUET_CONFIG="$DUET_DIR/duet.env" DUET_SESSION="$DUET_SESSION" \
+        bash "$SELF_DIR/duet-send.sh" "$name" --from "$INITIATOR_NAME")"; then
     kick_state="queued:${kick_output#duet: queued }"
   fi
   kick_states[$i]="$kick_state"
@@ -279,6 +477,10 @@ for i in "${!workers[@]}"; do
 done
 
 init_complete=1
+if ! release_workdir_lock; then
+  echo "duet: could not release the workdir transition lock." >&2
+  exit 7
+fi
 trap - EXIT INT TERM
 if [ "$failed" -ne 0 ]; then
   echo "duet: one or more workers did not confirm readiness; session left running for diagnosis." >&2
