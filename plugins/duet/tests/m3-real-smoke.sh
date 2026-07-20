@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Destructive-to-its-own-fixtures M3 gate against real Claude, Codex, and Kimi
-# TUIs. All tmux and duet state is isolated; HOME remains the caller's real
-# home so the installed CLIs can use their normal authentication.
+# Destructive-to-its-own-fixtures M3/M4 gate against real Claude, Codex, and
+# Kimi TUIs. All tmux and duet state is isolated; HOME remains the caller's
+# real home so the installed CLIs can use their normal authentication. Besides
+# failover/fencing, this is the release-candidate fan-out/fan-in and teardown
+# check used after documentation or packaging changes.
 set -u
 set -o pipefail
 
@@ -13,6 +15,8 @@ SEND_SCRIPT="$SCRIPTS_DIR/duet-send.sh"
 END_SCRIPT="$SCRIPTS_DIR/duet-end.sh"
 STATUS_SCRIPT="$SCRIPTS_DIR/duet-status.sh"
 DOCTOR_SCRIPT="$SCRIPTS_DIR/duet-doctor.sh"
+# shellcheck disable=SC1091
+. "$SCRIPTS_DIR/duet-common.sh"
 
 CLAUDE_MODEL=haiku
 CODEX_MODEL=gpt-5.3-codex-spark
@@ -361,6 +365,20 @@ pane_pid_is(){
   [ "$actual" = "$expected" ]
 }
 
+pane_absent(){
+  local which="$1" pane="$2"
+  if [ "$which" = hard ]; then
+    if tmux_hard list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$pane"; then
+      return 1
+    fi
+  else
+    if tmux_soft list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$pane"; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 process_has_arg_text(){
   local pid="$1" expected="$2" command_line
   command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
@@ -440,6 +458,35 @@ terminal_count_for_id(){
   printf '%s' "$count"
 }
 
+terminal_count_for_id_is(){
+  local box="${1:?queue directory required}" id="${2:?message id required}"
+  local expected="${3:?expected count required}"
+  [ "$(terminal_count_for_id "$box" "$id")" -eq "$expected" ]
+}
+
+transcript_token_count_is(){
+  local dir="${1:?session directory required}" token="${2:?token required}"
+  local expected="${3:?expected count required}" count
+  count="$(grep -cF "$token" "$dir/transcript.md" 2>/dev/null || true)"
+  [ "$count" -eq "$expected" ]
+}
+
+delivered_reply_count_is(){
+  local box="${1:?queue directory required}" sender="${2:?sender required}"
+  local expected_body="${3-}" expected_count="${4:?expected count required}"
+  local file count=0
+  for file in "$box"/delivered/N-*.msg "$box"/delivered/I-*.msg; do
+    [ -f "$file" ] || continue
+    duet_read_message "$file" || continue
+    if [ "$DUET_MESSAGE_SENDER" = "$sender" ] \
+        && [ "$DUET_MESSAGE_RECIPIENT" = leader ] \
+        && [ "$DUET_MESSAGE_BODY" = "$expected_body" ]; then
+      count=$((count + 1))
+    fi
+  done
+  [ "$count" -eq "$expected_count" ]
+}
+
 send_from(){
   local config="$1" sender="$2" recipient="$3" body="$4"
   local output_file="$LOG_DIR/send-$RANDOM-$$.txt"
@@ -453,6 +500,32 @@ send_from(){
   cat "$output_file" >> "$LOG_DIR/sends.log"
   SEND_ID="$(sed -n 's/^duet: queued \([^ ]*\) for .*/\1/p' "$output_file" | tail -n 1)"
   [ -n "$SEND_ID" ] || die "could not parse queued message id"
+  rm -f "$output_file"
+}
+
+send_all_from(){
+  local config="$1" sender="$2" body="$3"
+  local output_file="$LOG_DIR/send-all-$RANDOM-$$.txt"
+  if ! printf '%s' "$body" | env HOME="$REAL_HOME" \
+      DUET_CONFIG="$config" DUET_ALLOW_FROM_OVERRIDE=1 \
+      bash "$SEND_SCRIPT" all --from "$sender" --session "$config" \
+      > "$output_file" 2>&1; then
+    cat "$output_file" >> "$LOG_DIR/sends.log"
+    die "explicit broadcast from $sender failed (see sends.log)"
+  fi
+  cat "$output_file" >> "$LOG_DIR/sends.log"
+  SEND_ALL_CLAUDE_ID="$(sed -n 's/^duet: queued \([^ ]*\) for claude$/\1/p' \
+    "$output_file" | tail -n 1)"
+  SEND_ALL_KIMI_ID="$(sed -n 's/^duet: queued \([^ ]*\) for kimi-1$/\1/p' \
+    "$output_file" | tail -n 1)"
+  [ -n "$SEND_ALL_CLAUDE_ID" ] && [ -n "$SEND_ALL_KIMI_ID" ] \
+    || die "could not parse broadcast message ids"
+  [ "$(grep -cE '^duet: queued [^ ]+ for (claude|kimi-1)$' "$output_file" \
+      2>/dev/null || true)" -eq 2 ] \
+    || die "broadcast did not enqueue exactly one copy per non-sender"
+  if grep -qE '^duet: queued [^ ]+ for codex-1$' "$output_file"; then
+    die "broadcast enqueued an unexpected sender copy"
+  fi
   rm -f "$output_file"
 }
 
@@ -509,6 +582,51 @@ pane_start_command_has hard "$HARD_KIMI_PANE" "-m $KIMI_MODEL" \
   || die "Kimi worker did not launch with the smoke model"
 pane_history_has hard "$HARD_KIMI_PANE" 'Model:[[:space:]]+K2\.7 Coding' \
   || die "Kimi worker did not render the expected managed model"
+
+say "running one real leader fan-out / worker fan-in round"
+CODEX_FANIN_TOKEN="M4-FANIN-CODEX-$PPID-${RANDOM:-0}"
+KIMI_FANIN_TOKEN="M4-FANIN-KIMI-$PPID-${RANDOM:-0}"
+printf -v CODEX_FANOUT_BODY \
+  'M4 release-candidate fan-out. Run the pinned duet send command from your session brief exactly once and send this exact one-line body to leader: %s. Do not send any other duet reply for this task; then wait.' \
+  "$CODEX_FANIN_TOKEN"
+printf -v KIMI_FANOUT_BODY \
+  'M4 release-candidate fan-out. Run the pinned duet send command from your session brief exactly once and send this exact one-line body to leader: %s. Do not send any other duet reply for this task; then wait.' \
+  "$KIMI_FANIN_TOKEN"
+send_from "$HARD_CONFIG" claude codex-1 "$CODEX_FANOUT_BODY"
+CODEX_FANOUT_ID="$SEND_ID"
+send_from "$HARD_CONFIG" claude kimi-1 "$KIMI_FANOUT_BODY"
+KIMI_FANOUT_ID="$SEND_ID"
+wait_until 90 "Codex fan-out delivery" \
+  message_delivered "$HARD_DIR/inbox/codex-1" "$CODEX_FANOUT_ID"
+wait_until 90 "Kimi fan-out delivery" \
+  message_delivered "$HARD_DIR/inbox/kimi-1" "$KIMI_FANOUT_ID"
+# Each token appears once in the leader's assignment and once in the worker's
+# reply. Counting transcript entries, rather than pane text, also catches a
+# worker that accidentally enqueues a duplicate response. The pinned command
+# in the brief uses a heredoc, so the exact decoded reply body includes its one
+# terminating newline.
+wait_until 180 "Codex worker fan-in" \
+  transcript_token_count_is "$HARD_DIR" "$CODEX_FANIN_TOKEN" 2
+wait_until 180 "Kimi worker fan-in" \
+  transcript_token_count_is "$HARD_DIR" "$KIMI_FANIN_TOKEN" 2
+wait_until 180 "Codex reply delivered to leader" \
+  delivered_reply_count_is "$HARD_DIR/inbox/leader" codex-1 \
+    "$CODEX_FANIN_TOKEN"$'\n' 1
+wait_until 180 "Kimi reply delivered to leader" \
+  delivered_reply_count_is "$HARD_DIR/inbox/leader" kimi-1 \
+    "$KIMI_FANIN_TOKEN"$'\n' 1
+wait_until 120 "fan-in queue drain" all_messages_terminal "$HARD_DIR"
+sleep 2
+transcript_token_count_is "$HARD_DIR" "$CODEX_FANIN_TOKEN" 2 \
+  || die "Codex worker fan-in was missing or duplicated"
+transcript_token_count_is "$HARD_DIR" "$KIMI_FANIN_TOKEN" 2 \
+  || die "Kimi worker fan-in was missing or duplicated"
+delivered_reply_count_is "$HARD_DIR/inbox/leader" codex-1 \
+    "$CODEX_FANIN_TOKEN"$'\n' 1 \
+  || die "Codex worker reply was missing, duplicated, or not delivered"
+delivered_reply_count_is "$HARD_DIR/inbox/leader" kimi-1 \
+    "$KIMI_FANIN_TOKEN"$'\n' 1 \
+  || die "Kimi worker reply was missing, duplicated, or not delivered"
 
 say "exercising Codex collapsed-paste Enter-only continuation"
 LONG_TOKEN="codex-collapse-$PPID-${RANDOM:-0}"
@@ -641,6 +759,22 @@ env HOME="$REAL_HOME" bash "$DOCTOR_SCRIPT" --session "$HARD_CONFIG" \
   > "$LOG_DIR/hard-doctor.txt" 2>&1 || die "hard doctor found an issue"
 grep -qF 'doctor: healthy' "$LOG_DIR/hard-doctor.txt" \
   || die "hard doctor did not report healthy"
+HARD_DAEMON_PID="$(exact_daemon_pid "$HARD_CONFIG" 2>/dev/null || true)"
+case "$HARD_DAEMON_PID" in
+  ''|*[!0-9]*) die "hard daemon identity is invalid before end" ;;
+esac
+
+say "broadcasting DUET-END from the promoted leader"
+send_all_from "$HARD_CONFIG" codex-1 \
+  "DUET-END — M4 release-candidate teardown. Do not send another duet message; stop and wait for session cleanup."
+wait_until 90 "DUET-END delivery to remaining live worker" \
+  message_delivered "$HARD_DIR/inbox/kimi-1" "$SEND_ALL_KIMI_ID"
+# The broadcast also has a copy for the dead former leader. It cannot be
+# delivered, but must reach one durable terminal state so the drain barrier is
+# not hiding an active queue obligation.
+wait_until 60 "DUET-END dead-incumbent copy terminal" \
+  terminal_count_for_id_is "$HARD_DIR/inbox/claude" \
+    "$SEND_ALL_CLAUDE_ID" 1
 
 say "ending hard session without disturbing soft current"
 if ! run_timed_log 120 "$LOG_DIR/hard-end.log" env HOME="$REAL_HOME" \
@@ -648,6 +782,14 @@ if ! run_timed_log 120 "$LOG_DIR/hard-end.log" env HOME="$REAL_HOME" \
   die "explicit hard end failed or timed out"
 fi
 [ -f "$HARD_DIR/.ended" ] || die "hard end marker is missing"
+[ ! -f "$HARD_DIR/daemon.pid" ] || die "hard end left daemon.pid behind"
+if kill -0 "$HARD_DAEMON_PID" 2>/dev/null; then
+  die "hard end left its delivery daemon alive"
+fi
+pane_absent hard "$HARD_CODEX_PANE" \
+  || die "hard end left the spawned Codex pane alive"
+pane_absent hard "$HARD_KIMI_PANE" \
+  || die "hard end left the spawned Kimi pane alive"
 current_points_to "$SOFT_DIR" || die "ending hard session disturbed soft current"
 pane_pid_is soft "$SOFT_CLAUDE_PANE" "$SOFT_CLAUDE_PID" \
   || die "ending hard session disturbed soft leader pane"
@@ -742,6 +884,14 @@ if ! run_timed_log 120 "$LOG_DIR/soft-end.log" env HOME="$REAL_HOME" \
   die "explicit soft end failed or timed out"
 fi
 [ -f "$SOFT_DIR/.ended" ] || die "soft end marker is missing"
+[ ! -f "$SOFT_DIR/daemon.pid" ] || die "soft end left daemon.pid behind"
+if kill -0 "$SOFT_DAEMON_PID" 2>/dev/null; then
+  die "soft end left its delivery daemon alive"
+fi
+pane_absent soft "$SOFT_CODEX_PANE" \
+  || die "soft end left the spawned Codex pane alive"
+pane_pid_is soft "$SOFT_CLAUDE_PANE" "$SOFT_CLAUDE_PID" \
+  || die "soft end killed or replaced the non-spawned initiator pane"
 [ ! -e "$STATE_ROOT/current" ] && [ ! -L "$STATE_ROOT/current" ] \
   || die "soft end left the isolated current link behind"
 [ "$(default_current_fingerprint)" = "$DEFAULT_CURRENT_BEFORE" ] \
@@ -754,5 +904,5 @@ if grep -qF '<!-- DUET:BEGIN' "$HARD_WORK/AGENTS.md" "$HARD_WORK/CLAUDE.md" \
 fi
 
 SUCCESS=1
-say "PASS: real hard/soft failover, collapsed paste, A8 fences, and diagnostics"
+say "PASS: real fan-out/fan-in, hard/soft failover, DUET-END, A8 fences, and diagnostics"
 exit 0

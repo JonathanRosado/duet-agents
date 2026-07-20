@@ -28,7 +28,7 @@ duet_queue_next(){
   for file in "$box"/N-*.msg "$box"/I-*.msg; do
     [ -f "$file" ] || continue
     phase="$(cat "$file.phase" 2>/dev/null || true)"
-    case "$phase" in ENTER_ONLY|INFLIGHT) : ;; *) continue ;; esac
+    case "$phase" in ENTER_ONLY|INFLIGHT|CLEAR_RETRY) : ;; *) continue ;; esac
     sequence="$(duet_message_sequence "$file")"
     if [ -z "$best_sequence" ] || [[ "$sequence" < "$best_sequence" ]]; then
       DUET_NEXT_MESSAGE="$file"
@@ -514,7 +514,8 @@ duet_finish_quarantine(){
 }
 
 # Only attempts against the leader of the same term affect the soft watchdog.
-# Enter-only retries do not add failures; a verified success resets the count.
+# Enter-only and clear-recovery retries do not add failures; a verified success
+# resets the count.
 duet_watchdog_record_outcome(){
   local target_name="${1:-}" target_term="${2:-}" phase="${3:-}" rc="${4:-}"
   duet_read_leader_state || return 1
@@ -522,8 +523,8 @@ duet_watchdog_record_outcome(){
     && [ "$target_term" = "$DUET_CURRENT_TERM" ] || return 0
   case "$rc" in
     0) duet_watchdog_write "$DUET_CURRENT_TERM" "$DUET_CURRENT_LEADER" 0 ;;
-    "$DUET_SEND_NOT_LANDED"|"$DUET_SEND_LANDED_UNVERIFIED")
-      [ "$phase" != ENTER_ONLY ] || return 0
+    "$DUET_SEND_NOT_LANDED"|"$DUET_SEND_LANDED_UNVERIFIED"|"$DUET_SEND_COMPOSER_REFUSED")
+      [ "$phase" != ENTER_ONLY ] && [ "$phase" != CLEAR_RETRY ] || return 0
       duet_watchdog_failure "$DUET_CURRENT_TERM" "$DUET_CURRENT_LEADER"
       ;;
     *) return 0 ;;
@@ -555,7 +556,7 @@ duet_validate_message_session(){
 duet_process_one(){
   local box="${1:?queue directory required}" exact_file="${2:-}" file phase payload rc
   local attempts max enter_token interrupt="" target_is_symbolic="" target_harness=""
-  local continuation="" landing_evidence="" landing_clearable=""
+  local continuation="" clear_recovery="" landing_evidence="" landing_clearable=""
   local queue current_term current_leader target_term
   local bound_pane bound_name bound_term binding_complete="" reason
   DUET_PROCESS_ATTEMPTED=""
@@ -613,7 +614,8 @@ duet_process_one(){
   esac
 
   # Read the mutable delivery phase before applying term fences. Sanctioned
-  # promotion paths defer their CAS behind INFLIGHT/ENTER_ONLY roots. If an
+  # promotion paths defer their CAS behind INFLIGHT/ENTER_ONLY/CLEAR_RETRY
+  # roots. If an
   # unsafe raw leader edit bypassed that guard, keep the stale uncertain root
   # as a poison fence: never submit stale work and never release its pane for a
   # later paste while composer ownership is unknown.
@@ -625,7 +627,7 @@ duet_process_one(){
         return
       fi
       ;;
-    READY|ENTER_ONLY|INFLIGHT) : ;;
+    READY|ENTER_ONLY|INFLIGHT|CLEAR_RETRY) : ;;
     *)
       duet_finish_quarantine "$box" "$file" "invalid-delivery-phase-$phase"
       return
@@ -640,7 +642,7 @@ duet_process_one(){
            || [ "$DUET_MESSAGE_SENDER" != "$current_leader" ] \
            || [ "$DUET_MESSAGE_LEADER_AT_SEND" != "$current_leader" ]; }; then
     case "$phase" in
-      ENTER_ONLY|INFLIGHT)
+      ENTER_ONLY|INFLIGHT|CLEAR_RETRY)
         duet_deliverd_log "poison-fenced stale uncertain $DUET_MESSAGE_ID; operator recovery required"
         duet_write_sidecar "$file" retry_at "$(( $(date +%s) + 8 ))" || return 1
         return 0
@@ -689,6 +691,10 @@ duet_process_one(){
   if [ -n "$bound_pane$bound_name$bound_term" ]; then
     if [ -n "$bound_pane" ] && [ -n "$bound_name" ] && [ -n "$bound_term" ]; then
       binding_complete=1
+    elif [ "$phase" = CLEAR_RETRY ]; then
+      duet_deliverd_log "poison-fenced CLEAR_RETRY with incomplete target binding for $DUET_MESSAGE_ID"
+      duet_write_sidecar "$file" retry_at "$(( $(date +%s) + 8 ))" || return 1
+      return 0
     elif [ "$phase" = ENTER_ONLY ]; then
       duet_finish_quarantine "$box" "$file" incomplete-target-binding
       return
@@ -709,7 +715,8 @@ duet_process_one(){
   # provably pre-paste, so an empty/READY phase may safely discard it and
   # resolve a newly promoted symbolic leader.
   if [ -n "$binding_complete" ] \
-      && [ "$phase" != ENTER_ONLY ] && [ "$phase" != INFLIGHT ]; then
+      && [ "$phase" != ENTER_ONLY ] && [ "$phase" != INFLIGHT ] \
+      && [ "$phase" != CLEAR_RETRY ]; then
     duet_clear_target_binding "$file"
     bound_pane=""; bound_name=""; bound_term=""; binding_complete=""
   fi
@@ -717,6 +724,16 @@ duet_process_one(){
     if [ "$bound_name" != "$DUET_TARGET_NAME" ] \
         || [ "$bound_pane" != "$DUET_TARGET_PANE" ] \
         || { [ -n "$target_is_symbolic" ] && [ "$bound_term" != "$target_term" ]; }; then
+      case "$phase" in
+        ENTER_ONLY|INFLIGHT|CLEAR_RETRY)
+          # A raw leader-file edit can bypass the sanctioned pre-CAS
+          # ownership fence.  Never terminalize and release the old pane in
+          # that state; retain the original binding as a poison fence.
+          duet_deliverd_log "poison-fenced target change after possible landing for $DUET_MESSAGE_ID"
+          duet_write_sidecar "$file" retry_at "$(( $(date +%s) + 8 ))" || return 1
+          return 0
+          ;;
+      esac
       duet_finish_quarantine "$box" "$file" target-changed-after-possible-landing
       return
     fi
@@ -725,9 +742,24 @@ duet_process_one(){
     target_term="$bound_term"
   fi
 
+  target_harness="$(duet_roster_harness_for_name "$DUET_TARGET_NAME")"
   if [ "$DUET_TARGET_NAME" = NONE ] || [ -z "$DUET_TARGET_PANE" ] \
       || ! duet_roster_member_alive "$DUET_TARGET_NAME"; then
     rc=$DUET_SEND_DEAD
+  elif [ "$phase" = CLEAR_RETRY ]; then
+    clear_recovery=1
+    DUET_PROCESS_ATTEMPTED=1
+    enter_token="$(cat "$file.enter_token" 2>/dev/null || true)"
+    landing_evidence="$(cat "$file.landing_observed" 2>/dev/null || true)"
+    DUET_SEND_COMPOSER_CLEAR=""
+    if [ "$target_harness" != codex ] || [ "$landing_evidence" != marker ] \
+        || [ -z "$enter_token" ]; then
+      rc=$DUET_SEND_LANDED_UNVERIFIED
+    elif duet_clear_refused_composer "$DUET_TARGET_PANE" "$enter_token"; then
+      rc=0
+    else
+      rc=$?
+    fi
   elif [ "$phase" = ENTER_ONLY ] \
       || { [ "$phase" = INFLIGHT ] && [ -n "$binding_complete" ]; }; then
     continuation=1
@@ -737,7 +769,8 @@ duet_process_one(){
     DUET_SEND_COMPOSER_CLEAR=""
     DUET_SEND_LANDING_OBSERVED=""
     DUET_SEND_ENTER_TOKEN=""
-    if duet_send_enter_only "$DUET_TARGET_PANE" "$payload" "$enter_token"; then
+    if duet_send_enter_only "$DUET_TARGET_PANE" "$payload" "$enter_token" \
+        "$target_harness"; then
       rc=0
     else
       rc=$?
@@ -754,32 +787,48 @@ duet_process_one(){
       duet_write_sidecar "$file" landing_observed "$landing_evidence" || return 1
     fi
   else
-    target_harness="$(duet_roster_harness_for_name "$DUET_TARGET_NAME")"
     if [ -z "$binding_complete" ]; then
       duet_write_sidecar "$file" target_name "$DUET_TARGET_NAME" || return 1
       duet_write_sidecar "$file" target_pane "$DUET_TARGET_PANE" || return 1
       duet_write_sidecar "$file" target_term "$target_term" || return 1
     fi
+    # A new full attempt must never inherit a capability from a prior pane or
+    # a prior safe reset.  Remove it before publishing INFLIGHT.
+    rm -f "$file.enter_token" "$file.landing_observed" 2>/dev/null || true
     duet_write_sidecar "$file" phase INFLIGHT || {
       duet_deliverd_log "could not persist INFLIGHT for $DUET_MESSAGE_ID; daemon halting"
       return 1
     }
     DUET_PROCESS_ATTEMPTED=1
     if duet_send_verified "$DUET_TARGET_PANE" "$payload" "$interrupt" "$target_harness"; then rc=0; else rc=$?; fi
+    # Publish causal landing capabilities immediately on verifier return and
+    # before logging/watchdog work.  This minimizes the only unavoidable
+    # crash window between observing the live composer and durable recovery.
+    if [ -n "${DUET_SEND_ENTER_TOKEN:-}" ]; then
+      enter_token="$DUET_SEND_ENTER_TOKEN"
+      duet_write_sidecar "$file" enter_token "$enter_token" || return 1
+    fi
+    if [ -n "${DUET_SEND_LANDING_OBSERVED:-}" ]; then
+      landing_evidence="$DUET_SEND_LANDING_OBSERVED"
+      duet_write_sidecar "$file" landing_observed "$landing_evidence" || return 1
+    fi
     if [ -n "${DUET_SEND_COLLAPSED:-}" ]; then
       duet_deliverd_log "observed collapsed composer for $DUET_MESSAGE_ID -> $DUET_TARGET_NAME"
     fi
   fi
 
   if [ -n "$DUET_PROCESS_ATTEMPTED" ]; then
-    if [ -n "$continuation" ]; then
+    if [ -n "$clear_recovery" ]; then
+      :
+    elif [ -n "$continuation" ]; then
       duet_watchdog_record_outcome "$DUET_TARGET_NAME" "$target_term" ENTER_ONLY "$rc" || return 1
     else
       duet_watchdog_record_outcome "$DUET_TARGET_NAME" "$target_term" "$phase" "$rc" || return 1
     fi
   fi
   if [ -n "$continuation" ] && [ "$rc" -ne 0 ] \
-      && [ "$rc" -ne "$DUET_SEND_LANDED_UNVERIFIED" ]; then
+      && [ "$rc" -ne "$DUET_SEND_LANDED_UNVERIFIED" ] \
+      && [ "$rc" -ne "$DUET_SEND_COMPOSER_REFUSED" ]; then
     duet_finish_quarantine "$box" "$file" "enter-only-outcome-$rc"
     return
   fi
@@ -788,6 +837,52 @@ duet_process_one(){
   case "$attempts" in ''|*[!0-9]*) attempts=0;; esac
   max="${DUET_DELIVERY_MAX_ATTEMPTS:-5}"
   case "$max" in ''|*[!0-9]*) max=5;; esac
+
+  # CLEAR_RETRY is a durable, pane-owning phase.  It is published before any
+  # Escape/Ctrl-U recovery keys, so a crash either repeats only the idempotent
+  # clear or observes the already-empty composer.  No full payload can repaste
+  # until this branch verifies the owned marker is absent and resets READY.
+  if [ -n "$clear_recovery" ]; then
+    case "$rc" in
+      0)
+        [ -n "${DUET_SEND_COMPOSER_CLEAR:-}" ] || {
+          duet_deliverd_log "clear recovery lacked empty-composer evidence for $DUET_MESSAGE_ID"
+          duet_write_sidecar "$file" retry_at "$(( $(date +%s) + 8 ))" || return 1
+          return 0
+        }
+        duet_deliverd_log "cleared refused Codex composer for $DUET_MESSAGE_ID; requeueing stable ID"
+        if [ -z "$target_is_symbolic" ] && [ "$attempts" -ge "$max" ]; then
+          duet_move_terminal "$file" failed || return 1
+          duet_delivery_failure_notice "$DUET_TARGET_NAME" "$DUET_MESSAGE_ID" \
+            COMPOSER_REFUSED "$DUET_TERMINAL_FILE" || return 1
+        else
+          # READY is the crash-safe commit point: after it, stale capability
+          # sidecars are harmless and ordinary recovery may discard them.
+          duet_write_sidecar "$file" phase READY || return 1
+          rm -f "$file.enter_token" "$file.landing_observed" "$file.retry_at" \
+            2>/dev/null || true
+          duet_set_backoff "$file" "$((attempts > 0 ? attempts : 1))" || return 1
+          duet_clear_target_binding "$file"
+        fi
+        ;;
+      "$DUET_SEND_LANDED_UNVERIFIED")
+        duet_deliverd_log "refused Codex composer remains uncleared for $DUET_MESSAGE_ID"
+        duet_write_sidecar "$file" phase CLEAR_RETRY || return 1
+        duet_set_backoff "$file" "$((attempts > 0 ? attempts : 1))" || return 1
+        ;;
+      "$DUET_SEND_DEAD")
+        # The vanished pane cannot retain a dirty composer.  Reuse ordinary
+        # DEAD handling below to retry/reroute or terminalize as appropriate.
+        :
+        ;;
+      *)
+        duet_deliverd_log "unexpected clear-recovery outcome $rc for $DUET_MESSAGE_ID"
+        duet_write_sidecar "$file" retry_at "$(( $(date +%s) + 8 ))" || return 1
+        return 0
+        ;;
+    esac
+    [ "$rc" = "$DUET_SEND_DEAD" ] || return 0
+  fi
   case "$rc" in
     0)
       duet_deliverd_log "delivered $DUET_MESSAGE_ID -> $DUET_TARGET_NAME"
@@ -827,6 +922,26 @@ duet_process_one(){
         duet_write_sidecar "$file" retry_at "$(( $(date +%s) + 1 ))" || return 1
       fi
       ;;
+    "$DUET_SEND_COMPOSER_REFUSED")
+      # Only a causally observed Codex marker can reach this phase.  Publish
+      # its exact capability before the phase, then clear on a later pass.
+      if [ "$target_harness" != codex ] \
+          || [ "${DUET_SEND_LANDING_OBSERVED:-$landing_evidence}" != marker ] \
+          || [ -z "${DUET_SEND_ENTER_TOKEN:-$enter_token}" ]; then
+        duet_deliverd_log "refused-composer outcome lacked Codex marker evidence for $DUET_MESSAGE_ID"
+        duet_write_sidecar "$file" phase ENTER_ONLY || return 1
+        duet_write_sidecar "$file" retry_at "$(( $(date +%s) + 8 ))" || return 1
+        return 0
+      fi
+      enter_token="${DUET_SEND_ENTER_TOKEN:-$enter_token}"
+      duet_write_sidecar "$file" enter_token "$enter_token" || return 1
+      duet_write_sidecar "$file" landing_observed marker || return 1
+      attempts=$((attempts + 1))
+      duet_write_sidecar "$file" tries "$attempts" || return 1
+      duet_write_sidecar "$file" phase CLEAR_RETRY || return 1
+      duet_set_backoff "$file" "$attempts" || return 1
+      duet_deliverd_log "Codex composer refused Enter for $DUET_MESSAGE_ID; clear recovery scheduled"
+      ;;
     "$DUET_SEND_NOT_LANDED")
       attempts=$((attempts + 1))
       if [ -z "$target_is_symbolic" ] && [ "$attempts" -ge "$max" ]; then
@@ -861,6 +976,23 @@ duet_process_one(){
 
 duet_candidate_target(){
   local queue="${1:?queue required}" file="${2:?message required}"
+  local phase bound_name bound_pane
+  phase="$(cat "$file.phase" 2>/dev/null || true)"
+  case "$phase" in
+    ENTER_ONLY|INFLIGHT|CLEAR_RETRY)
+      bound_name="$(cat "$file.target_name" 2>/dev/null || true)"
+      bound_pane="$(cat "$file.target_pane" 2>/dev/null || true)"
+      if [ -n "$bound_name" ] && [ -n "$bound_pane" ]; then
+        # Ownership follows the durable physical binding, even after an unsafe
+        # raw leader edit.  This coalesces newer traffic targeting that old
+        # pane behind the poison-fenced root.
+        DUET_CANDIDATE_NAME="$bound_name"
+        DUET_CANDIDATE_PANE="$bound_pane"
+        DUET_CANDIDATE_KEY="pane:$bound_pane"
+        return 0
+      fi
+      ;;
+  esac
   case "$queue" in
     promotions) DUET_CANDIDATE_NAME="$(duet_raw_message_field "$file" recipient)" ;;
     leader)
@@ -900,7 +1032,8 @@ duet_collect_candidates(){
     # A composer that may already contain bytes predates the promotion and must
     # be resolved or retained as a poison fence before any new paste. The
     # promotion is still first among messages that have not possibly landed.
-    if [ "$phase" = ENTER_ONLY ] || [ "$phase" = INFLIGHT ]; then
+    if [ "$phase" = ENTER_ONLY ] || [ "$phase" = INFLIGHT ] \
+        || [ "$phase" = CLEAR_RETRY ]; then
       priority=0
     elif [ "$queue" = promotions ]; then
       priority=1

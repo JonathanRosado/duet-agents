@@ -1,11 +1,11 @@
 {
   "name": "duet",
-  "version": "0.1.2",
-  "description": "Pair Claude and Codex as peer agents in adjacent tmux or psmux panes. They collaborate through inline prompt delivery with a durable transcript, not screen-scraping.",
+  "version": "0.2.0",
+  "description": "Run Claude, Codex, and Kimi as a visible tmux ensemble with queued inline delivery, session fencing, and leader failover.",
   "author": {
     "name": "Jonathan Rosado",
     "url": "https://github.com/JonathanRosado"
   },
   "homepage": "https://github.com/JonathanRosado/duet-agents",
-  "keywords": ["codex", "tmux", "psmux", "multi-agent", "pair-programming", "orchestration", "duet"]
+  "keywords": ["claude", "codex", "kimi", "tmux", "multi-agent", "ensemble", "orchestration", "duet"]
 }

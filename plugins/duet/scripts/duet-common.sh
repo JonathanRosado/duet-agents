@@ -5,6 +5,10 @@
 DUET_SEND_DEAD=20
 DUET_SEND_NOT_LANDED=21
 DUET_SEND_LANDED_UNVERIFIED=22
+# A positively identified Codex collapsed-paste marker remained in the active
+# composer after the bounded Enter retries.  The caller must durably enter the
+# clear/retry state before sending recovery keys; it must not paste again yet.
+DUET_SEND_COMPOSER_REFUSED=23
 DUET_LOCK_TOKEN="${BASHPID:-$$}-${RANDOM:-0}-${RANDOM:-0}"
 
 # Always address the tmux server recorded for the session when one is known.
@@ -329,6 +333,22 @@ _duet_paste_marker(){
   fi
 }
 
+# Codex can render a single bracketed paste as more than one collapsed marker,
+# with the later marker appearing after the verifier first sampled the cursor
+# row.  Accept only an exact token or an extension made solely of additional
+# normalized Codex paste markers.  Arbitrary echoed characters and a different
+# marker are deliberately not treated as ours.
+_duet_codex_marker_owned(){
+  local current="${1:-}" token="${2:-}" remainder
+  [ -n "$current" ] && [ -n "$token" ] || return 1
+  printf '%s\n' "$token" \
+    | grep -qE '^codex(PastedContent[0-9]+chars)+$' || return 1
+  [ "$current" = "$token" ] && return 0
+  case "$current" in "$token"*) remainder="${current#"$token"}" ;; *) return 1;; esac
+  printf '%s\n' "$remainder" \
+    | grep -qE '^(PastedContent[0-9]+chars)+$'
+}
+
 duet_tmux_server_matches(){
   local expected="${DUET_TMUX_SERVER_PID:-}" actual
   [ -n "$expected" ] || return 0
@@ -350,6 +370,8 @@ _duet_alive(){
 #   DUET_SEND_NOT_LANDED          paste was not observed; caller may repaste
 #   DUET_SEND_LANDED_UNVERIFIED   paste landed, but submission is uncertain;
 #                                 caller must never paste the payload again
+#   DUET_SEND_COMPOSER_REFUSED    an owned Codex collapsed marker remained
+#                                 after Enter; persist clear/retry before keys
 duet_send_verified(){
   local pane="${1:-}" payload="${2:-}" interrupt="${3:-}" harness="${4:-}"
   local probe buffer i e marker_before marker_now landing_kind="" landing_token=""
@@ -395,6 +417,10 @@ duet_send_verified(){
     return "$DUET_SEND_NOT_LANDED"
   }
   marker_before="$(_duet_paste_marker "$pane")"
+  if [ -n "$marker_before" ]; then
+    echo "duet: target pane $pane already has a collapsed composer; not pasting." >&2
+    return "$DUET_SEND_NOT_LANDED"
+  fi
 
   buffer="duet-${BASHPID:-$$}-${RANDOM:-0}"
   if ! printf '%s' "$payload" | _duet_tmux load-buffer -b "$buffer" -; then
@@ -451,12 +477,29 @@ duet_send_verified(){
           _duet_present "$(_duet_tail_strip "$pane" 4)" "$landing_token" || return 0
           ;;
         marker)
-          [ "$(_duet_paste_marker "$pane")" = "$landing_token" ] || return 0
+          marker_now="$(_duet_paste_marker "$pane")"
+          [ -n "$marker_now" ] || return 0
+          if [ "$harness" = codex ] \
+              && _duet_codex_marker_owned "$marker_now" "$landing_token"; then
+            # A second placeholder can appear after the first sample.  Grow
+            # the exact capability rather than mistaking that redraw for a
+            # successful submission.
+            landing_token="$marker_now"
+            DUET_SEND_ENTER_TOKEN="$marker_now"
+          elif [ "$marker_now" != "$landing_token" ]; then
+            echo "duet: collapsed composer changed ownership in pane $pane" >&2
+            return "$DUET_SEND_LANDED_UNVERIFIED"
+          fi
           ;;
       esac
     done
   done
 
+  if [ "$harness" = codex ] && [ "$landing_kind" = marker ] \
+      && _duet_codex_marker_owned "$(_duet_paste_marker "$pane")" "$landing_token"; then
+    echo "duet: Codex composer retained an owned collapsed paste after Enter." >&2
+    return "$DUET_SEND_COMPOSER_REFUSED"
+  fi
   echo "duet: payload landed in pane $pane but submission is unverified." >&2
   return "$DUET_SEND_LANDED_UNVERIFIED"
 }
@@ -465,8 +508,8 @@ duet_send_verified(){
 # It never pastes. DUET_SEND_COMPOSER_CLEAR distinguishes an unverifiable but
 # absent payload from one whose probe/marker still visibly owns the composer.
 duet_send_enter_only(){
-  local pane="${1:-}" payload="${2:-}" marker_token="${3:-}"
-  local probe i kind
+  local pane="${1:-}" payload="${2:-}" marker_token="${3:-}" harness="${4:-}"
+  local probe i e kind marker_now
   DUET_SEND_COMPOSER_CLEAR=""
   DUET_SEND_LANDING_OBSERVED=""
   DUET_SEND_ENTER_TOKEN=""
@@ -476,34 +519,101 @@ duet_send_enter_only(){
   if _duet_present "$(_duet_tail_strip "$pane" 12)" "$probe"; then
     kind=probe
     DUET_SEND_LANDING_OBSERVED=probe
-  elif [ -n "$marker_token" ] && [ "$(_duet_paste_marker "$pane")" = "$marker_token" ]; then
+  else
+    marker_now="$(_duet_paste_marker "$pane")"
+  fi
+  if [ -z "${kind:-}" ] && [ -n "$marker_token" ] \
+      && { [ "$marker_now" = "$marker_token" ] \
+           || { [ "$harness" = codex ] \
+                && _duet_codex_marker_owned "$marker_now" "$marker_token"; }; }; then
     kind=marker
     DUET_SEND_LANDING_OBSERVED=marker
-  else
+    marker_token="$marker_now"
+    DUET_SEND_ENTER_TOKEN="$marker_now"
+  elif [ -z "${kind:-}" ]; then
     # Submission remains unverifiable, but the uncertain payload no longer
     # owns the composer. This distinction lets the daemon release a promotion
     # fence without ever repasting the message.
     DUET_SEND_COMPOSER_CLEAR=1
     return "$DUET_SEND_LANDED_UNVERIFIED"
   fi
-  _duet_tmux send-keys -t "$pane" Enter
-  for i in $(seq 1 12); do
-    sleep 0.2
+  for e in 1 2 3; do
+    _duet_tmux send-keys -t "$pane" Enter
+    for i in $(seq 1 12); do
+      sleep 0.2
+      _duet_alive "$pane" || return "$DUET_SEND_DEAD"
+      case "$kind" in
+        probe)
+          if ! _duet_present "$(_duet_tail_strip "$pane" 4)" "$probe"; then
+            DUET_SEND_COMPOSER_CLEAR=1
+            return 0
+          fi
+          ;;
+        marker)
+          marker_now="$(_duet_paste_marker "$pane")"
+          if [ -z "$marker_now" ]; then
+            DUET_SEND_COMPOSER_CLEAR=1
+            return 0
+          fi
+          if [ "$harness" = codex ] \
+              && _duet_codex_marker_owned "$marker_now" "$marker_token"; then
+            marker_token="$marker_now"
+            DUET_SEND_ENTER_TOKEN="$marker_now"
+          elif [ "$marker_now" != "$marker_token" ]; then
+            return "$DUET_SEND_LANDED_UNVERIFIED"
+          fi
+          ;;
+      esac
+    done
+  done
+  if [ "$harness" = codex ] && [ "$kind" = marker ] \
+      && _duet_codex_marker_owned "$(_duet_paste_marker "$pane")" "$marker_token"; then
+    return "$DUET_SEND_COMPOSER_REFUSED"
+  fi
+  return "$DUET_SEND_LANDED_UNVERIFIED"
+}
+
+# Clear a composer only when the durable Codex marker capability still owns
+# the cursor row.  Escape then Ctrl-U is the recovery sequence observed against
+# the Codex TUI.  A missing marker is also a successful clear (the daemon may
+# have crashed after the keys); a foreign/changed marker is never touched.
+duet_clear_refused_composer(){
+  local pane="${1:-}" marker_token="${2:-}" marker_now i
+  DUET_SEND_COMPOSER_CLEAR=""
+  _duet_alive "$pane" || return "$DUET_SEND_DEAD"
+  printf '%s\n' "$marker_token" \
+    | grep -qE '^codex(PastedContent[0-9]+chars)+$' \
+    || return "$DUET_SEND_LANDED_UNVERIFIED"
+  marker_now="$(_duet_paste_marker "$pane")"
+  if [ -z "$marker_now" ]; then
+    DUET_SEND_COMPOSER_CLEAR=1
+    return 0
+  fi
+  _duet_codex_marker_owned "$marker_now" "$marker_token" \
+    || return "$DUET_SEND_LANDED_UNVERIFIED"
+
+  _duet_tmux send-keys -t "$pane" Escape
+  sleep 0.1
+  # Escape can itself submit, clear, or redraw the composer. Re-establish the
+  # exact ownership capability before sending the destructive Ctrl-U key.
+  marker_now="$(_duet_paste_marker "$pane")"
+  if [ -z "$marker_now" ]; then
+    DUET_SEND_COMPOSER_CLEAR=1
+    return 0
+  fi
+  _duet_codex_marker_owned "$marker_now" "$marker_token" \
+    || return "$DUET_SEND_LANDED_UNVERIFIED"
+  _duet_tmux send-keys -t "$pane" C-u
+  for i in $(seq 1 20); do
+    sleep 0.1
     _duet_alive "$pane" || return "$DUET_SEND_DEAD"
-    case "$kind" in
-      probe)
-        if ! _duet_present "$(_duet_tail_strip "$pane" 4)" "$probe"; then
-          DUET_SEND_COMPOSER_CLEAR=1
-          return 0
-        fi
-        ;;
-      marker)
-        if [ "$(_duet_paste_marker "$pane")" != "$marker_token" ]; then
-          DUET_SEND_COMPOSER_CLEAR=1
-          return 0
-        fi
-        ;;
-    esac
+    marker_now="$(_duet_paste_marker "$pane")"
+    if [ -z "$marker_now" ]; then
+      DUET_SEND_COMPOSER_CLEAR=1
+      return 0
+    fi
+    _duet_codex_marker_owned "$marker_now" "$marker_token" \
+      || return "$DUET_SEND_LANDED_UNVERIFIED"
   done
   return "$DUET_SEND_LANDED_UNVERIFIED"
 }
@@ -837,7 +947,7 @@ duet_watchdog_failure(){
   duet_watchdog_write "$term" "$leader" "$DUET_WATCHDOG_COUNT"
 }
 
-# A complete binding published with INFLIGHT/ENTER_ONLY means a verifier may
+# A complete binding published with INFLIGHT/ENTER_ONLY/CLEAR_RETRY means a verifier may
 # already have placed bytes in a live TUI composer. Leadership must not advance
 # while any such obligation exists: after the CAS it would be stale and could
 # neither be submitted nor safely discarded, and promotion/fanout traffic
@@ -850,7 +960,14 @@ duet_has_uncertain_delivery(){
     for file in "$box"/N-*.msg "$box"/I-*.msg; do
       [ -f "$file" ] || continue
       phase="$(cat "$file.phase" 2>/dev/null || true)"
-      case "$phase" in ENTER_ONLY|INFLIGHT) : ;; *) continue ;; esac
+      case "$phase" in ENTER_ONLY|INFLIGHT|CLEAR_RETRY) : ;; *) continue ;; esac
+      # CLEAR_RETRY is itself a durable assertion that a causally observed
+      # marker may still own a pane.  Even damaged/missing binding sidecars
+      # must fail closed and block a leadership CAS.
+      if [ "$phase" = CLEAR_RETRY ]; then
+        DUET_UNCERTAIN_FILE="$file"
+        return 0
+      fi
       bound_name="$(cat "$file.target_name" 2>/dev/null || true)"
       bound_pane="$(cat "$file.target_pane" 2>/dev/null || true)"
       bound_term="$(cat "$file.target_term" 2>/dev/null || true)"

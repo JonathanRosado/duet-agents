@@ -224,6 +224,32 @@ conflicts with earlier sections, this section wins.
 - `DUET_STATE_ROOT` (default `$HOME/.duet`) parameterizes all session state —
   required for isolated smoke testing.
 
+### A8. Session pinning & cross-session fencing (added after a live incident)
+Live incident during implementation (2026-07-20): a second `/duet:duet` in
+another tmux window repointed `~/.duet/current`. The implementer's M2 gate
+report, sent with ambient session resolution, was delivered to the OTHER
+session's leader — which accepted the gate and issued M3 GO to its own
+context-less worker (in the wrong workdir) while the real implementer sat
+idle. Split-brain: two leaders, two workers, each pair half-wrong. Fixes:
+- **No ambient session resolution by agents, ever.** `current` is a
+  human/status convenience only. Every spawned pane gets `DUET_CONFIG` and
+  `DUET_SESSION` (unique session id) in its environment; the initiator's
+  brief embeds the absolute session path. `duet-send` requires an explicit
+  session (env or `--session`) and errors without one.
+- **Membership fence:** send refuses when the caller's pane is not in the
+  resolved session's roster, and names the session the pane actually belongs
+  to in the error.
+- **Foreign-payload fence:** payload headers carry `{session id, message id,
+  term}`; the daemon quarantines payloads whose session id doesn't match and
+  notifies the leader.
+- **Init never touches another workdir's session.** One active session per
+  workdir, enforced by a lock under `DUET_STATE_ROOT`; reap targets only the
+  same-workdir predecessor. A session in workdir X must be unable to disturb
+  routing for a live session in workdir Y.
+- Smoke additions: cross-session send refusal; foreign-session payload
+  quarantine; second-session init leaves the first session's routing intact.
+Scope: fold into M3 (it is fencing work); document in M4.
+
 ## Resolved harness facts (verified locally by Codex, kimi 0.28.0)
 - **Kimi:** boot banner `Welcome to Kimi Code!` (boot regex). Unattended flag
   is `--auto` (NOT `--yolo`, which may still ask). No pretrust step needed on

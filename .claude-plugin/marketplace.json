@@ -4,11 +4,12 @@
     "name": "Jonathan Rosado",
     "url": "https://github.com/JonathanRosado"
   },
+  "description": "Claude Code plugins for visible multi-agent collaboration in terminal panes.",
   "plugins": [
     {
       "name": "duet",
       "source": "./plugins/duet",
-      "description": "Pair Claude with a live Codex agent in adjacent tmux or psmux panes for real-time, bidirectional collaboration through inline prompt delivery (no polling, no screen-scraping)."
+      "description": "Run Claude, Codex, and Kimi as a visible tmux ensemble with queued inline delivery, session fencing, and automatic leader failover."
     }
   ]
 }

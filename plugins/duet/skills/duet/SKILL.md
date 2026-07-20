@@ -1,130 +1,219 @@
 ---
-description: Pair this Claude with a live Codex agent in an adjacent tmux or psmux pane for real-time, bidirectional, synchronous collaboration (a "duet"). Messages are delivered inline straight into each agent's prompt (no file to read, no polling), turn-taking keeps them in sync, and either side can interrupt the other. Use when the user wants Claude and Codex to work together interactively, debate an approach, or cross-check each other.
+name: duet
+description: Start and lead a live tmux ensemble of Claude, Codex, and Kimi agents. Use when the user wants multiple coding agents to collaborate interactively, divide disjoint implementation scopes, debate an approach, or cross-check one another. Messages are queued and injected into each agent's prompt while a watchdog provides fenced leader failover.
+argument-hint: "[codex|kimi|claude ...]"
 ---
 
-# Duet: Claude + Codex, side by side
+# Duet ensemble
 
-This pairs you (Claude) with a live **Codex** agent in the adjacent tmux or psmux
-pane. You collaborate as peers by exchanging messages that arrive **inline** — each message is
-injected directly into the recipient's prompt (bracketed paste), so nobody reads a
-file or polls. Turn-taking keeps you in sync; either side can interrupt the other.
+Start a named ensemble of two to five agents in one tmux window. You are the
+initiator, roster name `claude`, and term-0 leader. Each requested harness runs
+as a worker in another pane (`codex-1`, `kimi-1`, `claude-1`, and so on).
 
-## 0. Preconditions
-- You MUST be inside tmux or psmux. If `$TMUX` is empty, STOP and tell the user:
-  "Relaunch me in a multiplexer first: macOS/Linux `tmux new-session claude`; Windows `psmux new-session -s duet -- claude`; then run `/duet:duet`."
-- `codex` must be installed and already authenticated.
+The topology is a leader hub: the leader may talk to every worker, while each
+worker talks only to the symbolic recipient `leader`. Do not ask workers to
+message one another.
 
-## 1. Start
-On Windows, run the PowerShell script. If your shell is PowerShell:
+## 0. Preconditions and platform scope
+
+- Determine the host platform first. On Windows, use only the legacy psmux
+  path below; if Claude is not already inside psmux, tell the user to relaunch
+  with `psmux new-session -s duet -- claude`.
+- On macOS/Linux, the v0.2 ensemble path requires Bash and tmux. If `$TMUX` is
+  empty, stop and tell the user to relaunch with `tmux new-session claude`, then
+  run `/duet:duet` again.
+- Validate every harness argument before starting. Supported values are
+  `codex`, `kimi`, and `claude`; the user may request one to four workers.
+  Each requested CLI must already be installed and authenticated.
+- `/duet:duet` with no arguments defaults to one Codex worker. Examples:
+  `/duet:duet codex kimi` creates three agents total, while
+  `/duet:duet codex codex kimi` creates four.
+
+The invocation arguments are: $ARGUMENTS
+
+Treat them only as a whitespace-separated list of the three supported harness
+words. Reject options, shell syntax, or more than four words; do not interpolate
+unvalidated argument text into a shell command. An empty list means `codex`.
+
+### Windows/psmux legacy path
+
+The PowerShell scripts are intentionally unchanged in v0.2. On Windows they
+continue to provide the prior two-agent Claude+Codex behavior only:
+
+From PowerShell:
 
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-init.ps1"
 
-If your shell is Bash/Git Bash on Windows:
+From Bash/Git Bash on Windows:
 
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-init.ps1"
 
-On macOS/Linux, run:
+Do not pass roster arguments or promise queues, leadership terms, failover, or
+session fencing on that path. Follow the two-agent brief produced by the
+PowerShell script. The remaining sections describe only the tmux/Bash ensemble.
+
+## 1. Start and pin the session
+
+Pass the validated harness words from the skill invocation to init. With no
+words, omit them so init applies its Codex default:
 
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-init.sh"
+    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-init.sh" codex kimi
 
-This anchors the protocol in `AGENTS.md`/`CLAUDE.md` (so it survives `/clear` and
-compaction), splits the window, launches Codex (which reads its brief at boot), and
-starts the relay. Tell the user Codex is booting, then **send it the first message.**
+Init writes the role-neutral protocol into `AGENTS.md` and `CLAUDE.md`, launches
+the workers, starts the delivery daemon, and waits for every worker's readiness
+marker. Report the roster and any readiness failure to the user.
 
-Re-running init is safe: it reaps the previous session's Codex first, so you never
-end up with a stale, context-less agent shadowing the current one.
+Find the `duet: session <absolute-directory>` line in init's output and
+immediately retain that session's immutable config path:
 
-## 2. The protocol
-**Receiving.** A message from Codex arrives as a normal user prompt whose first line
-is `[DUET from codex]`. Everything after is Codex's message — read it, act, reply.
+    /absolute/session/directory/duet.env
 
-**Sending.** To message Codex on Windows (body on stdin). If your shell is PowerShell:
+Every later agent command must pin that exact session, either with
+`DUET_CONFIG=/absolute/session/directory/duet.env` or `--session` with that
+path. Never use `~/.duet/current`, infer the latest directory, or omit the pin.
+`current` is only a human/status convenience and another workdir may repoint it.
 
-    @'
-    ...your message to Codex...
-    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" codex
+Re-running init replaces only the active predecessor for the same canonical
+workdir. Sessions in other workdirs remain independent.
 
-If your shell is Bash/Git Bash on Windows:
+## 2. Lead through the hub
 
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-send.ps1" codex <<'DUET_EOF'
-    ...your message to Codex...
+Read the pinned session's `leader` file before assigning work. It records the
+current term and leader. While it names you:
+
+1. Decompose the goal into disjoint file or subsystem scopes. Record owner,
+   scope, state, and relevant term in `assignments.md` before dispatching.
+2. Keep at most one outstanding task per worker. You may fan out one task to
+   each worker and integrate replies asynchronously as they arrive.
+3. Send each worker a self-contained task with acceptance criteria. If scopes
+   collide, revise the assignment; workers are instructed to report conflicts
+   rather than edit outside their scope.
+4. Review and integrate worker results, maintain `assignments.md`, and remain
+   the single agent speaking to the user for the ensemble.
+
+Send to a named worker with the pinned config (body on stdin):
+
+    DUET_CONFIG="/absolute/session/directory/duet.env" \
+      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex-1 <<'DUET_EOF'
+    ...one scoped assignment or reply...
     DUET_EOF
 
-To message Codex on macOS/Linux:
+Only the current leader may broadcast:
 
-    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex <<'DUET_EOF'
-    ...your message to Codex...
+    DUET_CONFIG="/absolute/session/directory/duet.env" \
+      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" all <<'DUET_EOF'
+    ...message for every other roster member...
     DUET_EOF
 
-**After you send, END YOUR TURN and wait.** Do not keep working or narrate — Codex's
-reply arrives as the next `[DUET from codex]` prompt and wakes you. One message per
-reply; never send twice in a row.
+`duet-send` prints one `duet: queued <message-id> for <recipient>` line per
+recipient accepted. A broadcast therefore prints several lines. These confirm
+durable enqueue, not prompt submission; the daemon owns injection and retries.
 
-**Delivery is verified.** `duet-send` confirms the message actually landed in the
-peer's composer and was submitted (it retries the Enter if the first raced the paste)
-before printing `duet: submitted to <peer>`. If it instead prints `SENT BUT UNVERIFIED`
-and exits non-zero, the peer may **not** have received it — do NOT assume delivery.
-Check with `duet-status`/`duet-doctor`, confirm the peer's pane is alive, and resend
-rather than waiting forever for a reply that can't come.
+## 3. Message discipline and delivery model
 
-**Interrupting.** To barge in while Codex is mid-task, add `-Interrupt` on
-Windows or `--interrupt` on macOS/Linux:
+Messages arrive as ordinary prompts with a header like:
 
-PowerShell:
+    [DUET session=<session-id> id=<message-id> term=<term> from=<sender>]
 
-    @'
-    Stop - let's reconsider: ...
-    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" codex -Interrupt
+Treat the stable message ID as the logical message identity. Delivery is
+at-least-once across uncertain TUI submission and daemon restart: if an ID
+appears again, do not repeat work, side effects, or a reply already sent for
+that ID. Mention a suppressed duplicate in the next otherwise-required report
+when useful.
 
-Bash/Git Bash on Windows:
+Keep one in-flight exchange per leader-worker edge: after assigning a worker,
+do not send that same worker a second task until it replies or the first task is
+explicitly superseded. Other worker edges remain independent.
 
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-send.ps1" codex -Interrupt <<'DUET_EOF'
-    Stop - let's reconsider: ...
+To urgently redirect a worker, add `--interrupt`:
+
+    DUET_CONFIG="/absolute/session/directory/duet.env" \
+      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex-1 --interrupt <<'DUET_EOF'
+    Stop current work and follow this revised scope: ...
     DUET_EOF
 
-    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex --interrupt <<'DUET_EOF'
-    Stop — let's reconsider: ...
+Interrupts have queue priority and supersede older undeliverable normal work;
+use them only for a genuine redirect.
+
+Workers always reply to `leader`, never a concrete leader name. The symbolic
+queue resolves at delivery time, so a pending reply follows a promotion:
+
+    DUET_CONFIG="/absolute/session/directory/duet.env" \
+      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" leader <<'DUET_EOF'
+    ...worker result...
     DUET_EOF
 
-Use it only to redirect urgently (it aborts Codex's in-flight work). The user can
-also type into either pane at any time — both are theirs.
+The transcript records enqueue intent in serialized queue order. A transcript
+entry can survive even when its payload never reaches a prompt, so the entry
+alone is not proof that the recipient acted. Do not blindly re-enqueue a
+message when delivery is uncertain; inspect the pinned session first.
 
-## 3. Driving the collaboration
-- Send Codex the task — the user's goal, your plan, or a concrete question.
-- Treat Codex as a peer: share reasoning, ask its take, let it disagree, merge the best.
-- Keep the user in the loop: when Codex replies, summarize for the user before you reply back.
+## 4. Promotion and recovery
 
-## 4. Ending
-When done (or the user says stop):
+The delivery daemon watches the current leader. It advances the leadership
+term after the leader pane dies or after three consecutive verified-delivery
+failures to it. The failed incumbent becomes ineligible for automatic
+succession; the next-ranked live eligible roster member is promoted. The new
+leader's promotion notice is delivered before its ordinary traffic, and the
+other live agents receive a leadership-change notice.
 
-On Windows:
+On a promotion:
 
-PowerShell:
+- If you are the new leader, read `leader`, `transcript.md`, and
+  `assignments.md`; reconcile each outstanding assignment before dispatching
+  more work, preserve disjoint scopes, and take over user-facing coordination.
+- If another agent was promoted, stop assigning immediately, accept the worker
+  role, and send future replies only to `leader`.
+- If a former leader's pane recovers, it remains a worker. It must not resume
+  old-term assignments or leadership on its own.
 
-    @'
-    DUET-END - wrapping up. Summary: ...
-    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" codex
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-end.ps1"
+The current leader may request a fenced manual promotion, optionally naming an
+eligible successor:
 
-Bash/Git Bash on Windows:
+    DUET_CONFIG="/absolute/session/directory/duet.env" \
+      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-promote.sh" --to codex-1
 
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-send.ps1" codex <<'DUET_EOF'
-    DUET-END - wrapping up. Summary: ...
+Use `duet-promote.sh`; direct edits to the `leader` file bypass term and
+composer fencing and are an unsafe emergency-only recovery action. If no live
+eligible successor exists, leadership becomes `NONE`; report it to the user
+and use pinned diagnostics rather than assigning more work.
+
+Manual promotion is a permanent handoff for that session: the old incumbent is
+added to `failed-leaders` and cannot be promoted back automatically or with
+`--force`.
+
+If context is compacted or lost, recover from the same three pinned files:
+`leader`, `transcript.md`, and `assignments.md`. Re-establish the current term,
+your role, completed message IDs, and outstanding scopes before acting.
+
+## 5. Diagnostics
+
+Always diagnose the exact pinned session:
+
+    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-status.sh" \
+      --session "/absolute/session/directory/duet.env"
+    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-doctor.sh" \
+      --session "/absolute/session/directory/duet.env"
+
+Status shows roster readiness, pane liveness, leader/term, inbox depth, and the
+daemon. Doctor validates session invariants. Never substitute the ambient
+`current` link in agent-driven recovery.
+
+## 6. End cleanly
+
+When the work is done or the user says stop, the current leader first enqueues
+one `DUET-END` broadcast, then ends the same pinned session:
+
+    DUET_CONFIG="/absolute/session/directory/duet.env" \
+      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" all <<'DUET_EOF'
+    DUET-END — wrapping up. Final state and handoff: ...
     DUET_EOF
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-end.ps1"
+    DUET_CONFIG="/absolute/session/directory/duet.env" \
+      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-end.sh"
 
-On macOS/Linux:
-
-    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex <<'DUET_EOF'
-    DUET-END — wrapping up. Summary: ...
-    DUET_EOF
-    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-end.sh"
-
-## Escape hatch
-- Windows: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-status.ps1"` — session state (incl. pane liveness), transcript tail, Codex pane peek.
-- `bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-status.sh"` — session state, transcript tail, Codex pane peek.
-- If a peer seems unresponsive or a send reports `UNVERIFIED`, run the doctor to list
-  panes and find/reap orphaned agents:
-  Windows `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-doctor.ps1"` (add `-Reap` to kill orphans);
-  macOS/Linux `bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-doctor.sh"` (add `--reap`).
-- Full transcript persists at `~/.duet/<timestamp>/transcript.md` on macOS/Linux and `~\.duet\<timestamp>\transcript.md` on Windows.
+End closes admission and waits for all messages already queued, including the
+final broadcast, before stopping the daemon, removing protocol anchors, and
+killing only spawned worker panes. If the bounded drain times out, teardown is
+refused and the session is left running for pinned diagnosis; do not claim it
+ended.

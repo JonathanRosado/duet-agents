@@ -215,10 +215,14 @@ FAKE_ENTER_RC=0
 FAKE_ENTER_CLEAR=""
 FAKE_LANDING_OBSERVED=""
 FAKE_ENTER_OBSERVED=""
+FAKE_ENTER_TOKEN=""
 FAKE_FOREIGN_MARKER=""
+FAKE_CLEAR_RC=0
+FAKE_CLEAR_OBSERVED=1
 duet_daemon_alive(){ return 0; }
 duet_send_verified(){
   DUET_SEND_LANDING_OBSERVED="$FAKE_LANDING_OBSERVED"
+  DUET_SEND_ENTER_TOKEN="$FAKE_ENTER_TOKEN"
   printf 'FULL\t%s\t%s\t%s\t%s\n' "$DUET_MESSAGE_ID" \
     "$DUET_TARGET_NAME" "$DUET_TARGET_PANE" "$DUET_MESSAGE_MODE" >> "$FAKE_LOG"
   return "$FAKE_RC"
@@ -226,6 +230,7 @@ duet_send_verified(){
 duet_send_enter_only(){
   DUET_SEND_COMPOSER_CLEAR="$FAKE_ENTER_CLEAR"
   DUET_SEND_LANDING_OBSERVED="$FAKE_ENTER_OBSERVED"
+  DUET_SEND_ENTER_TOKEN="$FAKE_ENTER_TOKEN"
   if [ -n "$FAKE_FOREIGN_MARKER" ]; then
     printf 'FOREIGN_MARKER\t%s\n' "$DUET_MESSAGE_ID" >> "$FAKE_LOG"
     return "$DUET_SEND_LANDED_UNVERIFIED"
@@ -233,6 +238,12 @@ duet_send_enter_only(){
   printf 'ENTER\t%s\t%s\t%s\t%s\n' "$DUET_MESSAGE_ID" \
     "$DUET_TARGET_NAME" "$DUET_TARGET_PANE" "$DUET_CURRENT_TERM" >> "$FAKE_LOG"
   return "$FAKE_ENTER_RC"
+}
+duet_clear_refused_composer(){
+  DUET_SEND_COMPOSER_CLEAR="$FAKE_CLEAR_OBSERVED"
+  printf 'CLEAR\t%s\t%s\t%s\n' "$DUET_MESSAGE_ID" \
+    "$DUET_TARGET_NAME" "$DUET_TARGET_PANE" >> "$FAKE_LOG"
+  return "$FAKE_CLEAR_RC"
 }
 
 stage_message(){
@@ -247,7 +258,8 @@ stage_message(){
 
 test_codex_collapsed_composer(){
   local result="$TEST_ROOT/codex-marker.result" log="$TEST_ROOT/codex-marker.log"
-  local state="$TEST_ROOT/codex-marker.state"
+  local state="$TEST_ROOT/codex-marker.state" wedge="$TEST_ROOT/codex-marker.wedge"
+  local foreign_on_escape="$TEST_ROOT/codex-marker.foreign-on-escape"
   : > "$log"
   printf 'blank\n' > "$state"
   (
@@ -268,24 +280,62 @@ test_codex_collapsed_composer(){
             marker)
               printf 'history\n› [Pasted Content 2048 chars]\n\n\n\n› [Pasted Content 2048 chars]\nstatus\n\n\n\n'
               ;;
+            wedged-one)
+              printf 'history\naccepted\n\n\n\n› [Pasted Content 2048 chars]\nstatus\n\n\n\n'
+              ;;
+            wedged-two|wedged-escaped)
+              printf 'history\naccepted\n\n\n\n› [Pasted Content 2048 chars] [Pasted Content 2048 chars]\nstatus\n\n\n\n'
+              ;;
+            foreign)
+              printf 'history\naccepted\n\n\n\n› [Pasted Content 999 chars]\nstatus\n\n\n\n'
+              ;;
+            cleared)
+              printf 'history\naccepted\n\n\n\n› \nstatus\n\n\n\n'
+              ;;
             submitted)
               printf 'history\n› [Pasted Content 2048 chars]\naccepted\n\n\n\n\n› \nstatus\n\n'
               ;;
           esac
           ;;
         display-message)
-          case "$current" in blank|marker) printf '5\n';; submitted) printf '7\n';; esac
+          case "$current" in
+            blank|marker|wedged-one|wedged-two|wedged-escaped|foreign|cleared) printf '5\n' ;;
+            submitted) printf '7\n' ;;
+          esac
           ;;
         load-buffer) command cat >/dev/null ;;
         paste-buffer)
           printf 'PASTE\n' >> "$log"
-          printf 'marker\n' > "$state"
+          if [ -f "$wedge" ]; then
+            printf 'wedged-one\n' > "$state"
+          else
+            printf 'marker\n' > "$state"
+          fi
           ;;
         send-keys)
-          if [ "${*: -1}" = Enter ]; then
-            printf 'ENTER\n' >> "$log"
-            printf 'submitted\n' > "$state"
-          fi
+          case "${*: -1}" in
+            Enter)
+              printf 'ENTER\n' >> "$log"
+              case "$current" in
+                marker) printf 'submitted\n' > "$state" ;;
+                wedged-one) printf 'wedged-two\n' > "$state" ;;
+              esac
+              ;;
+            Escape)
+              printf 'ESCAPE\n' >> "$log"
+              if [ "$current" = wedged-two ]; then
+                if [ -f "$foreign_on_escape" ]; then
+                  printf 'foreign\n' > "$state"
+                else
+                  printf 'wedged-escaped\n' > "$state"
+                fi
+              fi
+              ;;
+            C-u)
+              printf 'CTRL_U\n' >> "$log"
+              [ "$current" != wedged-escaped ] || printf 'cleared\n' > "$state"
+              ;;
+          esac
           ;;
         delete-buffer) : ;;
         *) return 0 ;;
@@ -310,8 +360,9 @@ test_codex_collapsed_composer(){
     else
       enter_rc=$?
     fi
-    printf 'enter_rc=%s\nenter_only_enters=%s\n' "$enter_rc" \
-      "$(grep -c '^ENTER$' "$log" 2>/dev/null || true)" >> "$result"
+    printf 'enter_rc=%s\nenter_only_enters=%s\nenter_only_pastes=%s\n' "$enter_rc" \
+      "$(grep -c '^ENTER$' "$log" 2>/dev/null || true)" \
+      "$(grep -c '^PASTE$' "$log" 2>/dev/null || true)" >> "$result"
 
     # An evidence-less INFLIGHT recovery must not adopt a collapsed marker
     # merely because it is current. It may belong to unrelated user input.
@@ -325,6 +376,68 @@ test_codex_collapsed_composer(){
     printf 'foreign_rc=%s\nforeign_observed=%s\nforeign_enters=%s\n' \
       "$foreign_rc" "${DUET_SEND_LANDING_OBSERVED:-}" \
       "$(grep -c '^ENTER$' "$log" 2>/dev/null || true)" >> "$result"
+
+    # A marker present before this delivery is foreign composer state.  The
+    # verifier neither pastes onto it nor lets the clear helper adopt it.
+    : > "$log"
+    printf 'marker\n' > "$state"
+    if duet_send_verified '%0' 'payload must not join a foreign marker' '' codex; then
+      occupied_rc=0
+    else
+      occupied_rc=$?
+    fi
+    if duet_clear_refused_composer '%0' codexPastedContent4096chars; then
+      foreign_clear_rc=0
+    else
+      foreign_clear_rc=$?
+    fi
+    printf 'occupied_rc=%s\noccupied_pastes=%s\nforeign_clear_rc=%s\nforeign_clear_keys=%s\n' \
+      "$occupied_rc" "$(grep -c '^PASTE$' "$log" 2>/dev/null || true)" \
+      "$foreign_clear_rc" \
+      "$(grep -Ec '^(ESCAPE|CTRL_U)$' "$log" 2>/dev/null || true)" >> "$result"
+
+    # Model the live incident: one paste first renders one collapsed marker,
+    # then a second placeholder appears while Enter remains refused.  The
+    # verifier must not mistake the token change for accepted history.
+    : > "$log"
+    : > "$wedge"
+    printf 'blank\n' > "$state"
+    if duet_send_verified '%0' 'wedged payload with a distinctive verifier tail' '' codex; then
+      wedge_rc=0
+    else
+      wedge_rc=$?
+    fi
+    wedge_token="${DUET_SEND_ENTER_TOKEN:-}"
+    if duet_clear_refused_composer '%0' "$wedge_token"; then
+      clear_rc=0
+    else
+      clear_rc=$?
+    fi
+    printf 'wedge_rc=%s\nwedge_token=%s\nwedge_pastes=%s\nwedge_enters=%s\n' \
+      "$wedge_rc" "$wedge_token" \
+      "$(grep -c '^PASTE$' "$log" 2>/dev/null || true)" \
+      "$(grep -c '^ENTER$' "$log" 2>/dev/null || true)" >> "$result"
+    printf 'clear_rc=%s\nescapes=%s\nctrl_us=%s\ncleared_marker=%s\n' \
+      "$clear_rc" "$(grep -c '^ESCAPE$' "$log" 2>/dev/null || true)" \
+      "$(grep -c '^CTRL_U$' "$log" 2>/dev/null || true)" \
+      "$(_duet_paste_marker '%0')" >> "$result"
+
+    # Escape is not a proof that ownership persisted. If it exposes a foreign
+    # marker, recovery must stop before the destructive Ctrl-U key.
+    : > "$log"
+    : > "$foreign_on_escape"
+    printf 'wedged-two\n' > "$state"
+    if duet_clear_refused_composer '%0' "$wedge_token"; then
+      foreign_escape_rc=0
+    else
+      foreign_escape_rc=$?
+    fi
+    rm -f "$foreign_on_escape"
+    printf 'foreign_escape_rc=%s\nforeign_escape_keys=%s\nforeign_ctrl_us=%s\nforeign_after=%s\n' \
+      "$foreign_escape_rc" \
+      "$(grep -c '^ESCAPE$' "$log" 2>/dev/null || true)" \
+      "$(grep -c '^CTRL_U$' "$log" 2>/dev/null || true)" \
+      "$(_duet_paste_marker '%0')" >> "$result"
   )
 
   assert_contains "$result" 'rc=0' "collapsed composer submits successfully"
@@ -341,10 +454,163 @@ test_codex_collapsed_composer(){
     "foreign collapsed marker never becomes landing evidence"
   assert_contains "$result" 'foreign_enters=0' \
     "foreign collapsed marker is never submitted"
-  assert_eq 0 "$(grep -c '^PASTE$' "$log" 2>/dev/null || true)" \
+  assert_contains "$result" "occupied_rc=$DUET_SEND_NOT_LANDED" \
+    "pre-existing collapsed composer is a safe no-paste outcome"
+  assert_contains "$result" 'occupied_pastes=0' \
+    "full verifier never pastes onto a pre-existing marker"
+  assert_contains "$result" "foreign_clear_rc=$DUET_SEND_LANDED_UNVERIFIED" \
+    "clear helper rejects a foreign marker capability"
+  assert_contains "$result" 'foreign_clear_keys=0' \
+    "clear helper never sends keys to a foreign marker"
+  assert_contains "$result" 'enter_only_pastes=0' \
     "Enter-only continuation never repastes"
   assert_contains "$result" 'enter_only_enters=1' \
     "Enter-only continuation presses Enter once"
+  assert_contains "$result" "wedge_rc=$DUET_SEND_COMPOSER_REFUSED" \
+    "late second marker is a distinct refused-composer outcome"
+  assert_contains "$result" \
+    'wedge_token=codexPastedContent2048charsPastedContent2048chars' \
+    "late second marker extends the causally observed capability"
+  assert_contains "$result" 'wedge_pastes=1' \
+    "refused-composer detection never repastes"
+  assert_contains "$result" 'wedge_enters=3' \
+    "refused-composer classification follows bounded Enter retries"
+  assert_contains "$result" 'clear_rc=0' \
+    "owned refused composer clears successfully"
+  assert_contains "$result" 'escapes=1' "clear recovery sends one Escape"
+  assert_contains "$result" 'ctrl_us=1' "clear recovery sends one Ctrl-U"
+  assert_eq '' "$(sed -n 's/^cleared_marker=//p' "$result")" \
+    "clear recovery verifies the marker left the active composer"
+  assert_contains "$result" \
+    "foreign_escape_rc=$DUET_SEND_LANDED_UNVERIFIED" \
+    "ownership change after Escape remains unresolved"
+  assert_contains "$result" 'foreign_escape_keys=1' \
+    "foreign-after-Escape fixture sends Escape once"
+  assert_contains "$result" 'foreign_ctrl_us=0' \
+    "ownership change after Escape receives no Ctrl-U"
+  assert_contains "$result" 'foreign_after=codexPastedContent999chars' \
+    "foreign composer survives recovery untouched"
+}
+
+test_refused_composer_clear_requeue(){
+  local message message_id terminal rc
+  create_state refused-clear-requeue
+  : > "$FAKE_LOG"
+  DUET_DELIVERY_RETRY_BASE=0
+  FAKE_RC=$DUET_SEND_COMPOSER_REFUSED
+  FAKE_LANDING_OBSERVED=marker
+  FAKE_ENTER_TOKEN=codexPastedContent2048charsPastedContent2048chars
+  FAKE_CLEAR_RC=$DUET_SEND_LANDED_UNVERIFIED
+  FAKE_CLEAR_OBSERVED=""
+
+  stage_message codex-1 claude codex-1 0 LEADER claude \
+    'stable-id assignment whose collapsed composer refuses Enter' \
+    || { fail "could not stage refused-composer message"; return; }
+  message="$STAGED_FILE"
+  message_id="$STAGED_ID"
+  duet_deliverd_pass || { fail "refused-composer pass failed"; return; }
+  assert_eq CLEAR_RETRY "$(cat "$message.phase" 2>/dev/null || true)" \
+    "refused composer enters durable clear/retry phase"
+  assert_eq "$FAKE_ENTER_TOKEN" "$(cat "$message.enter_token" 2>/dev/null || true)" \
+    "clear/retry persists exact marker capability"
+  assert_eq marker "$(cat "$message.landing_observed" 2>/dev/null || true)" \
+    "clear/retry persists causal marker evidence"
+  assert_eq 1 "$(grep -c '^FULL' "$FAKE_LOG" 2>/dev/null || true)" \
+    "initial refused delivery pastes exactly once"
+  assert_eq 0 "$(grep -c '^CLEAR' "$FAKE_LOG" 2>/dev/null || true)" \
+    "recovery keys wait until CLEAR_RETRY is durable"
+
+  if duet_promote_locked 0 claude SOFT; then rc=0; else rc=$?; fi
+  assert_eq 11 "$rc" "CLEAR_RETRY blocks promotion CAS"
+  duet_atomic_write "$message.retry_at" 0 || fail "could not make failed clear due"
+  duet_deliverd_pass || { fail "failed clear-recovery pass failed"; return; }
+  assert_eq CLEAR_RETRY "$(cat "$message.phase" 2>/dev/null || true)" \
+    "unverified clear remains pane-owning"
+  assert_eq 1 "$(grep -c '^FULL' "$FAKE_LOG" 2>/dev/null || true)" \
+    "uncleared composer never repastes"
+  assert_eq 1 "$(grep -c '^CLEAR' "$FAKE_LOG" 2>/dev/null || true)" \
+    "clear recovery is attempted without a full paste"
+
+  FAKE_CLEAR_RC=0
+  FAKE_CLEAR_OBSERVED=1
+  duet_atomic_write "$message.retry_at" 0 || fail "could not make successful clear due"
+  duet_deliverd_pass || { fail "successful clear-recovery pass failed"; return; }
+  assert_eq READY "$(cat "$message.phase" 2>/dev/null || true)" \
+    "verified empty composer requeues the message"
+  assert_eq "$message_id" "$(field "$message" id)" \
+    "clear/requeue preserves the stable message ID"
+  assert_no_file "$message.enter_token" "READY requeue drops old marker capability"
+  assert_eq 1 "$(grep -c '^FULL' "$FAKE_LOG" 2>/dev/null || true)" \
+    "clear pass itself never repastes"
+
+  FAKE_RC=0
+  FAKE_LANDING_OBSERVED=""
+  FAKE_ENTER_TOKEN=""
+  duet_atomic_write "$message.retry_at" 0 || fail "could not make safe requeue due"
+  duet_deliverd_pass || { fail "safe full-retry pass failed"; return; }
+  terminal="$DUET_DIR/inbox/codex-1/delivered/$(basename "$message")"
+  assert_file "$terminal" "same stable-ID message delivers after verified clear"
+  assert_eq "$message_id" "$(field "$terminal" id)" \
+    "terminal delivery retains the stable message ID"
+  assert_eq 2 "$(grep -c '^FULL' "$FAKE_LOG" 2>/dev/null || true)" \
+    "one full retry occurs only after verified clear"
+
+  FAKE_RC=0
+  FAKE_LANDING_OBSERVED=""
+  FAKE_ENTER_TOKEN=""
+  FAKE_CLEAR_RC=0
+  FAKE_CLEAR_OBSERVED=1
+}
+
+test_clear_retry_raw_cas_poison(){
+  local owner newer rc candidate
+  create_state clear-retry-raw-cas
+  : > "$FAKE_LOG"
+  DUET_DELIVERY_RETRY_BASE=0
+  duet_write_leader_state 1 codex-1 || { fail "could not promote fixture leader"; return; }
+  duet_watchdog_write 1 codex-1 0 || fail "could not stage fixture watchdog"
+  FAKE_RC=$DUET_SEND_COMPOSER_REFUSED
+  FAKE_LANDING_OBSERVED=marker
+  FAKE_ENTER_TOKEN=codexPastedContent2048charsPastedContent2048chars
+
+  stage_message leader kimi-1 leader 1 WORKER codex-1 \
+    'worker reply owns the current Codex leader composer' \
+    || { fail "could not stage symbolic refused-composer message"; return; }
+  owner="$STAGED_FILE"
+  duet_deliverd_pass || { fail "symbolic refused-composer pass failed"; return; }
+  assert_eq CLEAR_RETRY "$(cat "$owner.phase" 2>/dev/null || true)" \
+    "symbolic Codex owner enters CLEAR_RETRY"
+
+  # Model the documented-unsafe raw leader edit.  The worker-origin message
+  # is not a stale leader assignment, so its durable physical binding is the
+  # only thing preventing the old pane from being released.
+  duet_write_leader_state 2 kimi-1 || { fail "could not stage raw leader edit"; return; }
+  duet_watchdog_write 2 kimi-1 0 || fail "could not stage raw-edit watchdog"
+  duet_candidate_target leader "$owner" || fail "could not resolve owner candidate"
+  candidate="$DUET_CANDIDATE_NAME:$DUET_CANDIDATE_PANE"
+  assert_eq "codex-1:$A_CODEX_PANE" "$candidate" \
+    "scheduler coalesces poison owner by its original physical pane"
+
+  stage_message codex-1 kimi-1 codex-1 2 LEADER kimi-1 \
+    'new-term traffic must wait behind the old pane owner' \
+    || { fail "could not stage new-term traffic"; return; }
+  newer="$STAGED_FILE"
+  duet_atomic_write "$owner.retry_at" 0 || fail "could not make poison owner due"
+  duet_deliverd_pass || { fail "raw-CAS poison pass failed"; return; }
+  assert_file "$owner" "raw target change retains CLEAR_RETRY root"
+  assert_eq CLEAR_RETRY "$(cat "$owner.phase" 2>/dev/null || true)" \
+    "raw target change remains clear/retry poison"
+  assert_no_file "$DUET_DIR/inbox/leader/quarantine/$(basename "$owner")" \
+    "raw target change never terminalizes uncertain ownership"
+  assert_file "$newer" "new-term traffic waits behind old physical pane owner"
+  assert_eq 1 "$(grep -c '^FULL' "$FAKE_LOG" 2>/dev/null || true)" \
+    "no later paste reaches the poison-owned pane"
+  if duet_promote_locked 2 kimi-1 SOFT; then rc=0; else rc=$?; fi
+  assert_eq 11 "$rc" "raw-CAS CLEAR_RETRY continues to block later promotion"
+
+  FAKE_RC=0
+  FAKE_LANDING_OBSERVED=""
+  FAKE_ENTER_TOKEN=""
 }
 
 test_promotion_cas_exclusion_no_successor(){
@@ -1224,6 +1490,10 @@ test_leader_name_path_fence(){
 }
 
 run_case 'Codex cursor-row collapsed composer' test_codex_collapsed_composer
+run_case 'Codex refused composer clear and stable-ID requeue' \
+  test_refused_composer_clear_requeue
+run_case 'CLEAR_RETRY raw-CAS poison and physical-pane coalescing' \
+  test_clear_retry_raw_cas_poison
 run_case 'promotion CAS, exclusions, and no successor' \
   test_promotion_cas_exclusion_no_successor
 run_case 'force refusal and ordinary eligible manual target' \
