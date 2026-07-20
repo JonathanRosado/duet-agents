@@ -1,95 +1,194 @@
 #!/usr/bin/env bash
-# Shared duet helpers for the tmux/bash path. Sourced by duet-send.sh,
-# duet-relay.sh, duet-init.sh, duet-end.sh, duet-doctor.sh. Mirrors the tested
-# duet-common.ps1: a paste is confirmed to have LANDED in the composer, then Enter
-# is sent and confirmed to have SUBMITTED (composer cleared), retrying Enter. This
-# is the fix for the Enter-races-bracketed-paste silent drop (issues #1 and #2).
-#
-# NOTE: the .ps1 path is the one exercised/tested on Windows here; this .sh mirror
-# is provided for macOS/Linux parity and has NOT been run against a live tmux TUI.
+# Shared helpers for the tmux/bash ensemble path.
 
-# Strip ALL whitespace so terminal soft-wrap row breaks don't defeat substring match.
-_duet_strip(){ printf '%s' "${1:-}" | tr -d '[:space:]'; }
+# duet_send_verified result codes. Success is the normal shell status 0.
+DUET_SEND_DEAD=20
+DUET_SEND_NOT_LANDED=21
+DUET_SEND_LANDED_UNVERIFIED=22
 
-# A distinctive tail of the payload (<=48 non-ws chars) - what sits at the composer
-# cursor right after a paste.
+# Always address the tmux server recorded for the session when one is known.
+# This is what keeps detached smoke servers and status calls outside a pane from
+# accidentally falling back to the user's default tmux server.
+_duet_tmux(){
+  if [ -n "${DUET_TMUX_SOCKET:-}" ]; then
+    command tmux -S "$DUET_TMUX_SOCKET" "$@"
+  else
+    command tmux "$@"
+  fi
+}
+
+# Normalize to ASCII alphanumerics. Besides whitespace, boxed TUIs insert border
+# glyphs at visual row boundaries; ignoring punctuation lets one logical payload
+# probe span those decorated rows without mistaking the border for message text.
+_duet_strip(){ LC_ALL=C printf '%s' "${1:-}" | LC_ALL=C tr -cd '[:alnum:]'; }
+
+# A distinctive tail of the payload (at most 48 normalized characters).
 _duet_probe(){
   local s n
-  s="$(_duet_strip "${1:-}")"; n=${#s}
+  s="$(_duet_strip "${1:-}")"
+  n=${#s}
   if [ "$n" -gt 48 ]; then printf '%s' "${s: -48}"; else printf '%s' "$s"; fi
 }
 
-# Is <probe> a substring of <stripped-haystack>?  args: haystack_stripped probe
-_duet_present(){ [ -n "${2:-}" ] || return 1; case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
+_duet_present(){
+  [ -n "${2:-}" ] || return 1
+  case "$1" in *"$2"*) return 0;; *) return 1;; esac
+}
 
-# Last N lines of a pane, whitespace-stripped.
-_duet_tail_strip(){ tmux capture-pane -p -t "$1" 2>/dev/null | tail -n "${2:-6}" | tr -d '[:space:]'; }
+_duet_tail_strip(){
+  _duet_tmux capture-pane -p -t "$1" 2>/dev/null \
+    | awk 'NF' \
+    | tail -n "${2:-6}" \
+    | LC_ALL=C tr -cd '[:alnum:]'
+}
 
-# Is this pane id currently present on the server?
-_duet_alive(){ tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$1"; }
+_duet_alive(){
+  [ -n "${1:-}" ] || return 1
+  _duet_tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$1"
+}
 
 # duet_send_verified <pane> <payload> <interrupt-flag>
-# Returns 0 ONLY when submission is verified (never a false positive). Prints
-# diagnostics to stderr; the caller owns the user-facing success/failure line.
+#
+# A successful return means the payload was observed in the composer and then
+# observed leaving it after Enter. Non-zero outcomes are deliberately distinct:
+#   DUET_SEND_DEAD                pane disappeared
+#   DUET_SEND_NOT_LANDED          paste was not observed; caller may repaste
+#   DUET_SEND_LANDED_UNVERIFIED   paste landed, but submission is uncertain;
+#                                 caller must never paste the payload again
 duet_send_verified(){
-  local pane="$1" payload="$2" interrupt="${3:-}"
-  _duet_alive "$pane" || { echo "duet: target pane $pane is gone; not sending." >&2; return 1; }
+  local pane="${1:-}" payload="${2:-}" interrupt="${3:-}"
+  local probe buffer i e
 
-  # Interrupt only aborts a BUSY peer; escaping an idle composer can swallow the paste.
+  if ! _duet_alive "$pane"; then
+    echo "duet: target pane $pane is gone; not sending." >&2
+    return "$DUET_SEND_DEAD"
+  fi
+
+  # Escape only a recognizably busy TUI. On an idle composer Escape can clear
+  # input or close a modal and make the following paste disappear.
   if [ -n "$interrupt" ]; then
-    if tmux capture-pane -p -t "$pane" 2>/dev/null | tail -n 4 \
-         | grep -qiE 'esc to interrupt|esc to cancel|ctrl\+c to|working|thinking|generating|running'; then
-      tmux send-keys -t "$pane" Escape; sleep 0.4
+    if _duet_tmux capture-pane -p -t "$pane" 2>/dev/null \
+         | tail -n 6 \
+         | grep -qiE 'esc to interrupt|esc to cancel|ctrl\+c to|working|thinking|generating|running|streaming'; then
+      _duet_tmux send-keys -t "$pane" Escape
+      sleep 0.4
     fi
   fi
 
-  local probe buf landed="" a i
   probe="$(_duet_probe "$payload")"
-  buf="duet-$$-${RANDOM:-0}"
+  [ -n "$probe" ] || {
+    echo "duet: refusing to send an empty/unprobeable payload to $pane" >&2
+    return "$DUET_SEND_NOT_LANDED"
+  }
 
-  # Paste, then poll until it shows in the composer. Retry the paste once.
-  for a in 1 2; do
-    printf '%s' "$payload" | tmux load-buffer -b "$buf" -
-    tmux paste-buffer -d -b "$buf" -p -t "$pane"
-    if [ -z "$probe" ]; then landed=1; break; fi
-    for i in $(seq 1 15); do
-      sleep 0.1
-      if _duet_present "$(_duet_tail_strip "$pane" 10)" "$probe"; then landed=1; break; fi
-    done
-    [ -n "$landed" ] && break
-  done
-
-  if [ -z "$landed" ]; then
-    tmux send-keys -t "$pane" Enter
-    echo "duet: could not confirm paste landed in pane $pane" >&2
-    return 1
+  buffer="duet-${BASHPID:-$$}-${RANDOM:-0}"
+  if ! printf '%s' "$payload" | _duet_tmux load-buffer -b "$buffer" -; then
+    echo "duet: could not load paste buffer for pane $pane" >&2
+    return "$DUET_SEND_NOT_LANDED"
+  fi
+  if ! _duet_tmux paste-buffer -d -b "$buffer" -p -t "$pane"; then
+    _duet_tmux delete-buffer -b "$buffer" 2>/dev/null || true
+    if _duet_alive "$pane"; then
+      echo "duet: paste command failed for pane $pane" >&2
+      return "$DUET_SEND_NOT_LANDED"
+    fi
+    return "$DUET_SEND_DEAD"
   fi
 
-  # Submit: Enter, poll for the composer to clear, retry Enter (a later Enter
-  # submits when the first raced the paste).
-  local e
+  for i in $(seq 1 20); do
+    sleep 0.1
+    if _duet_present "$(_duet_tail_strip "$pane" 12)" "$probe"; then
+      break
+    fi
+  done
+  if [ "$i" -eq 20 ] && ! _duet_present "$(_duet_tail_strip "$pane" 12)" "$probe"; then
+    if _duet_alive "$pane"; then
+      echo "duet: could not confirm paste landed in pane $pane" >&2
+      return "$DUET_SEND_NOT_LANDED"
+    fi
+    return "$DUET_SEND_DEAD"
+  fi
+
+  # Once landing has been observed, only retry Enter. Re-pasting here could
+  # duplicate an already accepted task.
   for e in 1 2 3; do
-    tmux send-keys -t "$pane" Enter
+    _duet_tmux send-keys -t "$pane" Enter
     for i in $(seq 1 12); do
       sleep 0.2
+      if ! _duet_alive "$pane"; then
+        return "$DUET_SEND_DEAD"
+      fi
       if ! _duet_present "$(_duet_tail_strip "$pane" 4)" "$probe"; then
         return 0
       fi
     done
   done
-  echo "duet: pasted into pane $pane but could not confirm submission." >&2
-  return 1
+
+  echo "duet: payload landed in pane $pane but submission is unverified." >&2
+  return "$DUET_SEND_LANDED_UNVERIFIED"
 }
 
-# Reap a previous session (issue #3): signal its relay to stop and kill its Codex
-# pane, so exactly one Codex exists per role. args: prev_duet_dir prev_codex_pane
-duet_reap_prev(){
-  local dir="${1:-}" codex="${2:-}"
-  [ -n "$dir" ] || return 0
-  [ -d "$dir" ] && : > "$dir/.ended" 2>/dev/null || true
-  if [ -n "$codex" ] && _duet_alive "$codex"; then
-    tmux send-keys -t "$codex" C-c 2>/dev/null || true
-    sleep 0.3
-    tmux kill-pane -t "$codex" 2>/dev/null || true
+# Remove only the delimited block owned by duet. Existing surrounding content
+# and even an otherwise-empty user-created anchor file are preserved.
+duet_strip_anchor_file(){
+  [ -f "${1:-}" ] || return 0
+  perl -0777 -pi -e 's/\n?<!-- DUET:BEGIN.*?<!-- DUET:END -->\n?//sg' "$1" 2>/dev/null || true
+}
+
+duet_strip_session_anchors(){
+  local workdir="${1:-}"
+  [ -n "$workdir" ] || return 0
+  duet_strip_anchor_file "$workdir/AGENTS.md"
+  duet_strip_anchor_file "$workdir/CLAUDE.md"
+}
+
+# Kill only panes explicitly marked as spawned. The caller pane is fenced even
+# if a malformed roster marks it spawned.
+duet_kill_spawned_panes(){
+  local roster="${1:-}" exempt="${2:-}" legacy_pane="${3:-}"
+  local name harness pane pane_pid rank spawned
+  local victims="" victim
+  if [ ! -f "$roster" ]; then
+    # v0.1.x compatibility: its env recorded one spawned CODEX_PANE and had no
+    # roster. Preserve the same never-self fence during the v0.2 transition.
+    if [ -n "$legacy_pane" ] && [ "$legacy_pane" != "$exempt" ] && _duet_alive "$legacy_pane"; then
+      _duet_tmux send-keys -t "$legacy_pane" C-c 2>/dev/null || true
+      sleep 0.3
+      _duet_alive "$legacy_pane" && _duet_tmux kill-pane -t "$legacy_pane" 2>/dev/null || true
+    fi
+    return 0
   fi
+
+  while IFS=$'\t' read -r name harness pane pane_pid rank spawned; do
+    [ "$name" = name ] && continue
+    [ "$spawned" = 1 ] || continue
+    [ -n "$pane" ] || continue
+    [ "$pane" = "$exempt" ] && continue
+    _duet_alive "$pane" || continue
+    _duet_tmux send-keys -t "$pane" C-c 2>/dev/null || true
+    victims="${victims}${victims:+ }$pane"
+  done < "$roster"
+
+  [ -n "$victims" ] || return 0
+  sleep 0.3
+  for victim in $victims; do
+    [ "$victim" = "$exempt" ] && continue
+    _duet_alive "$victim" && _duet_tmux kill-pane -t "$victim" 2>/dev/null || true
+  done
+}
+
+# Reap a previous session without ever killing the pane performing the re-init.
+# args: duet_dir workdir tmux_socket exempt_pane [legacy_codex_pane]
+duet_reap_session(){
+  local dir="${1:-}" workdir="${2:-}" socket="${3:-}" exempt="${4:-}"
+  local legacy_pane="${5:-}"
+  local saved_socket="${DUET_TMUX_SOCKET:-}"
+  [ -n "$dir" ] || return 0
+
+  [ -d "$dir" ] && : > "$dir/.ended" 2>/dev/null || true
+  duet_strip_session_anchors "$workdir"
+
+  DUET_TMUX_SOCKET="$socket"
+  duet_kill_spawned_panes "$dir/roster.tsv" "$exempt" "$legacy_pane"
+  DUET_TMUX_SOCKET="$saved_socket"
 }
