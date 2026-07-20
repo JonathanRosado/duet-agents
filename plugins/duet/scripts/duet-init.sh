@@ -42,6 +42,7 @@ INITIATOR_NAME=claude
 INITIATOR_PANE="${TMUX_PANE:?duet: initiating pane has no TMUX_PANE}"
 DUET_TMUX_SOCKET="$(tmux display-message -p -t "$INITIATOR_PANE" '#{socket_path}')"
 WINDOW_ID="$(_duet_tmux display-message -p -t "$INITIATOR_PANE" '#{window_id}')"
+DUET_TMUX_SERVER_PID="$(_duet_tmux display-message -p '#{pid}')"
 DUET_STATE_ROOT="${DUET_STATE_ROOT:-$HOME/.duet}"
 
 workers=("$@")
@@ -75,17 +76,21 @@ mkdir -p "$DUET_STATE_ROOT"
 PREV_ENV="$DUET_STATE_ROOT/current/duet.env"
 if [ -f "$PREV_ENV" ]; then
   caller_pane="$INITIATOR_PANE"
-  (
-    unset DUET_DIR WORKDIR PLUGIN_DIR DUET_TMUX_SOCKET CODEX_PANE
+  if ! (
+    unset DUET_DIR WORKDIR PLUGIN_DIR DUET_TMUX_SOCKET DUET_TMUX_SERVER_PID CODEX_PANE
     # shellcheck disable=SC1090
     . "$PREV_ENV"
     duet_reap_session "${DUET_DIR:-}" "${WORKDIR:-}" "${DUET_TMUX_SOCKET:-}" \
-      "$caller_pane" "${CODEX_PANE:-}"
-  ) || true
+      "$caller_pane" "${CODEX_PANE:-}" "${DUET_TMUX_SERVER_PID:-}"
+  ); then
+    echo "duet: previous session could not be stopped safely; init aborted." >&2
+    exit 7
+  fi
 fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 DUET_DIR="$(mktemp -d "$DUET_STATE_ROOT/$STAMP-XXXXXX")"
+DUET_SESSION_ID="$(basename "$DUET_DIR")"
 mkdir -p "$DUET_DIR/ready"
 : > "$DUET_DIR/transcript.md"
 printf '# Duet assignments\n\nTerm 0 leader: claude\n' > "$DUET_DIR/assignments.md"
@@ -94,11 +99,17 @@ printf 'ok\n' > "$DUET_DIR/ready/$INITIATOR_NAME"
 for name in "${worker_names[@]}"; do
   mkdir -p "$DUET_DIR/inbox/$name/delivered" \
            "$DUET_DIR/inbox/$name/failed" \
-           "$DUET_DIR/inbox/$name/quarantine"
+           "$DUET_DIR/inbox/$name/quarantine" \
+           "$DUET_DIR/inbox/$name/superseded"
 done
 mkdir -p "$DUET_DIR/inbox/$INITIATOR_NAME/delivered" \
          "$DUET_DIR/inbox/$INITIATOR_NAME/failed" \
-         "$DUET_DIR/inbox/$INITIATOR_NAME/quarantine"
+         "$DUET_DIR/inbox/$INITIATOR_NAME/quarantine" \
+         "$DUET_DIR/inbox/$INITIATOR_NAME/superseded" \
+         "$DUET_DIR/inbox/leader/delivered" \
+         "$DUET_DIR/inbox/leader/failed" \
+         "$DUET_DIR/inbox/leader/quarantine" \
+         "$DUET_DIR/inbox/leader/superseded"
 
 # Leadership state is human-readable but never sourced as shell code.
 leader_tmp="$(mktemp "$DUET_DIR/.leader.XXXXXX")"
@@ -130,12 +141,16 @@ cleanup_on_exit(){
   local status=$? pane current_target
   [ -n "$init_complete" ] && return "$status"
   : > "$DUET_DIR/.ended" 2>/dev/null || true
+  if ! duet_stop_daemon "$DUET_DIR" 20; then
+    echo "duet: init cleanup left panes intact because the daemon could not be fenced." >&2
+    return "$status"
+  fi
   for pane in "${worker_panes[@]}"; do
     [ -n "$pane" ] || continue
     [ "$pane" = "$INITIATOR_PANE" ] && continue
     _duet_alive "$pane" && _duet_tmux kill-pane -t "$pane" 2>/dev/null || true
   done
-  duet_strip_session_anchors "$WORKDIR"
+  duet_strip_session_anchors "$WORKDIR" || true
   current_target="$(readlink "$DUET_STATE_ROOT/current" 2>/dev/null || true)"
   [ "$current_target" = "$DUET_DIR" ] && rm -f "$DUET_STATE_ROOT/current"
   return "$status"
@@ -188,15 +203,31 @@ env_tmp="$(mktemp "$DUET_DIR/.env.XXXXXX")"
   printf 'WORKDIR=%q\n' "$WORKDIR"
   printf 'PLUGIN_DIR=%q\n' "$PLUGIN_DIR"
   printf 'DUET_TMUX_SOCKET=%q\n' "$DUET_TMUX_SOCKET"
+  printf 'DUET_TMUX_SERVER_PID=%q\n' "$DUET_TMUX_SERVER_PID"
+  printf 'DUET_SESSION_ID=%q\n' "$DUET_SESSION_ID"
   printf 'DUET_INITIATOR=%q\n' "$INITIATOR_NAME"
   printf 'DUET_INITIATOR_PANE=%q\n' "$INITIATOR_PANE"
 } > "$env_tmp"
 mv -f "$env_tmp" "$DUET_DIR/duet.env"
 ln -sfn "$DUET_DIR" "$DUET_STATE_ROOT/current"
 
-# Wait for every harness banner, then issue direct verified boot kicks. M2 moves
-# all ordinary traffic to the daemon; this bootstrap path exists only so an
-# agent can prove it loaded the durable brief and can use tools.
+DUET_CONFIG="$DUET_DIR/duet.env" nohup bash "$PLUGIN_DIR/scripts/duet-deliverd.sh" \
+  >/dev/null 2>&1 &
+daemon_boot_pid=$!
+disown 2>/dev/null || true
+daemon_ready=""
+for _ in $(seq 1 50); do
+  if duet_daemon_alive; then daemon_ready=1; break; fi
+  kill -0 "$daemon_boot_pid" 2>/dev/null || break
+  sleep 0.1
+done
+[ -n "$daemon_ready" ] || {
+  echo "duet: delivery daemon failed to start; see $DUET_DIR/deliverd.log" >&2
+  exit 6
+}
+
+# Wait for every harness banner, then enqueue boot kicks through the same daemon
+# path used by every later message.
 boot_timeout="${DUET_BOOT_TIMEOUT:-35}"
 for i in "${!workers[@]}"; do
   harness="${workers[$i]}"
@@ -218,23 +249,9 @@ for i in "${!workers[@]}"; do
   printf -v kick '[DUET boot]\nYou are %s (harness: %s). Read %s and %s/leader. Confirm readiness now by running exactly this shell command: printf '\''ok\\n'\'' > %s . Then wait for a task from the leader.' \
     "$name" "$harness" "$DUET_HARNESS_BRIEF_FILE" "$DUET_DIR" "$ready_path_q"
   kick_state=failed
-  if duet_send_verified "$pane" "$kick" ""; then
-    kick_state=submitted
-  else
-    send_rc=$?
-    if [ "$send_rc" -eq "$DUET_SEND_NOT_LANDED" ]; then
-      sleep 0.5
-      if duet_send_verified "$pane" "$kick" ""; then
-        kick_state=submitted-after-retry
-      else
-        send_rc=$?
-        [ "$send_rc" -eq "$DUET_SEND_LANDED_UNVERIFIED" ] && kick_state=landed-unverified || kick_state=failed
-      fi
-    elif [ "$send_rc" -eq "$DUET_SEND_LANDED_UNVERIFIED" ]; then
-      kick_state=landed-unverified
-    elif [ "$send_rc" -eq "$DUET_SEND_DEAD" ]; then
-      kick_state=dead
-    fi
+  if kick_output="$(printf '%s' "$kick" | DUET_CONFIG="$DUET_DIR/duet.env" \
+      bash "$SELF_DIR/duet-send.sh" "$name" --from "$INITIATOR_NAME")"; then
+    kick_state="queued:${kick_output#duet: queued }"
   fi
   kick_states[$i]="$kick_state"
 done

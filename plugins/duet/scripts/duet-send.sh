@@ -1,55 +1,127 @@
 #!/usr/bin/env bash
-# duet-send.sh <codex|claude> [--interrupt]  — send a message (read from stdin) to
-# the peer, delivered INLINE (bracketed paste) and VERIFIED submitted. Prints
-# "submitted" only after confirming the peer's composer actually cleared; prints
-# "SENT BUT UNVERIFIED" (exit 3) otherwise, instead of a false "delivered". This is
-# the fix for the Enter-races-bracketed-paste silent drop (issues #1 and #2).
-# --interrupt barges in (Esc first) to redirect a BUSY peer.
+# Enqueue one duet message. Injection is owned exclusively by duet-deliverd.
 set -euo pipefail
+
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SELF_DIR/duet-common.sh"
-recipient="${1:-}"; [ $# -ge 1 ] && shift
-interrupt=""; [ "${1:-}" = "--interrupt" ] && interrupt=1
-cfg="${DUET_CONFIG:-$HOME/.duet/current/duet.env}"
-[ -f "$cfg" ] || { echo "duet: no session ($cfg). run duet-init first." >&2; exit 1; }
+
+usage(){
+  echo "usage: duet-send.sh <recipient-name|leader|all> [--interrupt] [--from <name>]" >&2
+}
+
+recipient_token="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+[ -n "$recipient_token" ] || { usage; exit 2; }
+interrupt=""
+from=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --interrupt) interrupt=1; shift ;;
+    --from)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      from="$2"
+      shift 2
+      ;;
+    *) usage; echo "duet: unknown option '$1'" >&2; exit 2 ;;
+  esac
+done
+
+state_root="${DUET_STATE_ROOT:-$HOME/.duet}"
+cfg="${DUET_CONFIG:-$state_root/current/duet.env}"
+[ -f "$cfg" ] || { echo "duet: no session ($cfg); run duet-init first." >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$cfg"
-case "$recipient" in
-  codex)  sender=claude; pane="$CODEX_PANE"  ;;
-  claude) sender=codex;  pane="$CLAUDE_PANE" ;;
-  *) echo "usage: duet-send.sh <codex|claude> [--interrupt]   (message body on stdin)" >&2; exit 2 ;;
-esac
+[ ! -f "$DUET_DIR/.ended" ] || { echo "duet: session has ended; refusing to enqueue." >&2; exit 1; }
+[ -f "$DUET_DIR/roster.tsv" ] || { echo "duet: session roster is missing." >&2; exit 1; }
+duet_read_leader_state
+duet_daemon_alive || { echo "duet: delivery daemon is not alive; message was not queued." >&2; exit 6; }
 
-body="$(cat)"
-ts="$(date '+%H:%M:%S')"
-# durable transcript (both directions) - for recovery after /clear or compaction
-printf '\n----- %s  %s -> %s%s -----\n%s\n' "$ts" "$sender" "$recipient" "${interrupt:+  (INTERRUPT)}" "$body" \
-  >> "$DUET_DIR/transcript.md"
-# framed payload the peer receives (header lets it tell duet msgs from a human typing)
-payload="$(printf '[DUET from %s]\n%s' "$sender" "$body")"
+pane_name=""
+if [ -n "${TMUX_PANE:-}" ]; then
+  pane_name="$(duet_roster_name_for_pane "$TMUX_PANE")"
+fi
+self_name="${DUET_SELF:-}"
+if [ -n "$pane_name" ] && [ -n "$self_name" ] && [ "$pane_name" != "$self_name" ]; then
+  echo "duet: identity mismatch: pane $TMUX_PANE is '$pane_name' but DUET_SELF is '$self_name'." >&2
+  exit 7
+fi
 
-# Optional relay path: ONLY for a deliberately-sandboxed Codex that cannot drive
-# tmux. The relay process verifies submission and retries; refuse to queue silently
-# if no relay is actually running (that would recreate the old false-"delivered").
-if [ "$recipient" = claude ] && [ -n "${DUET_RELAY:-}" ]; then
-  if [ ! -f "$DUET_DIR/relay.log" ]; then
-    echo "duet: DUET_RELAY set but no relay.log - relay may not be running; sending directly." >&2
-  else
-    box="$DUET_DIR/to-claude"; mkdir -p "$box"
-    n=$(( $(find "$box" -maxdepth 1 -name '*.msg' 2>/dev/null | wc -l | tr -d ' ') + 1 ))
-    seq=$(printf '%04d' "$n"); tmp="$box/.$seq.tmp"; final="$box/$seq.msg"
-    { [ -n "$interrupt" ] && echo INTERRUPT || echo NORMAL; printf '%s' "$payload"; } > "$tmp"; mv -f "$tmp" "$final"
-    echo "duet: queued for claude via relay${interrupt:+ (interrupt)} ($seq.msg)"; exit 0
+known_sender="$pane_name"
+if [ -n "$from" ]; then
+  duet_roster_has_name "$from" || { echo "duet: --from identity '$from' is not in the roster." >&2; exit 7; }
+  if [ -n "$known_sender" ] && [ "$known_sender" != "$from" ] \
+      && [ -z "${DUET_ALLOW_FROM_OVERRIDE:-}" ]; then
+    echo "duet: --from '$from' does not match caller pane identity '$known_sender'." >&2
+    exit 7
+  fi
+  if [ -n "$self_name" ] && [ "$self_name" != "$from" ] \
+      && [ -z "${DUET_ALLOW_FROM_OVERRIDE:-}" ]; then
+    echo "duet: --from '$from' does not match DUET_SELF '$self_name'." >&2
+    exit 7
+  fi
+  if [ -z "$known_sender" ] && [ -z "${DUET_ALLOW_FROM_OVERRIDE:-}" ]; then
+    echo "duet: caller pane is not in this roster; set DUET_ALLOW_FROM_OVERRIDE=1 for explicit admin/test sends." >&2
+    exit 7
+  fi
+  sender="$from"
+else
+  [ -n "$known_sender" ] || {
+    echo "duet: cannot resolve sender from TMUX_PANE; use an explicit authorized --from override." >&2
+    exit 7
+  }
+  sender="$known_sender"
+fi
+
+body_with_sentinel="$(cat; printf '.')"
+body="${body_with_sentinel%.}"
+mode=NORMAL
+[ -z "$interrupt" ] || mode=INTERRUPT
+origin=WORKER
+[ "$sender" != "$DUET_CURRENT_LEADER" ] || origin=LEADER
+
+enqueue_one(){
+  local queue="$1" recipient="$2"
+  duet_enqueue_message "$queue" "$sender" "$recipient" "$DUET_CURRENT_TERM" \
+    "$mode" "$origin" "$DUET_CURRENT_LEADER" "$body"
+  printf 'duet: queued %s for %s%s\n' \
+    "$DUET_ENQUEUED_ID" "$recipient" "${interrupt:+ (interrupt)}"
+}
+
+if [ "$sender" = "$DUET_CURRENT_LEADER" ]; then
+  if [ "$recipient_token" = all ]; then
+    while IFS=$'\t' read -r name _harness _pane _pid _rank _spawned; do
+      [ "$name" = name ] && continue
+      [ "$name" = "$sender" ] && continue
+      enqueue_one "$name" "$name"
+    done < "$DUET_DIR/roster.tsv"
+    exit 0
+  fi
+
+  if [ "$recipient_token" = leader ]; then
+    echo "duet: leader '$sender' cannot send to itself through the leader alias." >&2
+    exit 8
+  fi
+  recipient="$(duet_resolve_roster_name "$recipient_token")" || {
+    echo "duet: unknown or ambiguous recipient '$recipient_token'." >&2
+    exit 2
+  }
+  [ "$recipient" != "$sender" ] || { echo "duet: sender and recipient are both '$sender'." >&2; exit 8; }
+  enqueue_one "$recipient" "$recipient"
+  exit 0
+fi
+
+# Worker traffic is canonicalized to the symbolic leader queue, even when the
+# caller used the current leader's concrete name. Delivery-time resolution then
+# preserves an in-flight reply across a later promotion.
+if [ "$recipient_token" != leader ]; then
+  recipient="$(duet_resolve_roster_name "$recipient_token")" || {
+    echo "duet: unknown or ambiguous recipient '$recipient_token'." >&2
+    exit 2
+  }
+  if [ "$recipient" != "$DUET_CURRENT_LEADER" ]; then
+    echo "duet: hub violation: worker '$sender' may send only to leader '$DUET_CURRENT_LEADER'." >&2
+    exit 8
   fi
 fi
-
-# Default: inject directly into the recipient's pane and VERIFY submission.
-_duet_alive "$pane" || { echo "duet: $recipient pane ($pane) is not alive - re-init the duet or run duet-doctor.sh." >&2; exit 4; }
-if duet_send_verified "$pane" "$payload" "$interrupt"; then
-  echo "duet: submitted to $recipient${interrupt:+ (interrupt)}"
-  exit 0
-else
-  echo "duet: SENT BUT UNVERIFIED to $recipient - could not confirm it was submitted. Check its pane (duet-status.sh); do NOT assume delivery." >&2
-  exit 3
-fi
+enqueue_one leader leader
