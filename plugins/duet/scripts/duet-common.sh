@@ -190,8 +190,10 @@ duet_caller_roster_name(){
   duet_capture_caller_identity || return 1
   [ "$DUET_CALLER_SOCKET" = "${DUET_TMUX_SOCKET:-}" ] || return 1
   [ "$DUET_CALLER_SERVER_PID" = "${DUET_TMUX_SERVER_PID:-}" ] || return 1
+  duet_validate_roster "${DUET_DIR:?}/roster.tsv" || return 1
   entry="$(awk -F '\t' -v pane="$DUET_CALLER_PANE" \
-    'NR > 1 && $3 == pane { print $1 "|" $4; exit }' \
+    'NR > 1 && $3 == pane { value=$1 "|" $4; count++ }
+     END { if (count == 1) print value }' \
     "${DUET_DIR:?}/roster.tsv" 2>/dev/null)"
   [ -n "$entry" ] || return 1
   roster_pid="${entry#*|}"
@@ -226,8 +228,10 @@ duet_find_caller_session(){
         [ "${DUET_SESSION_ID:-}" = "$(basename "$config_parent")" ] || exit 1
         [ "${DUET_TMUX_SOCKET:-}" = "$DUET_CALLER_SOCKET" ] || exit 1
         [ "${DUET_TMUX_SERVER_PID:-}" = "$DUET_CALLER_SERVER_PID" ] || exit 1
+        duet_validate_roster "${DUET_DIR:-$(dirname "$cfg")}/roster.tsv" || exit 1
         awk -F '\t' -v pane="$DUET_CALLER_PANE" -v pid="$DUET_CALLER_PANE_PID" \
-          'NR > 1 && $3 == pane && $4 == pid { print dir; exit }' \
+          'NR > 1 && $3 == pane && $4 == pid { count++ }
+           END { if (count == 1) print dir }' \
           dir="${DUET_DIR:-$(dirname "$cfg")}" "${DUET_DIR:-$(dirname "$cfg")}/roster.tsv"
       )
     )"
@@ -732,8 +736,8 @@ duet_kill_spawned_panes(){
   local roster="${1:-}" exempt="${2:-}" legacy_pane="${3:-}"
   local legacy_pid="${4:-}"
   local pane recorded_pid spawned actual_pid
-  local victims="" victim victim_pane victim_pid
-  if [ ! -f "$roster" ]; then
+  local victims="" victim victim_pane victim_pid failed=""
+  if [ ! -e "$roster" ] && [ ! -L "$roster" ]; then
     # v0.1.x recorded CODEX_PANE_PID even though it had no roster. Require that
     # exact process identity; a server-local pane ID alone is never kill proof.
     actual_pid="$(_duet_tmux display-message -p -t "$legacy_pane" '#{pane_pid}' 2>/dev/null || true)"
@@ -742,10 +746,17 @@ duet_kill_spawned_panes(){
       _duet_tmux send-keys -t "$legacy_pane" C-c 2>/dev/null || true
       sleep 0.3
       actual_pid="$(_duet_tmux display-message -p -t "$legacy_pane" '#{pane_pid}' 2>/dev/null || true)"
-      [ "$actual_pid" = "$legacy_pid" ] \
-        && _duet_tmux kill-pane -t "$legacy_pane" 2>/dev/null || true
+      if [ "$actual_pid" = "$legacy_pid" ] \
+          && ! _duet_tmux kill-pane -t "$legacy_pane" 2>/dev/null; then
+        echo "duet: failed to reap spawned legacy pane $legacy_pane." >&2
+        return 1
+      fi
     fi
     return 0
+  fi
+  if ! duet_validate_roster "$roster"; then
+    echo "duet: invalid roster cannot authorize pane teardown: $roster" >&2
+    return 1
   fi
 
   while IFS='|' read -r pane recorded_pid spawned; do
@@ -757,7 +768,7 @@ duet_kill_spawned_panes(){
     [ "$actual_pid" = "$recorded_pid" ] || continue
     _duet_tmux send-keys -t "$pane" C-c 2>/dev/null || true
     victims="${victims}${victims:+ }$pane|$recorded_pid"
-  done < <(awk -F '\t' 'NR > 1 { print $3 "|" $4 "|" $6 }' "$roster")
+  done < <(awk -F '\t' 'NR > 1 { sub(/\r$/, "", $6); print $3 "|" $4 "|" $6 }' "$roster")
 
   [ -n "$victims" ] || return 0
   sleep 0.3
@@ -766,9 +777,13 @@ duet_kill_spawned_panes(){
     victim_pid="${victim#*|}"
     [ "$victim_pane" = "$exempt" ] && continue
     actual_pid="$(_duet_tmux display-message -p -t "$victim_pane" '#{pane_pid}' 2>/dev/null || true)"
-    [ "$actual_pid" = "$victim_pid" ] \
-      && _duet_tmux kill-pane -t "$victim_pane" 2>/dev/null || true
+    if [ "$actual_pid" = "$victim_pid" ] \
+        && ! _duet_tmux kill-pane -t "$victim_pane" 2>/dev/null; then
+      echo "duet: failed to reap spawned pane $victim_pane." >&2
+      failed=1
+    fi
   done
+  [ -z "$failed" ]
 }
 
 # Reap a previous session without ever killing the pane performing the re-init.
@@ -780,6 +795,11 @@ duet_reap_session(){
   local legacy_pid="${7:-}"
   local saved_socket="${DUET_TMUX_SOCKET:-}"
   [ -n "$dir" ] || return 0
+  if { [ -e "$dir/roster.tsv" ] || [ -L "$dir/roster.tsv" ]; } \
+      && ! duet_validate_roster "$dir/roster.tsv"; then
+    echo "duet: invalid previous-session roster; refusing reap before lifecycle mutation." >&2
+    return 1
+  fi
 
   if [ -d "$dir" ]; then
     duet_lock_acquire "$dir/.admission.lock" 200 || return 1
@@ -801,30 +821,124 @@ duet_reap_session(){
       return 0
     fi
   fi
-  duet_kill_spawned_panes "$dir/roster.tsv" "$exempt" "$legacy_pane" "$legacy_pid"
+  if ! duet_kill_spawned_panes "$dir/roster.tsv" "$exempt" "$legacy_pane" "$legacy_pid"; then
+    DUET_TMUX_SOCKET="$saved_socket"
+    return 1
+  fi
   DUET_TMUX_SOCKET="$saved_socket"
+}
+
+# Validate the immutable session roster before using any row as an identity,
+# liveness, routing, or teardown capability. This mirrors Import-DuetRoster on
+# Windows and keeps ambiguous/corrupt tuples UNKNOWN rather than DEAD.
+duet_validate_roster(){
+  local roster="${1:-${DUET_DIR:?}/roster.tsv}"
+  DUET_ROSTER_VALID=""
+  duet_regular_file_without_nul "$roster" || return 1
+  if LC_ALL=C awk '
+    function reject(){ bad=1; exit }
+    function int32(s, positive, t){
+      if (s !~ /^[0-9]+$/) return 0
+      t=s; sub(/^0+/, "", t); if (t=="") t="0"
+      if (positive && t=="0") return 0
+      if (length(t)>10 || (length(t)==10 && ("x" t) > "x2147483647")) return 0
+      return 1
+    }
+    {
+      line=$0; sub(/\r$/, "", line)
+      if (NR==1) {
+        if (line != "name\tharness\tpane_id\tpane_pid\trank\tspawned") reject()
+        header=1; next
+      }
+      if (line=="") next
+      n=split(line,c,"\t"); if (n != 6) reject()
+      name=c[1]; harness=c[2]; pane=c[3]; pid=c[4]; rank=c[5]; spawned=c[6]
+      if (name !~ /^[A-Za-z0-9_-]+$/) reject()
+      if (harness!="claude" && harness!="codex" && harness!="kimi") reject()
+      if (pane !~ /^%[0-9]+$/ || !int32(pid,1) || !int32(rank,0)) reject()
+      if (spawned!="0" && spawned!="1") reject()
+      folded_name=tolower(name)
+      if ((folded_name in names)||(pane in panes)||(pid in pids)||(rank in ranks)) reject()
+      names[folded_name]=1; panes[pane]=1; pids[pid]=1; ranks[rank]=1; rows++
+      if (rows > 5) reject()
+    }
+    END { exit (bad || !header || rows < 1) }
+  ' "$roster"; then
+    DUET_ROSTER_VALID=1
+    return 0
+  fi
+  return 1
+}
+
+# awk and shell variables cannot faithfully represent NUL bytes. Reject them
+# at the raw-file boundary before parsing metadata or identity capabilities.
+duet_regular_file_without_nul(){
+  local file="${1:?file required}"
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  LC_ALL=C tr -d '\000' < "$file" | cmp -s "$file" -
+}
+
+# Parse the protocol's bounded decimal space without feeding untrusted text to
+# Bash arithmetic. By default the representation must be canonical (only zero
+# itself may start with zero); order/sequence callers may allow zero padding.
+duet_decimal_d10(){
+  local value="${1-}" allow_leading_zeros="${2:-0}" prefix normalized
+  DUET_DECIMAL_VALUE=""
+  case "$value" in ''|*[!0-9]*) return 1;; esac
+  if [ "$allow_leading_zeros" = 1 ]; then
+    [ "${#value}" -le 10 ] || return 1
+    prefix="${value%%[!0]*}"
+    normalized="${value#"$prefix"}"
+    [ -n "$normalized" ] || normalized=0
+  else
+    case "$value" in
+      0) normalized=0 ;;
+      0*) return 1 ;;
+      *) normalized="$value" ;;
+    esac
+  fi
+  [ "${#normalized}" -le 10 ] || return 1
+  DUET_DECIMAL_VALUE="$normalized"
 }
 
 # Read the atomically-published leadership state into DUET_CURRENT_TERM and
 # DUET_CURRENT_LEADER. The file is data, never shell code.
 duet_read_leader_state(){
-  local file="${1:-${DUET_DIR:?}/leader}" state
+  local file="${1:-${DUET_DIR:?}/leader}" state term leader
+  DUET_CURRENT_TERM=""
+  DUET_CURRENT_LEADER=""
+  duet_regular_file_without_nul "$file" || {
+    echo "duet: invalid leadership state in $file" >&2
+    return 1
+  }
   state="$(awk -F '\t' '
-    $1 == "term" { term=$2 }
-    $1 == "leader" { leader=$2 }
+    {
+      line=$0; sub(/\r$/, "", line)
+      n=split(line, c, "\t")
+      if (NR==1 && n==2 && c[1]=="term") term=c[2]
+      else if (NR==2 && n==2 && c[1]=="leader") leader=c[2]
+      else bad=1
+    }
     END {
-      if (term ~ /^[0-9]+$/ && leader ~ /^[A-Za-z0-9_-]+$/)
+      if (!bad && NR==2 && term ~ /^[0-9]+$/ && leader ~ /^[A-Za-z0-9_-]+$/)
         print term "\t" leader
     }
   ' "$file" 2>/dev/null)"
   [ -n "$state" ] || { echo "duet: invalid leadership state in $file" >&2; return 1; }
-  DUET_CURRENT_TERM="${state%%$'\t'*}"
-  DUET_CURRENT_LEADER="${state#*$'\t'}"
+  term="${state%%$'\t'*}"
+  leader="${state#*$'\t'}"
+  duet_decimal_d10 "$term" || {
+    echo "duet: invalid leadership state in $file" >&2
+    return 1
+  }
+  DUET_CURRENT_TERM="$DUET_DECIMAL_VALUE"
+  DUET_CURRENT_LEADER="$leader"
 }
 
 duet_write_leader_state(){
   local term="${1:?term required}" leader="${2:?leader required}" tmp
-  case "$term" in ''|*[!0-9]*) return 1;; esac
+  duet_decimal_d10 "$term" || return 1
+  term="$DUET_DECIMAL_VALUE"
   case "$leader" in ''|*[!A-Za-z0-9_-]*) return 1;; esac
   tmp="$(mktemp "${DUET_DIR:?}/.leader.XXXXXX")" || return 1
   if ! printf 'term\t%s\nleader\t%s\n' "$term" "$leader" > "$tmp" \
@@ -835,22 +949,30 @@ duet_write_leader_state(){
 }
 
 duet_roster_has_name(){
-  awk -F '\t' -v name="${1:-}" 'NR > 1 && $1 == name { found=1 } END { exit !found }' \
+  duet_validate_roster "${DUET_DIR:?}/roster.tsv" || return 1
+  awk -F '\t' -v name="${1:-}" \
+    'NR > 1 && $1 == name { count++ } END { exit !(count == 1) }' \
     "${DUET_DIR:?}/roster.tsv" 2>/dev/null
 }
 
 duet_roster_name_for_pane(){
-  awk -F '\t' -v pane="${1:-}" 'NR > 1 && $3 == pane { print $1; exit }' \
+  duet_validate_roster "${DUET_DIR:?}/roster.tsv" || return 1
+  awk -F '\t' -v pane="${1:-}" \
+    'NR > 1 && $3 == pane { value=$1; count++ } END { if (count == 1) print value }' \
     "${DUET_DIR:?}/roster.tsv" 2>/dev/null
 }
 
 duet_roster_pane_for_name(){
-  awk -F '\t' -v name="${1:-}" 'NR > 1 && $1 == name { print $3; exit }' \
+  duet_validate_roster "${DUET_DIR:?}/roster.tsv" || return 1
+  awk -F '\t' -v name="${1:-}" \
+    'NR > 1 && $1 == name { value=$3; count++ } END { if (count == 1) print value }' \
     "${DUET_DIR:?}/roster.tsv" 2>/dev/null
 }
 
 duet_roster_harness_for_name(){
-  awk -F '\t' -v name="${1:-}" 'NR > 1 && $1 == name { print $2; exit }' \
+  duet_validate_roster "${DUET_DIR:?}/roster.tsv" || return 1
+  awk -F '\t' -v name="${1:-}" \
+    'NR > 1 && $1 == name { value=$2; count++ } END { if (count == 1) print value }' \
     "${DUET_DIR:?}/roster.tsv" 2>/dev/null
 }
 
@@ -859,8 +981,10 @@ duet_roster_harness_for_name(){
 duet_roster_member_alive(){
   local name="${1:?name required}" entry pane roster_pid actual_pid
   duet_tmux_server_matches || return 1
+  duet_validate_roster "${DUET_DIR:?}/roster.tsv" || return 1
   entry="$(awk -F '\t' -v name="$name" \
-    'NR > 1 && $1 == name { print $3 "|" $4; exit }' \
+    'NR > 1 && $1 == name { value=$3 "|" $4; count++ }
+     END { if (count == 1) print value }' \
     "${DUET_DIR:?}/roster.tsv" 2>/dev/null)"
   [ -n "$entry" ] || return 1
   pane="${entry%%|*}"
@@ -916,6 +1040,10 @@ duet_promote_locked(){
   [ -n "$requested" ] || return 3
   lock="${DUET_DIR:?}/.promotion.lock"
   duet_lock_acquire "$lock" 200 || return 1
+  if ! duet_validate_roster "$DUET_DIR/roster.tsv"; then
+    duet_lock_release "$lock" 2>/dev/null || true
+    return 1
+  fi
   if ! duet_read_leader_state \
       || [ "$DUET_CURRENT_TERM" != "$expected_term" ] \
       || [ "$DUET_CURRENT_LEADER" != "$expected_leader" ]; then
@@ -937,6 +1065,11 @@ duet_promote_locked(){
     return 11
   fi
 
+  if ! duet_decimal_d10 "$expected_term" || [ "$DUET_DECIMAL_VALUE" = 9999999999 ]; then
+    duet_lock_release "$lock" 2>/dev/null || true
+    return 1
+  fi
+  expected_term="$DUET_DECIMAL_VALUE"
   new_term=$((10#$expected_term + 1))
   safe_reason="$(printf '%s' "$reason" | tr '\t\r\n' '   ')"
   body="Leadership handoff for session ${DUET_SESSION_ID:?}: you are leader for generation $new_term. Prior leader: $expected_leader. Operator record: $safe_reason. Read assignments.md, preserve disjoint scopes, and notify or reassign workers as needed."
@@ -976,6 +1109,7 @@ duet_promote_locked(){
 # when exactly one roster entry uses that harness.
 duet_resolve_roster_name(){
   local token="${1:-}" exact matches
+  duet_validate_roster "${DUET_DIR:?}/roster.tsv" || return 1
   if duet_roster_has_name "$token"; then printf '%s' "$token"; return 0; fi
   matches="$(awk -F '\t' -v harness="$token" 'NR > 1 && $2 == harness { print $1 }' \
     "${DUET_DIR:?}/roster.tsv" 2>/dev/null)"
@@ -1124,12 +1258,19 @@ duet_next_sequence(){
   local box="${1:?queue directory required}" current next tmp existing sequence_dir
   if [ -f "$box/.counter" ]; then
     current="$(cat "$box/.counter" 2>/dev/null || true)"
-    case "$current" in ''|*[!0-9]*) echo "duet: corrupt counter in $box" >&2; return 1;; esac
-    current=$((10#$current))
+    if ! duet_decimal_d10 "$current"; then
+      echo "duet: corrupt counter in $box" >&2
+      return 1
+    fi
+    current="$DUET_DECIMAL_VALUE"
   else
     existing="$(find "$box" -type f \( -name 'N-*.msg' -o -name 'I-*.msg' \) -print -quit 2>/dev/null)"
     [ -z "$existing" ] || { echo "duet: missing counter in non-empty queue $box" >&2; return 1; }
     current=0
+  fi
+  if [ "$current" = 9999999999 ]; then
+    echo "duet: sequence exhausted (D10 cap) in $box" >&2
+    return 1
   fi
   next=$((current + 1))
   printf -v DUET_SEQUENCE '%010d' "$next"
@@ -1160,12 +1301,17 @@ duet_next_message_order(){
   local file="${DUET_DIR:?}/.message-order" current next
   if [ -f "$file" ]; then
     current="$(cat "$file" 2>/dev/null || true)"
-    case "$current" in
-      ''|*[!0-9]*) echo "duet: corrupt global message order in $file" >&2; return 1 ;;
-    esac
-    current=$((10#$current))
+    if ! duet_decimal_d10 "$current"; then
+      echo "duet: corrupt global message order in $file" >&2
+      return 1
+    fi
+    current="$DUET_DECIMAL_VALUE"
   else
     current=0
+  fi
+  if [ "$current" = 9999999999 ]; then
+    echo "duet: message-order exhausted (D10 cap)" >&2
+    return 1
   fi
   next=$((current + 1))
   duet_atomic_write "$file" "$next" || return 1
@@ -1182,11 +1328,13 @@ duet_find_dedupe_message(){
       "$box"/failed/N-*.msg "$box"/failed/I-*.msg \
       "$box"/quarantine/N-*.msg "$box"/quarantine/I-*.msg \
       "$box"/superseded/N-*.msg "$box"/superseded/I-*.msg; do
-    [ -f "$file" ] || continue
-    value="$(awk -F '\t' '$1 == "dedupe" { sub(/^[^\t]*\t/, ""); print; exit }' "$file")"
+    [ -f "$file" ] && [ ! -L "$file" ] || continue
+    duet_read_message "$file" || continue
+    [ "$DUET_MESSAGE_SESSION" = "${DUET_SESSION_ID:?}" ] || continue
+    value="$DUET_MESSAGE_DEDUPE"
     [ "$value" = "$key" ] || continue
     DUET_DEDUPE_FILE="$file"
-    DUET_DEDUPE_ID="$(awk -F '\t' '$1 == "id" { print $2; exit }' "$file")"
+    DUET_DEDUPE_ID="$DUET_MESSAGE_ID"
     [ -n "$DUET_DEDUPE_ID" ] && return 0
   done
   return 1
@@ -1226,8 +1374,15 @@ duet_enqueue_message(){
   case "$queue" in ''|*[!A-Za-z0-9_-]*) echo "duet: invalid queue '$queue'" >&2; return 1;; esac
   case "$mode" in NORMAL) prefix=N;; INTERRUPT) prefix=I;; *) echo "duet: invalid mode '$mode'" >&2; return 1;; esac
   case "$origin" in LEADER|WORKER|SYSTEM) :;; *) echo "duet: invalid origin role '$origin'" >&2; return 1;; esac
-  case "$term" in ''|*[!0-9]*) echo "duet: invalid term '$term'" >&2; return 1;; esac
-  case "$dedupe" in *$'\t'*|*$'\n'*) echo "duet: invalid dedupe key" >&2; return 1;; esac
+  if ! duet_decimal_d10 "$term"; then
+    echo "duet: invalid term '$term'" >&2
+    return 1
+  fi
+  term="$DUET_DECIMAL_VALUE"
+  case "${DUET_SESSION_ID:-}${sender}${recipient}${leader_at_send}" in
+    ''|*[!A-Za-z0-9_-]*) echo "duet: invalid message metadata" >&2; return 1;;
+  esac
+  case "$dedupe" in *$'\t'*|*$'\r'*|*$'\n'*) echo "duet: invalid dedupe key" >&2; return 1;; esac
   if [ -n "$handoff_mode" ] || [ -n "$handoff_prior_term" ] \
       || [ -n "$handoff_prior_leader" ]; then
     if [ "$handoff_mode" != MANUAL ] || [ "$queue" != promotions ] \
@@ -1237,10 +1392,16 @@ duet_enqueue_message(){
       echo "duet: invalid manual handoff envelope" >&2
       return 1
     fi
-    case "$handoff_prior_term" in ''|*[!0-9]*) echo "duet: invalid prior handoff term" >&2; return 1;; esac
+    if ! duet_decimal_d10 "$handoff_prior_term"; then
+      echo "duet: invalid prior handoff term" >&2
+      return 1
+    fi
+    handoff_prior_term="$DUET_DECIMAL_VALUE"
     case "$handoff_prior_leader" in ''|*[!A-Za-z0-9_-]*) echo "duet: invalid prior leader" >&2; return 1;; esac
     [ "$handoff_prior_leader" != "$recipient" ] \
       || { echo "duet: handoff target already leads" >&2; return 1; }
+    [ "$handoff_prior_term" != 9999999999 ] \
+      || { echo "duet: prior handoff term exhausted the D10 space" >&2; return 1; }
     handoff_expected_term=$((10#$handoff_prior_term + 1))
     [ "$term" = "$handoff_expected_term" ] \
       || { echo "duet: handoff term is not the next generation" >&2; return 1; }
@@ -1335,53 +1496,173 @@ duet_enqueue_message(){
   DUET_ENQUEUED_FILE="$final"
 }
 
+_duet_message_structure_valid(){
+  # Bash 3.2 has no associative arrays, so use POSIX awk for the wire-schema
+  # pass.  LC_ALL=C makes [:cntrl:] exactly the ASCII C0/DEL set that the
+  # PowerShell parser rejects.  Strip one terminal CR per line only as CRLF
+  # framing; a second CR remains metadata and is rejected.
+  duet_regular_file_without_nul "$1" || return 1
+  LC_ALL=C awk '
+    BEGIN {
+      known["id"]; known["session"]; known["order"]; known["mode"]
+      known["sender"]; known["recipient"]; known["term"]; known["origin"]
+      known["leader_at_send"]; known["dedupe"]; known["handoff_mode"]
+      known["prior_term"]; known["prior_leader"]; known["body64"]
+      required["id"]; required["session"]; required["order"]; required["mode"]
+      required["sender"]; required["recipient"]; required["term"]
+      required["origin"]; required["leader_at_send"]; required["dedupe"]
+      required["body64"]
+      cr = sprintf("%c", 13)
+    }
+    {
+      line = $0
+      if (substr(line, length(line), 1) == cr) {
+        line = substr(line, 1, length(line) - 1)
+      }
+      if (NR == 1) {
+        if (line != "DUETv1") bad = 1
+        next
+      }
+      if (line == "") next
+      tab = index(line, "\t")
+      if (tab) {
+        key = substr(line, 1, tab - 1)
+        value = substr(line, tab + 1)
+      } else {
+        key = line
+        value = ""
+      }
+      if (!(key in known) || (key in seen)) {
+        bad = 1
+        next
+      }
+      seen[key] = 1
+      if (key != "body64" && value ~ /[[:cntrl:]]/) bad = 1
+    }
+    END {
+      if (NR < 1) bad = 1
+      for (key in required) if (!(key in seen)) bad = 1
+      exit bad ? 1 : 0
+    }
+  ' "$1"
+}
+
+_duet_message_field(){
+  LC_ALL=C awk -v wanted="$2" '
+    BEGIN { cr = sprintf("%c", 13) }
+    {
+      line = $0
+      if (substr(line, length(line), 1) == cr) {
+        line = substr(line, 1, length(line) - 1)
+      }
+      tab = index(line, "\t")
+      key = tab ? substr(line, 1, tab - 1) : line
+      if (key == wanted) {
+        if (tab) print substr(line, tab + 1)
+        else print ""
+        exit
+      }
+    }
+  ' "$1"
+}
+
+_duet_message_decimal_valid(){ duet_decimal_d10 "$@"; }
+
 duet_read_message(){
   local file="${1:?message file required}" encoded decoded handoff_expected_term
-  [ "$(sed -n '1p' "$file" 2>/dev/null)" = DUETv1 ] || return 1
-  DUET_MESSAGE_ID="$(awk -F '\t' '$1 == "id" { print $2; exit }' "$file")"
-  DUET_MESSAGE_SESSION="$(awk -F '\t' '$1 == "session" { print $2; exit }' "$file")"
-  DUET_MESSAGE_ORDER="$(awk -F '\t' '$1 == "order" { print $2; exit }' "$file")"
-  DUET_MESSAGE_MODE="$(awk -F '\t' '$1 == "mode" { print $2; exit }' "$file")"
-  DUET_MESSAGE_SENDER="$(awk -F '\t' '$1 == "sender" { print $2; exit }' "$file")"
-  DUET_MESSAGE_RECIPIENT="$(awk -F '\t' '$1 == "recipient" { print $2; exit }' "$file")"
-  DUET_MESSAGE_TERM="$(awk -F '\t' '$1 == "term" { print $2; exit }' "$file")"
-  DUET_MESSAGE_ORIGIN="$(awk -F '\t' '$1 == "origin" { print $2; exit }' "$file")"
-  DUET_MESSAGE_LEADER_AT_SEND="$(awk -F '\t' '$1 == "leader_at_send" { print $2; exit }' "$file")"
-  DUET_MESSAGE_DEDUPE="$(awk -F '\t' '$1 == "dedupe" { sub(/^[^\t]*\t/, ""); print; exit }' "$file")"
-  DUET_MESSAGE_HANDOFF_MODE="$(awk -F '\t' '$1 == "handoff_mode" { print $2; exit }' "$file")"
-  DUET_MESSAGE_PRIOR_TERM="$(awk -F '\t' '$1 == "prior_term" { print $2; exit }' "$file")"
-  DUET_MESSAGE_PRIOR_LEADER="$(awk -F '\t' '$1 == "prior_leader" { print $2; exit }' "$file")"
-  encoded="$(awk -F '\t' '$1 == "body64" { sub(/^[^\t]*\t/, ""); print; exit }' "$file")"
+  local handoff_field_count decoded_file decode_rc LC_ALL=C
+
+  DUET_MESSAGE_ID=""
+  DUET_MESSAGE_SESSION=""
+  DUET_MESSAGE_ORDER=""
+  DUET_MESSAGE_MODE=""
+  DUET_MESSAGE_SENDER=""
+  DUET_MESSAGE_RECIPIENT=""
+  DUET_MESSAGE_TERM=""
+  DUET_MESSAGE_ORIGIN=""
+  DUET_MESSAGE_LEADER_AT_SEND=""
+  DUET_MESSAGE_DEDUPE=""
+  DUET_MESSAGE_HANDOFF_MODE=""
+  DUET_MESSAGE_PRIOR_TERM=""
+  DUET_MESSAGE_PRIOR_LEADER=""
+  DUET_MESSAGE_BODY=""
+
+  _duet_message_structure_valid "$file" || return 1
+  DUET_MESSAGE_ID="$(_duet_message_field "$file" id)" || return 1
+  DUET_MESSAGE_SESSION="$(_duet_message_field "$file" session)" || return 1
+  DUET_MESSAGE_ORDER="$(_duet_message_field "$file" order)" || return 1
+  DUET_MESSAGE_MODE="$(_duet_message_field "$file" mode)" || return 1
+  DUET_MESSAGE_SENDER="$(_duet_message_field "$file" sender)" || return 1
+  DUET_MESSAGE_RECIPIENT="$(_duet_message_field "$file" recipient)" || return 1
+  DUET_MESSAGE_TERM="$(_duet_message_field "$file" term)" || return 1
+  DUET_MESSAGE_ORIGIN="$(_duet_message_field "$file" origin)" || return 1
+  DUET_MESSAGE_LEADER_AT_SEND="$(_duet_message_field "$file" leader_at_send)" || return 1
+  DUET_MESSAGE_DEDUPE="$(_duet_message_field "$file" dedupe)" || return 1
+  DUET_MESSAGE_HANDOFF_MODE="$(_duet_message_field "$file" handoff_mode)" || return 1
+  DUET_MESSAGE_PRIOR_TERM="$(_duet_message_field "$file" prior_term)" || return 1
+  DUET_MESSAGE_PRIOR_LEADER="$(_duet_message_field "$file" prior_leader)" || return 1
+  encoded="$(_duet_message_field "$file" body64)" || return 1
+  handoff_field_count="$(LC_ALL=C awk '
+    BEGIN { cr = sprintf("%c", 13) }
+    {
+      line = $0
+      if (substr(line, length(line), 1) == cr) {
+        line = substr(line, 1, length(line) - 1)
+      }
+      tab = index(line, "\t")
+      key = tab ? substr(line, 1, tab - 1) : line
+      if (key == "handoff_mode" || key == "prior_term" || key == "prior_leader") n++
+    }
+    END { print n + 0 }
+  ' "$file")" || return 1
+  decoded_file="$(mktemp "${TMPDIR:-/tmp}/duet-message-body.XXXXXX")" || return 1
   if printf '' | base64 -d >/dev/null 2>&1; then
-    decoded="$(
-      if ! printf '%s' "$encoded" | base64 -d 2>/dev/null; then exit 1; fi
-      printf '.'
-    )" || return 1
+    if printf '%s' "$encoded" | base64 -d > "$decoded_file" 2>/dev/null; then
+      decode_rc=0
+    else
+      decode_rc=$?
+    fi
   else
-    decoded="$(
-      if ! printf '%s' "$encoded" | base64 -D 2>/dev/null; then exit 1; fi
-      printf '.'
-    )" || return 1
+    if printf '%s' "$encoded" | base64 -D > "$decoded_file" 2>/dev/null; then
+      decode_rc=0
+    else
+      decode_rc=$?
+    fi
   fi
+  if [ "$decode_rc" -ne 0 ] \
+      || ! duet_regular_file_without_nul "$decoded_file" \
+      || ! command -v iconv >/dev/null 2>&1 \
+      || ! iconv -f UTF-8 -t UTF-8 "$decoded_file" >/dev/null 2>&1; then
+    rm -f "$decoded_file"
+    return 1
+  fi
+  decoded="$(command cat "$decoded_file"; printf '.')"
+  decode_rc=$?
+  rm -f "$decoded_file"
+  [ "$decode_rc" -eq 0 ] || return 1
   DUET_MESSAGE_BODY="${decoded%.}"
+  case "$DUET_MESSAGE_ID$DUET_MESSAGE_SESSION$DUET_MESSAGE_SENDER$DUET_MESSAGE_RECIPIENT$DUET_MESSAGE_LEADER_AT_SEND" in
+    *[!A-Za-z0-9_-]*) return 1;;
+  esac
   [ -n "$DUET_MESSAGE_ID" ] && [ -n "$DUET_MESSAGE_SESSION" ] \
-    && [ -n "$DUET_MESSAGE_SENDER" ] \
-    && [ -n "$DUET_MESSAGE_RECIPIENT" ] || return 1
-  case "$DUET_MESSAGE_ORDER" in ''|*[!0-9]*) return 1;; esac
+    && [ -n "$DUET_MESSAGE_SENDER" ] && [ -n "$DUET_MESSAGE_RECIPIENT" ] \
+    && [ -n "$DUET_MESSAGE_LEADER_AT_SEND" ] || return 1
+  _duet_message_decimal_valid "$DUET_MESSAGE_ORDER" 1 || return 1
   case "$DUET_MESSAGE_MODE" in NORMAL|INTERRUPT) :;; *) return 1;; esac
   case "$DUET_MESSAGE_ORIGIN" in LEADER|WORKER|SYSTEM) :;; *) return 1;; esac
-  case "$DUET_MESSAGE_TERM" in ''|*[!0-9]*) return 1;; esac
-  if [ -n "$DUET_MESSAGE_HANDOFF_MODE" ] || [ -n "$DUET_MESSAGE_PRIOR_TERM" ] \
-      || [ -n "$DUET_MESSAGE_PRIOR_LEADER" ]; then
-    [ "$DUET_MESSAGE_HANDOFF_MODE" = MANUAL ] \
+  _duet_message_decimal_valid "$DUET_MESSAGE_TERM" || return 1
+  if [ "$handoff_field_count" -ne 0 ]; then
+    [ "$handoff_field_count" -eq 3 ] \
+      && [ "$DUET_MESSAGE_HANDOFF_MODE" = MANUAL ] \
       && [ "$DUET_MESSAGE_SENDER" = duet-system ] \
       && [ "$DUET_MESSAGE_ORIGIN" = SYSTEM ] \
       && [ "$DUET_MESSAGE_LEADER_AT_SEND" = "$DUET_MESSAGE_RECIPIENT" ] \
       && [ "$DUET_MESSAGE_DEDUPE" = "promotion-$DUET_MESSAGE_TERM" ] \
       || return 1
-    case "$DUET_MESSAGE_PRIOR_TERM" in ''|*[!0-9]*) return 1;; esac
+    _duet_message_decimal_valid "$DUET_MESSAGE_PRIOR_TERM" || return 1
     case "$DUET_MESSAGE_PRIOR_LEADER" in ''|*[!A-Za-z0-9_-]*) return 1;; esac
     [ "$DUET_MESSAGE_PRIOR_LEADER" != "$DUET_MESSAGE_RECIPIENT" ] || return 1
+    [ "$DUET_MESSAGE_PRIOR_TERM" != 9999999999 ] || return 1
     handoff_expected_term=$((10#$DUET_MESSAGE_PRIOR_TERM + 1))
     [ "$DUET_MESSAGE_TERM" = "$handoff_expected_term" ] || return 1
   fi

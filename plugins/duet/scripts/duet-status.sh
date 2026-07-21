@@ -172,6 +172,10 @@ duet_diag_print_summary(){
 
 duet_diag_print_roster(){
   local name harness pane recorded_pid rank spawned role state ready depth
+  if ! duet_validate_roster "$DUET_DIR/roster.tsv"; then
+    printf '\nroster state  : INVALID; member liveness is UNKNOWN.\n'
+    return 1
+  fi
   printf '\n%-12s %-8s %4s %-8s %-6s %-8s %-12s %-5s %5s\n' \
     NAME HARNESS RANK ROLE PANE PID STATE READY INBOX
   while IFS=$'\t' read -r name harness pane recorded_pid rank spawned; do
@@ -190,6 +194,10 @@ duet_diag_print_roster(){
 
 duet_diag_print_handoff_guidance(){
   local entry leader_pane leader_pid name harness pane pane_pid rank spawned found=""
+  if ! duet_validate_roster "$DUET_DIR/roster.tsv"; then
+    printf '\nleader state  : UNKNOWN (session roster is invalid); no handoff target is recommended.\n'
+    return
+  fi
   entry="$(awk -F '\t' -v name="$DUET_CURRENT_LEADER" \
     'NR > 1 && $1 == name { print $3 "|" $4; exit }' "$DUET_DIR/roster.tsv")"
   if [ -z "$entry" ]; then
@@ -236,6 +244,10 @@ duet_status_main(){
   done
 
   duet_diag_load_session "$session_arg" 1 || return 1
+  duet_validate_roster "$DUET_DIR/roster.tsv" || {
+    echo "duet: session roster is invalid: $DUET_DIR/roster.tsv" >&2
+    return 1
+  }
   duet_read_leader_state || return 1
   duet_diag_print_summary
   duet_diag_print_roster

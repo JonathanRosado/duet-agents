@@ -55,6 +55,10 @@ unset DUET_SESSION DUET_SESSION_ID DUET_INITIATOR DUET_INITIATOR_PANE DUET_WORKD
 DUET_CONFIG="$cfg"
 duet_validate_loaded_session "$caller_session_pin" "$cfg" || exit 7
 [ ! -f "$DUET_DIR/.ended" ] || { echo "duet: session has ended; refusing handoff." >&2; exit 1; }
+[ -f "$DUET_DIR/roster.tsv" ] \
+  || { echo "duet: session roster is missing; refusing handoff." >&2; exit 1; }
+duet_validate_roster "$DUET_DIR/roster.tsv" \
+  || { echo "duet: session roster is invalid; refusing handoff." >&2; exit 1; }
 duet_daemon_alive || { echo "duet: delivery daemon is not alive; refusing handoff." >&2; exit 6; }
 duet_read_leader_state || exit 1
 
@@ -104,6 +108,10 @@ duet_daemon_alive || {
   exit 6
 }
 duet_read_leader_state || exit 1
+duet_validate_roster "$DUET_DIR/roster.tsv" || {
+  echo "duet: session roster became invalid while the handoff waited; refusing mutation." >&2
+  exit 1
+}
 expected_term="$DUET_CURRENT_TERM"
 expected_leader="$DUET_CURRENT_LEADER"
 if duet_promote_locked "$expected_term" "$expected_leader" \

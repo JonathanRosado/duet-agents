@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 - 2026-07-21
+
+- Validated the explicit-handoff protocol end to end on macOS with real
+  Claude, Codex, and Kimi TUIs.
+- Hardened the Bash/tmux path against ambiguous rosters, malformed or
+  NUL-tainted envelopes, and unbounded persisted numeric state.
+- Made invalid session state fail closed before routing, delivery, handoff, or
+  teardown mutations.
+- Fixed CRLF spawned-pane cleanup and propagated pane-reaping failures.
+
 ## 0.3.0 - 2026-07-21
 
 - Replaced automatic leader election with explicit operator handoff to a named

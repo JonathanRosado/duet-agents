@@ -1319,7 +1319,7 @@ test_status_and_doctor_healthy_fixture(){
     "status reports healthy leadership"
   assert_contains "$status_output" 'daemon        : alive pid=' \
     "status reports live daemon"
-  assert_contains "$status_output" 'mode          : manual handoff only' \
+  assert_contains "$status_output" '(manual handoff only)' \
     "status reports operator-controlled leadership"
 
   doctor_output="$TEST_ROOT/doctor-healthy.out"
@@ -1457,6 +1457,262 @@ test_leader_name_path_fence(){
   assert_eq 1 "$rc" "leadership state rejects path-like leader name"
 }
 
+test_strict_roster_validator_matrix(){
+  local fixture="$TEST_ROOT/roster-validator.tsv"
+  local linked="$TEST_ROOT/roster-validator-link.tsv"
+  local header good expected actual label payload
+  header='name\tharness\tpane_id\tpane_pid\trank\tspawned\n'
+  good='claude\tclaude\t%1\t111\t0\t0\ncodex-1\tcodex\t%2\t222\t1\t1\n'
+
+  while IFS='|' read -r expected label payload; do
+    [ -n "$label" ] || continue
+    printf '%b' "$payload" > "$fixture"
+    if duet_validate_roster "$fixture"; then actual=valid; else actual=invalid; fi
+    assert_eq "$expected" "$actual" "roster validator $label"
+  done <<EOF
+valid|accepts canonical schema|${header}${good}
+valid|accepts CRLF framing|name\tharness\tpane_id\tpane_pid\trank\tspawned\r\nclaude\tclaude\t%1\t111\t0\t0\r\n
+valid|accepts exactly five members|${header}claude\tclaude\t%1\t111\t0\t0\ncodex-1\tcodex\t%2\t222\t1\t1\nkimi-1\tkimi\t%3\t333\t2\t1\ncodex-2\tcodex\t%4\t444\t3\t1\nkimi-2\tkimi\t%5\t555\t4\t1\n
+invalid|rejects a wrong header|name\tharness\tpane\tpane_pid\trank\tspawned\nclaude\tclaude\t%1\t111\t0\t0\n
+invalid|rejects a physical leading blank line|\n${header}${good}
+invalid|requires at least one member|${header}
+invalid|rejects a missing column|${header}claude\tclaude\t%1\t111\t0\n
+invalid|rejects an extra column|${header}claude\tclaude\t%1\t111\t0\t0\textra\n
+invalid|rejects an unsafe name|${header}bad/name\tclaude\t%1\t111\t0\t0\n
+invalid|rejects an unknown harness|${header}claude\tother\t%1\t111\t0\t0\n
+invalid|rejects an invalid pane id|${header}claude\tclaude\t1\t111\t0\t0\n
+invalid|rejects a zero pane pid|${header}claude\tclaude\t%1\t0\t0\t0\n
+invalid|rejects an oversized pane pid|${header}claude\tclaude\t%1\t2147483648\t0\t0\n
+invalid|rejects a negative rank|${header}claude\tclaude\t%1\t111\t-1\t0\n
+invalid|rejects an oversized rank|${header}claude\tclaude\t%1\t111\t2147483648\t0\n
+invalid|rejects an invalid spawned flag|${header}claude\tclaude\t%1\t111\t0\t2\n
+invalid|rejects a duplicate name|${header}${good}claude\tkimi\t%3\t333\t2\t1\n
+invalid|rejects a case-insensitive duplicate name|${header}${good}Claude\tkimi\t%3\t333\t2\t1\n
+invalid|rejects a duplicate pane|${header}${good}kimi-1\tkimi\t%2\t333\t2\t1\n
+invalid|rejects a duplicate pane pid|${header}${good}kimi-1\tkimi\t%3\t222\t2\t1\n
+invalid|rejects a duplicate rank|${header}${good}kimi-1\tkimi\t%3\t333\t1\t1\n
+invalid|rejects more than five members|${header}claude\tclaude\t%1\t111\t0\t0\ncodex-1\tcodex\t%2\t222\t1\t1\nkimi-1\tkimi\t%3\t333\t2\t1\ncodex-2\tcodex\t%4\t444\t3\t1\nkimi-2\tkimi\t%5\t555\t4\t1\nclaude-2\tclaude\t%6\t666\t5\t1\n
+EOF
+
+  printf '%b' "${header}${good}" > "$fixture"
+  ln -s "$fixture" "$linked"
+  if duet_validate_roster "$linked"; then actual=valid; else actual=invalid; fi
+  assert_eq invalid "$actual" "roster validator rejects a symlink capability"
+
+  printf '%b' "${header}${good}" > "$fixture"
+  printf '\000' >> "$fixture"
+  if duet_validate_roster "$fixture"; then actual=valid; else actual=invalid; fi
+  assert_eq invalid "$actual" "roster validator rejects a raw NUL byte"
+}
+
+test_invalid_roster_fails_closed_everywhere(){
+  local assignment intent leader_before promotions_before promotions_counter_before
+  local codex_before codex_counter_before output rc
+  create_state invalid-roster-fail-closed || return
+  : > "$FAKE_LOG"
+  FAKE_RC=0
+
+  stage_message codex-1 claude codex-1 0 LEADER claude \
+    'must not paste while roster identity is ambiguous' \
+    || { fail "could not stage invalid-roster assignment"; return; }
+  assignment="$STAGED_FILE"
+  stage_manual_handoff_intent codex-1 1 0 claude \
+    'must not reconcile while roster identity is ambiguous' \
+    || { fail "could not stage invalid-roster handoff intent"; return; }
+  intent="$STAGED_FILE"
+
+  # Duplicate the Codex pane capability under a second otherwise-valid row.
+  # Any first-match interpretation could misroute identity, liveness, teardown,
+  # or leadership, so every control-plane entry point must stop before action.
+  printf 'shadow\tkimi\t%s\t2147483000\t3\t1\n' "$A_CODEX_PANE" \
+    >> "$DUET_DIR/roster.tsv"
+  if duet_validate_roster "$DUET_DIR/roster.tsv"; then
+    fail "ambiguous roster unexpectedly validated"
+    return
+  fi
+
+  leader_before="$(cat "$DUET_DIR/leader")"
+  promotions_before="$(active_message_count "$DUET_DIR/inbox/promotions")"
+  promotions_counter_before="$(cat "$DUET_DIR/inbox/promotions/.counter" 2>/dev/null || true)"
+  codex_before="$(active_message_count "$DUET_DIR/inbox/codex-1")"
+  codex_counter_before="$(cat "$DUET_DIR/inbox/codex-1/.counter" 2>/dev/null || true)"
+
+  output="$TEST_ROOT/invalid-roster-status.out"
+  if env -u DUET_CONFIG -u DUET_SESSION -u TMUX -u TMUX_PANE -u DUET_SELF \
+      DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+      bash "$STATUS_SCRIPT" --session "$CURRENT_CONFIG" \
+      > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 1 "$rc" "status fails on an ambiguous roster"
+  assert_contains "$output" 'session roster is invalid' \
+    "status identifies roster uncertainty"
+  assert_not_contains "$output" 'leader unavailable: confirmed dead' \
+    "status never recasts roster uncertainty as DEAD"
+  assert_not_contains "$output" 'duet-promote.sh' \
+    "status recommends no handoff from ambiguous identity data"
+
+  output="$TEST_ROOT/invalid-roster-doctor.out"
+  if env -u DUET_CONFIG -u DUET_SESSION -u TMUX -u TMUX_PANE -u DUET_SELF \
+      DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+      bash "$DOCTOR_SCRIPT" --session "$CURRENT_CONFIG" \
+      > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 1 "$rc" "doctor reports an ambiguous roster as unhealthy"
+  assert_contains "$output" 'duplicate roster pane' \
+    "doctor identifies the duplicate pane capability"
+  assert_contains "$output" 'member liveness is UNKNOWN because the roster is invalid' \
+    "doctor keeps ambiguous roster liveness UNKNOWN"
+  assert_not_contains "$output" 'leader unavailable: confirmed dead' \
+    "doctor never recasts ambiguous roster identity as DEAD"
+  assert_not_contains "$output" 'duet-promote.sh' \
+    "doctor recommends no handoff from ambiguous identity data"
+
+  if duet_promote_locked 0 claude MANUAL kimi-1; then rc=0; else rc=$?; fi
+  assert_eq 1 "$rc" "direct handoff fails on an ambiguous roster"
+  assert_eq "$leader_before" "$(cat "$DUET_DIR/leader")" \
+    "invalid-roster handoff leaves leadership unchanged"
+  assert_eq "$promotions_before" \
+    "$(active_message_count "$DUET_DIR/inbox/promotions")" \
+    "invalid-roster handoff publishes no additional intent"
+  assert_eq "$promotions_counter_before" \
+    "$(cat "$DUET_DIR/inbox/promotions/.counter" 2>/dev/null || true)" \
+    "invalid-roster handoff does not advance the promotion counter"
+
+  if duet_deliverd_pass; then rc=0; else rc=$?; fi
+  assert_eq 1 "$rc" "daemon pass halts on an ambiguous roster"
+  assert_eq 0 "$(grep -cE '^(FULL|ENTER|CLEAR)' "$FAKE_LOG" 2>/dev/null || true)" \
+    "invalid-roster daemon pass issues no composer operation"
+  assert_eq "$leader_before" "$(cat "$DUET_DIR/leader")" \
+    "invalid-roster daemon pass performs no handoff reconciliation"
+  assert_file "$intent" "unreconciled handoff intent remains active"
+  assert_no_file "$intent.promotion_term" \
+    "invalid-roster daemon pass publishes no promotion metadata"
+  assert_file "$assignment" "undelivered assignment remains active"
+
+  output="$TEST_ROOT/invalid-roster-send.out"
+  if printf 'must not enqueue through ambiguous identity\n' | \
+      env TMUX="$TMUX_SOCKET_A,$TMUX_SERVER_PID_A,0" TMUX_PANE="$A_INIT_PANE" \
+      DUET_SELF=claude DUET_SESSION="$DUET_SESSION_ID" \
+      DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+      bash "$SEND_SCRIPT" codex-1 --session "$CURRENT_CONFIG" \
+      > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 1 "$rc" "send CLI fails on an ambiguous roster"
+  assert_contains "$output" 'session roster is invalid; refusing to enqueue' \
+    "send CLI reports fail-closed roster admission"
+  assert_eq "$codex_before" "$(active_message_count "$DUET_DIR/inbox/codex-1")" \
+    "invalid-roster send publishes no message"
+  assert_eq "$codex_counter_before" \
+    "$(cat "$DUET_DIR/inbox/codex-1/.counter" 2>/dev/null || true)" \
+    "invalid-roster send does not advance the recipient counter"
+
+  FAKE_RC=0
+}
+
+test_doctor_reap_crlf_spawned_rows(){
+  local codex_pane="$A_CODEX_PANE" kimi_pane="$A_KIMI_PANE"
+  local codex_pid="$A_CODEX_PID" kimi_pid="$A_KIMI_PID" name output rc
+
+  create_state doctor-reap-crlf || return
+  printf 'name\tharness\tpane_id\tpane_pid\trank\tspawned\r\n' \
+    > "$DUET_DIR/roster.tsv"
+  printf 'claude\tclaude\t%s\t%s\t0\t0\r\n' "$A_INIT_PANE" "$A_INIT_PID" \
+    >> "$DUET_DIR/roster.tsv"
+  printf 'codex-1\tcodex\t%s\t%s\t1\t1\r\n' "$codex_pane" "$codex_pid" \
+    >> "$DUET_DIR/roster.tsv"
+  printf 'kimi-1\tkimi\t%s\t%s\t2\t1\r\n' "$kimi_pane" "$kimi_pid" \
+    >> "$DUET_DIR/roster.tsv"
+  mkdir -p "$DUET_DIR/ready"
+  for name in claude codex-1 kimi-1; do
+    duet_atomic_write "$DUET_DIR/ready/$name" ready \
+      || fail "could not stage CRLF reap readiness for $name"
+  done
+  duet_atomic_write "$DUET_DIR/.ended" ended \
+    || { fail "could not end CRLF reap fixture"; return; }
+  rm -f "$DUET_STATE_ROOT/workdirs/$DUET_WORKDIR_KEY.active"
+
+  output="$TEST_ROOT/doctor-reap-crlf.out"
+  if env -u DUET_CONFIG -u DUET_SESSION -u TMUX -u TMUX_PANE -u DUET_SELF \
+      DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+      bash "$DOCTOR_SCRIPT" --session "$CURRENT_CONFIG" --reap \
+      > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 0 "$rc" "doctor reaps a healthy ended CRLF roster"
+  assert_contains "$output" "reap : codex-1 pane=$codex_pane pid=$codex_pid" \
+    "doctor recognizes CRLF Codex spawned flag"
+  assert_contains "$output" "reap : kimi-1 pane=$kimi_pane pid=$kimi_pid" \
+    "doctor recognizes CRLF Kimi spawned flag"
+  if command tmux -L "$TMUX_LABEL_A" list-panes -a -F '#{pane_id}' \
+      | grep -qxF "$codex_pane"; then
+    fail "doctor left the CRLF Codex spawned pane alive"
+  fi
+  if command tmux -L "$TMUX_LABEL_A" list-panes -a -F '#{pane_id}' \
+      | grep -qxF "$kimi_pane"; then
+    fail "doctor left the CRLF Kimi spawned pane alive"
+  fi
+}
+
+test_doctor_reap_propagates_kill_failure(){
+  local fixture="$STATE_ROOT/doctor-reap-kill-failure"
+  local result="$TEST_ROOT/doctor-reap-kill-failure.rc"
+  local log="$TEST_ROOT/doctor-reap-kill-failure.log"
+  local rc
+  mkdir -p "$fixture"
+  : > "$fixture/.ended"
+  {
+    printf 'name\tharness\tpane_id\tpane_pid\trank\tspawned\n'
+    printf 'claude\tclaude\t%%1\t111\t0\t0\n'
+    printf 'codex-1\tcodex\t%%2\t222\t1\t1\n'
+  } > "$fixture/roster.tsv"
+  : > "$log"
+
+  (
+    # Source the production doctor in isolation, then make the pane stay live
+    # while its final kill operation fails. A successful return would falsely
+    # report cleanup that never happened.
+    # shellcheck disable=SC1090
+    . "$DOCTOR_SCRIPT"
+    DUET_DIR="$fixture"
+    DUET_DOCTOR_ROSTER_VALID=1
+    DUET_TMUX_SOCKET=fixture
+    DUET_TMUX_SERVER_PID=123
+    duet_tmux_server_matches(){ return 0; }
+    duet_capture_caller_identity(){ return 1; }
+    duet_diag_pane_state(){
+      DUET_DIAG_LIVENESS=ALIVE
+      DUET_DIAG_ALIVE=yes
+    }
+    sleep(){ :; }
+    _duet_tmux(){
+      case "${1:-}" in
+        send-keys) return 0 ;;
+        kill-pane) printf 'KILL\t%s\n' "${*: -1}" >> "$log"; return 1 ;;
+        *) return 0 ;;
+      esac
+    }
+    if duet_doctor_reap_ended >/dev/null 2>&1; then rc=0; else rc=$?; fi
+    printf '%s\n' "$rc" > "$result"
+  )
+  rc="$(cat "$result" 2>/dev/null || true)"
+  case "$rc" in
+    ''|0) fail "doctor swallowed a live spawned pane kill failure" ;;
+  esac
+  assert_contains "$log" $'KILL\t%2' \
+    "doctor attempted the failed spawned-pane kill"
+}
+
 run_case 'Codex cursor-row collapsed composer' test_codex_collapsed_composer
 run_case 'Codex refused composer clear and stable-ID requeue' \
   test_refused_composer_clear_requeue
@@ -1494,6 +1750,14 @@ run_case 'explicit session and cross-session membership fence' \
 run_case 'handoff CLI accepts a surviving nonleader member' \
   test_handoff_cli_from_surviving_nonleader
 run_case 'leader name path fence' test_leader_name_path_fence
+run_case 'strict roster schema and uniqueness matrix' \
+  test_strict_roster_validator_matrix
+run_case 'invalid roster fails closed across status, handoff, daemon, and send' \
+  test_invalid_roster_fails_closed_everywhere
+run_case 'doctor reap parses CRLF spawned rows' \
+  test_doctor_reap_crlf_spawned_rows
+run_case 'doctor reap propagates a spawned-pane kill failure' \
+  test_doctor_reap_propagates_kill_failure
 
 if [ "$FAILURES" -eq 0 ]; then
   printf '==== ALL M3 MANUAL LEADERSHIP TESTS PASS ====\n'

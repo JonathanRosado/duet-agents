@@ -13,10 +13,15 @@ duet_deliverd_log(){
 }
 
 duet_message_sequence(){
-  local base
+  local base sequence
+  DUET_MESSAGE_SEQUENCE=""
   base="$(basename "${1:?message file required}")"
+  case "$base" in N-*.msg|I-*.msg) :;; *) return 1;; esac
   base="${base#?-}"
-  printf '%s' "${base%.msg}"
+  sequence="${base%.msg}"
+  case "$sequence" in ''|*[!0-9]*) return 1;; esac
+  duet_decimal_d10 "$sequence" 1 || return 2
+  printf -v DUET_MESSAGE_SEQUENCE '%010d' "$DUET_DECIMAL_VALUE"
 }
 
 duet_queue_next(){
@@ -29,7 +34,11 @@ duet_queue_next(){
     [ -f "$file" ] || continue
     phase="$(cat "$file.phase" 2>/dev/null || true)"
     case "$phase" in ENTER_ONLY|INFLIGHT|CLEAR_RETRY) : ;; *) continue ;; esac
-    sequence="$(duet_message_sequence "$file")"
+    if ! duet_message_sequence "$file"; then
+      DUET_NEXT_MESSAGE="$file"
+      return 0
+    fi
+    sequence="$DUET_MESSAGE_SEQUENCE"
     if [ -z "$best_sequence" ] || [[ "$sequence" < "$best_sequence" ]]; then
       DUET_NEXT_MESSAGE="$file"
       best_sequence="$sequence"
@@ -55,9 +64,22 @@ duet_queue_next(){
 }
 
 duet_retry_due(){
-  local file="${1:?message file required}" retry_at now
-  retry_at="$(cat "$file.retry_at" 2>/dev/null || true)"
-  case "$retry_at" in ''|*[!0-9]*) return 0;; esac
+  local file="${1:?message file required}" retry_file retry_at now
+  DUET_RETRY_INVALID=""
+  retry_file="$file.retry_at"
+  if [ ! -e "$retry_file" ] && [ ! -L "$retry_file" ]; then
+    return 0
+  fi
+  if ! duet_regular_file_without_nul "$retry_file"; then
+    DUET_RETRY_INVALID=1
+    return 0
+  fi
+  retry_at="$(cat "$retry_file" 2>/dev/null || true)"
+  if ! duet_decimal_d10 "$retry_at"; then
+    DUET_RETRY_INVALID=1
+    return 0
+  fi
+  retry_at="$DUET_DECIMAL_VALUE"
   now="$(date +%s)"
   [ "$now" -ge "$retry_at" ]
 }
@@ -159,11 +181,20 @@ duet_reconcile_terminal_moves(){
 
 duet_supersede_before(){
   local box="${1:?queue directory required}" winning_sequence="${2:?sequence required}"
-  local file sequence
+  local file sequence winning_value rc synthetic_winner
+  synthetic_winner="$box/I-$winning_sequence.msg"
+  duet_message_sequence "$synthetic_winner" || return 1
+  winning_value="$DUET_MESSAGE_SEQUENCE"
   for file in "$box"/N-*.msg "$box"/I-*.msg; do
     [ -f "$file" ] || continue
-    sequence="$(duet_message_sequence "$file")"
-    if [ $((10#$sequence)) -lt $((10#$winning_sequence)) ]; then
+    if duet_message_sequence "$file"; then
+      sequence="$DUET_MESSAGE_SEQUENCE"
+    else
+      rc=$?
+      [ "$rc" -eq 1 ] && continue
+      return 1
+    fi
+    if [ $((10#$sequence)) -lt $((10#$winning_value)) ]; then
       duet_deliverd_log "superseded $(basename "$file") by interrupt sequence $winning_sequence"
       duet_move_terminal "$file" superseded || return 1
     fi
@@ -173,7 +204,8 @@ duet_supersede_before(){
 duet_complete_interrupt_supersede(){
   local box="${1:?queue directory required}" terminal_file="${2:?terminal interrupt required}"
   local sequence
-  sequence="$(duet_message_sequence "$terminal_file")"
+  duet_message_sequence "$terminal_file" || return 1
+  sequence="$DUET_MESSAGE_SEQUENCE"
   duet_supersede_before "$box" "$sequence" || return 1
   duet_write_sidecar "$terminal_file" supersede_done "$sequence"
 }
@@ -284,6 +316,10 @@ duet_reconcile_promotion_intents(){
   [ -d "$box" ] || return 0
   for file in "$box"/N-*.msg; do
     [ -f "$file" ] || continue
+    if ! duet_message_sequence "$file"; then
+      duet_quarantine_reason "$file" invalid-message-filename || return 1
+      continue
+    fi
     raw_session="$(duet_raw_message_field "$file" session)"
     if [ -z "$raw_session" ]; then
       duet_quarantine_reason "$file" missing-session || return 1
@@ -341,7 +377,8 @@ duet_reconcile_promotion_fanout(){
     [ -f "$file" ] || continue
     [ ! -f "$file.fanout_done" ] || continue
     promotion_term="$(cat "$file.promotion_term" 2>/dev/null || true)"
-    case "$promotion_term" in ''|*[!0-9]*) continue;; esac
+    duet_decimal_d10 "$promotion_term" || continue
+    promotion_term="$DUET_DECIMAL_VALUE"
     reason="$(cat "$file.reason" 2>/dev/null || true)"
     case "$reason" in
       obsolete-promotion)
@@ -433,6 +470,9 @@ duet_process_one(){
   DUET_PROCESS_ATTEMPTED=""
   DUET_PROCESS_TARGET_PANE=""
   DUET_PROCESS_TARGET_NAME=""
+  # Pre-parse quarantine paths must not inherit envelope capabilities from the
+  # message processed immediately before this one.
+  DUET_MESSAGE_MODE=""
   if [ -n "$exact_file" ]; then
     [ -f "$exact_file" ] || return 0
     [ "$(dirname "$exact_file")" = "$box" ] || return 1
@@ -441,7 +481,19 @@ duet_process_one(){
     duet_queue_next "$box" || return 0
     file="$DUET_NEXT_MESSAGE"
   fi
-  duet_retry_due "$file" || return 0
+  if ! duet_message_sequence "$file"; then
+    duet_finish_quarantine "$box" "$file" invalid-message-filename
+    return
+  fi
+  if duet_retry_due "$file"; then
+    :
+  else
+    return 0
+  fi
+  if [ -n "${DUET_RETRY_INVALID:-}" ]; then
+    duet_finish_quarantine "$box" "$file" invalid-delivery-retry-time
+    return
+  fi
 
   queue="$(basename "$box")"
   if ! duet_validate_message_session "$file"; then
@@ -614,6 +666,25 @@ duet_process_one(){
     target_term="$bound_term"
   fi
 
+  # Persisted attempt counts are untrusted recovery state. Validate them before
+  # any composer operation; an invalid or exhausted counter cannot earn one
+  # additional delivery attempt.
+  attempts="$(cat "$file.tries" 2>/dev/null || true)"
+  if [ -z "$attempts" ]; then
+    attempts=0
+  elif ! duet_decimal_d10 "$attempts"; then
+    duet_finish_quarantine "$box" "$file" invalid-delivery-attempt-count
+    return
+  else
+    attempts="$DUET_DECIMAL_VALUE"
+  fi
+  if [ "$attempts" = 9999999999 ]; then
+    duet_finish_quarantine "$box" "$file" delivery-attempt-count-exhausted
+    return
+  fi
+  max="${DUET_DELIVERY_MAX_ATTEMPTS:-5}"
+  case "$max" in ''|*[!0-9]*) max=5;; esac
+
   target_harness="$(duet_roster_harness_for_name "$DUET_TARGET_NAME")"
   if [ -z "$DUET_TARGET_PANE" ] \
       || ! duet_roster_member_alive "$DUET_TARGET_NAME"; then
@@ -695,11 +766,6 @@ duet_process_one(){
     duet_finish_quarantine "$box" "$file" "enter-only-outcome-$rc"
     return
   fi
-
-  attempts="$(cat "$file.tries" 2>/dev/null || true)"
-  case "$attempts" in ''|*[!0-9]*) attempts=0;; esac
-  max="${DUET_DELIVERY_MAX_ATTEMPTS:-5}"
-  case "$max" in ''|*[!0-9]*) max=5;; esac
 
   # CLEAR_RETRY is a durable, pane-owning phase.  It is published before any
   # Escape/Ctrl-U recovery keys, so a crash either repeats only the idempotent
@@ -918,6 +984,10 @@ duet_collect_candidates(){
 
 duet_deliverd_pass(){
   local candidates seen priority order key box file
+  if ! duet_validate_roster "$DUET_DIR/roster.tsv"; then
+    duet_deliverd_log "roster validation failed; daemon halting"
+    return 1
+  fi
   duet_reconcile_terminal_moves || return 1
   duet_reconcile_promotion_intents || return 1
   duet_reconcile_interrupt_supersedes || return 1
@@ -994,6 +1064,10 @@ duet_deliverd_main(){
   DUET_CONFIG="$cfg"
   export DUET_CONFIG DUET_SESSION
   [ ! -f "$DUET_DIR/.ended" ] || return 0
+  duet_validate_roster "$DUET_DIR/roster.tsv" || {
+    echo "duet: session roster is invalid; daemon will not start." >&2
+    return 1
+  }
 
   env_server_pid="${DUET_TMUX_SERVER_PID:-}"
   actual_server_pid="$(_duet_tmux display-message -p '#{pid}' 2>/dev/null || true)"

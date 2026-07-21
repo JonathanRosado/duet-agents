@@ -29,6 +29,11 @@ unset DUET_SESSION DUET_SESSION_ID DUET_WORKDIR_KEY CODEX_PANE CODEX_PANE_PID
 # shellcheck disable=SC1090
 . "$cfg" 2>/dev/null || { echo "duet: could not load pinned session: $cfg" >&2; exit 1; }
 duet_validate_loaded_session "$caller_session" "$cfg" || exit 1
+if { [ -e "$DUET_DIR/roster.tsv" ] || [ -L "$DUET_DIR/roster.tsv" ]; } \
+    && ! duet_validate_roster "$DUET_DIR/roster.tsv"; then
+  echo "duet: session roster is invalid; refusing teardown before any lifecycle mutation." >&2
+  exit 9
+fi
 
 WORKDIR="$(cd "$WORKDIR" 2>/dev/null && pwd -P)" || {
   echo "duet: recorded workdir is unavailable; refusing teardown." >&2
@@ -158,8 +163,11 @@ else
   echo "duet: a replacement session owns $WORKDIR; preserved its anchors and active index." >&2
 fi
 if duet_tmux_server_matches; then
-  duet_kill_spawned_panes "$DUET_DIR/roster.tsv" "$current_pane" \
-    "${CODEX_PANE:-}" "${CODEX_PANE_PID:-}"
+  if ! duet_kill_spawned_panes "$DUET_DIR/roster.tsv" "$current_pane" \
+      "${CODEX_PANE:-}" "${CODEX_PANE_PID:-}"; then
+    echo "duet: invalid or ambiguous roster blocked recorded pane cleanup." >&2
+    exit 9
+  fi
 else
   echo "duet: tmux server identity changed; skipped recorded pane cleanup." >&2
 fi

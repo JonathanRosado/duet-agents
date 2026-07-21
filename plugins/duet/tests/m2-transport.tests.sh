@@ -656,6 +656,531 @@ test_malformed_body_rejected(){
   assert_eq 0 "$full_count" "malformed body never reaches pane verifier"
 }
 
+test_strict_message_parser(){
+  local parser_dir message body body64 invalid64 variant
+  create_state strict-parser
+  parser_dir="$DUET_DIR/parser-fixtures"
+  mkdir -p "$parser_dir"
+  message="$parser_dir/valid.msg"
+  body="$(printf 'h\303\251llo \342\230\203\nline two\tpunctuation !?')"
+  body64="$(printf '%s' "$body" | base64 | tr -d '\r\n')"
+  {
+    printf 'DUETv1\n'
+    printf 'id\tm-strict-codex-1-0000000001\n'
+    printf 'session\tstrict-parser\n'
+    printf 'order\t0000000001\n'
+    printf 'mode\tNORMAL\n'
+    printf 'sender\tclaude\n'
+    printf 'recipient\tcodex-1\n'
+    printf 'term\t0\n'
+    printf 'origin\tLEADER\n'
+    printf 'leader_at_send\tclaude\n'
+    printf 'dedupe\t\n'
+    printf 'body64\t%s\n' "$body64"
+  } > "$message"
+
+  if ! duet_read_message "$message"; then
+    fail "valid strict DUETv1 envelope was rejected"
+  else
+    assert_eq m-strict-codex-1-0000000001 "$DUET_MESSAGE_ID" \
+      "valid envelope ID"
+    assert_eq "$body" "$DUET_MESSAGE_BODY" \
+      "valid UTF-8 multiline body survives strict parsing"
+  fi
+
+  variant="$parser_dir/valid-crlf.msg"
+  LC_ALL=C awk '{ printf "%s\r\n", $0 }' "$message" > "$variant"
+  if ! duet_read_message "$variant"; then
+    fail "valid CRLF-framed DUETv1 envelope was rejected"
+  else
+    assert_eq "$body" "$DUET_MESSAGE_BODY" "CRLF framing preserves the body"
+  fi
+
+  variant="$parser_dir/valid-empty-body.msg"
+  LC_ALL=C awk -F '\t' 'BEGIN { OFS="\t" } $1 == "body64" { $2="" } { print }' \
+    "$message" > "$variant"
+  if ! duet_read_message "$variant"; then
+    fail "present empty body64 field was treated as missing"
+  else
+    assert_eq "" "$DUET_MESSAGE_BODY" "present empty body parses as empty"
+  fi
+
+  variant="$parser_dir/duplicate.msg"
+  LC_ALL=C awk 'NR == 3 { print "id\tm-conflicting-id" } { print }' \
+    "$message" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "duplicate known envelope field was accepted"
+  fi
+
+  variant="$parser_dir/unknown.msg"
+  LC_ALL=C awk 'NR == 3 { print "bogus\tvalue" } { print }' \
+    "$message" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "unknown envelope field was accepted"
+  fi
+
+  variant="$parser_dir/missing-required.msg"
+  LC_ALL=C awk -F '\t' '$1 != "dedupe" { print }' "$message" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "missing required dedupe field was accepted"
+  fi
+
+  variant="$parser_dir/control-metadata.msg"
+  LC_ALL=C awk -F '\t' '
+    $1 == "dedupe" { printf "dedupe\tsafe%cunsafe\n", 7; next }
+    { print }
+  ' "$message" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "ASCII control character in metadata was accepted"
+  fi
+
+  variant="$parser_dir/invalid-identity.msg"
+  LC_ALL=C awk -F '\t' 'BEGIN { OFS="\t" }
+    $1 == "recipient" { $2="../codex-1" }
+    { print }
+  ' "$message" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "path-like identity metadata was accepted"
+  fi
+
+  variant="$parser_dir/oversized-order.msg"
+  LC_ALL=C awk -F '\t' 'BEGIN { OFS="\t" }
+    $1 == "order" { $2="10000000000" }
+    { print }
+  ' "$message" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "oversized message order was accepted"
+  fi
+
+  variant="$parser_dir/noncanonical-term.msg"
+  LC_ALL=C awk -F '\t' 'BEGIN { OFS="\t" }
+    $1 == "term" { $2="01" }
+    { print }
+  ' "$message" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "noncanonical message term was accepted"
+  fi
+
+  variant="$parser_dir/partial-manual-fields.msg"
+  LC_ALL=C awk -F '\t' '$1 == "body64" { print "handoff_mode\t" } { print }' \
+    "$message" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "present-but-empty partial manual handoff metadata was accepted"
+  fi
+
+  invalid64="$(printf '\377\376\377' | base64 | tr -d '\r\n')"
+  variant="$parser_dir/invalid-utf8.msg"
+  LC_ALL=C awk -F '\t' -v invalid64="$invalid64" 'BEGIN { OFS="\t" }
+    $1 == "body64" { $2=invalid64 }
+    { print }
+  ' "$message" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "invalid UTF-8 body bytes were accepted"
+  fi
+}
+
+test_nul_payload_and_state_fences(){
+  local box source variant staged nul_body64 seed seed_id replacement
+  create_state nul-payload-state-fences
+  box="$DUET_DIR/inbox/codex-1"
+  mkdir -p "$DUET_DIR/nul-fixtures"
+
+  unit_enqueue codex-1 NORMAL valid-source-envelope
+  source="$UNIT_FILE"
+
+  variant="$DUET_DIR/nul-fixtures/raw-metadata-nul.msg"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      dedupe$'\t'*) printf 'dedupe\tsafe\000hidden\n' ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$source" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "raw NUL byte in envelope metadata was accepted"
+  fi
+
+  nul_body64="$(printf 'A\000B' | base64 | tr -d '\r\n')"
+  variant="$DUET_DIR/nul-fixtures/decoded-body-nul.msg"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      body64$'\t'*) printf 'body64\t%s\n' "$nul_body64" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$source" > "$variant"
+  if duet_read_message "$variant"; then
+    fail "decoded body64 containing A-NUL-B was accepted"
+  fi
+
+  printf 'term\t0\nleader\tclaude\000shadow\n' > "$DUET_DIR/leader"
+  if duet_read_leader_state > /dev/null 2>&1; then
+    fail "NUL-tainted leader state was accepted"
+  fi
+  printf 'term\t0\nleader\tclaude\n' > "$DUET_DIR/leader"
+
+  if ! duet_enqueue_message codex-1 claude codex-1 0 NORMAL LEADER claude \
+      nul-dedupe-seed nul-dedupe-key; then
+    fail "could not create NUL-dedupe seed message"
+    return
+  fi
+  seed="$DUET_ENQUEUED_FILE"
+  seed_id="$DUET_ENQUEUED_ID"
+  staged="$box/.nul-dedupe.test"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      dedupe$'\t'nul-dedupe-key) printf 'dedupe\tnul-dedupe-key\000\n' ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$seed" > "$staged"
+  mv "$staged" "$seed"
+  if duet_find_dedupe_message "$box" nul-dedupe-key; then
+    fail "NUL-tainted envelope was trusted as a dedupe capability"
+  fi
+  if ! duet_enqueue_message codex-1 claude codex-1 0 NORMAL LEADER claude \
+      replacement-after-nul-dedupe nul-dedupe-key; then
+    fail "NUL-tainted dedupe record blocked a replacement enqueue"
+    return
+  fi
+  replacement="$DUET_ENQUEUED_FILE"
+  [ "$DUET_ENQUEUED_ID" != "$seed_id" ] \
+    || fail "replacement enqueue reused the NUL-tainted message ID"
+  [ "$replacement" != "$seed" ] \
+    || fail "replacement enqueue resolved to the NUL-tainted message"
+  if ! duet_read_message "$replacement"; then
+    fail "replacement after NUL-tainted dedupe is not a valid envelope"
+  else
+    assert_eq nul-dedupe-key "$DUET_MESSAGE_DEDUPE" \
+      "replacement publishes the requested clean dedupe key"
+  fi
+}
+
+test_retry_at_numeric_fences(){
+  local box message terminal marker
+
+  create_state oversized-retry-at
+  FAKE_LOG="$DUET_DIR/fake.log"
+  : > "$FAKE_LOG"
+  FAKE_CODEX_RC=0
+  FAKE_INTERRUPT_RC=0
+  FAKE_ENTER_RC=0
+  box="$DUET_DIR/inbox/codex-1"
+  unit_enqueue codex-1 NORMAL oversized-retry-at-message
+  message="$UNIT_FILE"
+  printf '10000000000\n' > "$message.retry_at"
+  DUET_MESSAGE_MODE=INTERRUPT
+  duet_process_one "$box" "$message" \
+    || fail "oversized retry timestamp processing failed"
+  terminal="$box/quarantine/$(basename "$message")"
+  assert_file "$terminal" \
+    "oversized retry timestamp is terminalized instead of head-blocking"
+  assert_eq invalid-delivery-retry-time \
+    "$(cat "$terminal.reason" 2>/dev/null || true)" \
+    "oversized retry timestamp quarantine reason"
+  assert_eq 0 \
+    "$(awk -F '\t' '$1 == "FULL" { n++ } END { print n + 0 }' "$FAKE_LOG")" \
+    "oversized retry timestamp is rejected before a pane operation"
+  assert_no_file "$terminal.supersede_done" \
+    "pre-parse quarantine cannot inherit stale interrupt authority"
+
+  create_state invalid-retry-at
+  FAKE_LOG="$DUET_DIR/fake.log"
+  : > "$FAKE_LOG"
+  FAKE_CODEX_RC=0
+  box="$DUET_DIR/inbox/codex-1"
+  marker="$DUET_DIR/RETRY-AT-PWNED"
+  unit_enqueue codex-1 NORMAL hostile-retry-at-message
+  message="$UNIT_FILE"
+  printf '%s\n' '$(touch RETRY-AT-PWNED)' > "$message.retry_at"
+  (cd "$DUET_DIR" && duet_process_one "$box" "$message") \
+    || fail "hostile retry timestamp processing failed"
+  terminal="$box/quarantine/$(basename "$message")"
+  assert_file "$terminal" \
+    "invalid retry timestamp is terminalized instead of head-blocking"
+  assert_eq invalid-delivery-retry-time \
+    "$(cat "$terminal.reason" 2>/dev/null || true)" \
+    "invalid retry timestamp quarantine reason"
+  assert_eq 0 \
+    "$(awk -F '\t' '$1 == "FULL" { n++ } END { print n + 0 }' "$FAKE_LOG")" \
+    "invalid retry timestamp is rejected before a pane operation"
+  assert_no_file "$marker" \
+    "retry timestamp text is never evaluated as arithmetic or shell code"
+}
+
+test_decimal_d10_bounds(){
+  local value
+
+  for value in 0 1 42 9999999999; do
+    if ! duet_decimal_d10 "$value"; then
+      fail "canonical D10 value $value was rejected"
+      continue
+    fi
+    assert_eq "$value" "$DUET_DECIMAL_VALUE" \
+      "canonical D10 value $value is preserved"
+  done
+
+  if ! duet_decimal_d10 0000000000 1; then
+    fail "zero-padded D10 zero was rejected"
+  else
+    assert_eq 0 "$DUET_DECIMAL_VALUE" "zero-padded D10 zero normalization"
+  fi
+  if ! duet_decimal_d10 0000000042 1; then
+    fail "zero-padded D10 value was rejected"
+  else
+    assert_eq 42 "$DUET_DECIMAL_VALUE" "zero-padded D10 value normalization"
+  fi
+  if ! duet_decimal_d10 9999999999 1; then
+    fail "maximum zero-padding-enabled D10 value was rejected"
+  else
+    assert_eq 9999999999 "$DUET_DECIMAL_VALUE" \
+      "maximum zero-padding-enabled D10 value"
+  fi
+
+  for value in '' 00 01 -1 +1 1x 10000000000 '$(touch D10-PWNED)'; do
+    if duet_decimal_d10 "$value"; then
+      fail "invalid canonical D10 value '$value' was accepted"
+    fi
+    assert_eq '' "$DUET_DECIMAL_VALUE" \
+      "failed D10 parse clears output for '$value'"
+  done
+  if duet_decimal_d10 10000000000 1; then
+    fail "oversized zero-padding-enabled D10 value was accepted"
+  fi
+  assert_eq '' "$DUET_DECIMAL_VALUE" \
+    "oversized padding-enabled D10 parse clears output"
+}
+
+test_persistent_numeric_bounds(){
+  local box output rc
+  create_state persistent-numeric-bounds
+  box="$DUET_DIR/inbox/codex-1"
+  output="$DUET_DIR/numeric.err"
+
+  printf '9999999998\n' > "$box/.counter"
+  if ! duet_next_sequence "$box"; then
+    fail "queue counter could not allocate the maximum D10 sequence"
+  else
+    assert_eq 9999999999 "$DUET_SEQUENCE" "maximum queue sequence allocation"
+    assert_eq 9999999999 "$(cat "$box/.counter")" \
+      "maximum queue counter publication"
+  fi
+  if duet_next_sequence "$box" > /dev/null 2> "$output"; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "exhausted queue counter allocated past the D10 cap"
+  assert_contains "$output" 'sequence exhausted (D10 cap)' \
+    "queue sequence exhaustion diagnostic"
+  assert_eq 9999999999 "$(cat "$box/.counter")" \
+    "exhausted queue counter remains unchanged"
+
+  printf '10000000000\n' > "$box/.counter"
+  if duet_next_sequence "$box" > /dev/null 2> "$output"; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "oversized queue counter was accepted"
+  assert_eq 10000000000 "$(cat "$box/.counter")" \
+    "oversized queue counter is not rewritten"
+  printf '0000000001\n' > "$box/.counter"
+  if duet_next_sequence "$box" > /dev/null 2> "$output"; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "noncanonical queue counter was accepted"
+  assert_eq 0000000001 "$(cat "$box/.counter")" \
+    "noncanonical queue counter is not rewritten"
+
+  printf '9999999998\n' > "$DUET_DIR/.message-order"
+  if ! duet_next_message_order; then
+    fail "global order could not allocate the maximum D10 value"
+  else
+    assert_eq 9999999999 "$DUET_MESSAGE_ORDER_ALLOC" \
+      "maximum global message-order allocation"
+    assert_eq 9999999999 "$(cat "$DUET_DIR/.message-order")" \
+      "maximum global message-order publication"
+  fi
+  if duet_next_message_order > /dev/null 2> "$output"; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "global message order allocated past the D10 cap"
+  assert_contains "$output" 'message-order exhausted (D10 cap)' \
+    "global message-order exhaustion diagnostic"
+  assert_eq 9999999999 "$(cat "$DUET_DIR/.message-order")" \
+    "exhausted global message order remains unchanged"
+
+  printf '10000000000\n' > "$DUET_DIR/.message-order"
+  if duet_next_message_order > /dev/null 2> "$output"; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "oversized global message order was accepted"
+  assert_eq 10000000000 "$(cat "$DUET_DIR/.message-order")" \
+    "oversized global message order is not rewritten"
+  printf '0000000001\n' > "$DUET_DIR/.message-order"
+  if duet_next_message_order > /dev/null 2> "$output"; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "noncanonical global message order was accepted"
+  assert_eq 0000000001 "$(cat "$DUET_DIR/.message-order")" \
+    "noncanonical global message order is not rewritten"
+}
+
+test_term_numeric_bounds(){
+  local box max_message before_counter before_order before_transcript output rc
+  create_state term-numeric-bounds
+  box="$DUET_DIR/inbox/codex-1"
+  output="$DUET_DIR/term.err"
+
+  if ! duet_write_leader_state 9999999999 claude; then
+    fail "maximum D10 leader term could not be written"
+  elif ! duet_read_leader_state; then
+    fail "maximum D10 leader term could not be read"
+  else
+    assert_eq 9999999999 "$DUET_CURRENT_TERM" "maximum leader term round trip"
+  fi
+  if duet_promote_locked 9999999999 claude MANUAL codex-1; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "handoff advanced beyond the maximum D10 generation"
+  assert_contains "$DUET_DIR/leader" $'term\t9999999999' \
+    "exhausted handoff leaves the maximum leader generation unchanged"
+  assert_no_file "$DUET_DIR/inbox/promotions/.counter" \
+    "exhausted handoff publishes no promotion intent"
+  if duet_write_leader_state 10000000000 claude; then
+    fail "oversized leader term was written"
+  fi
+  if duet_write_leader_state 0000000001 claude; then
+    fail "noncanonical leader term was written"
+  fi
+  assert_contains "$DUET_DIR/leader" $'term\t9999999999' \
+    "invalid leader writes preserve the prior state"
+
+  printf 'term\t10000000000\nleader\tclaude\n' > "$DUET_DIR/leader"
+  if duet_read_leader_state > /dev/null 2> "$output"; then
+    fail "oversized persisted leader term was accepted"
+  fi
+  printf 'term\t0000000001\nleader\tclaude\n' > "$DUET_DIR/leader"
+  if duet_read_leader_state > /dev/null 2> "$output"; then
+    fail "noncanonical persisted leader term was accepted"
+  fi
+  printf 'term\t0\nleader\tclaude\n' > "$DUET_DIR/leader"
+
+  if ! duet_enqueue_message codex-1 claude codex-1 9999999999 \
+      NORMAL LEADER claude maximum-term-message; then
+    fail "ordinary envelope rejected maximum D10 term"
+    return
+  fi
+  max_message="$DUET_ENQUEUED_FILE"
+  assert_contains "$max_message" $'term\t9999999999' \
+    "maximum envelope term publication"
+  if ! duet_read_message "$max_message"; then
+    fail "maximum D10 term envelope could not be parsed"
+  else
+    assert_eq 9999999999 "$DUET_MESSAGE_TERM" "maximum parsed envelope term"
+  fi
+  before_counter="$(cat "$box/.counter")"
+  before_order="$(cat "$DUET_DIR/.message-order")"
+  before_transcript="$(transcript_count "$DUET_DIR/transcript.md")"
+
+  if duet_enqueue_message codex-1 claude codex-1 10000000000 \
+      NORMAL LEADER claude oversized-term > /dev/null 2> "$output"; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "oversized envelope term was accepted"
+  if duet_enqueue_message codex-1 claude codex-1 0000000001 \
+      NORMAL LEADER claude noncanonical-term > /dev/null 2> "$output"; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "noncanonical envelope term was accepted"
+  assert_eq "$before_counter" "$(cat "$box/.counter")" \
+    "invalid envelope terms do not advance queue counter"
+  assert_eq "$before_order" "$(cat "$DUET_DIR/.message-order")" \
+    "invalid envelope terms do not advance global order"
+  assert_eq "$before_transcript" "$(transcript_count "$DUET_DIR/transcript.md")" \
+    "invalid envelope terms do not append transcript"
+}
+
+test_message_filename_numeric_fences(){
+  local box valid malicious oversized marker rc
+  create_state message-filename-numeric-fences
+  box="$DUET_DIR/inbox/codex-1"
+  marker="$DUET_DIR/FILENAME-PWNED"
+
+  unit_enqueue codex-1 NORMAL valid-older-message
+  valid="$UNIT_FILE"
+  malicious="$box/N-\$(touch FILENAME-PWNED).msg"
+  printf 'hostile filename fixture\n' > "$malicious"
+  if ! (cd "$DUET_DIR" && duet_supersede_before "$box" 0000000002); then
+    fail "interrupt supersede rejected a nonnumeric filename instead of ignoring it"
+  fi
+  assert_no_file "$marker" "literal command substitution in filename is inert"
+  assert_file "$box/superseded/$(basename "$valid")" \
+    "valid lower sequence is superseded beside hostile filename"
+  assert_file "$malicious" "hostile nonnumeric filename remains for quarantine"
+
+  oversized="$box/N-10000000000.msg"
+  printf 'oversized filename fixture\n' > "$oversized"
+  if duet_message_sequence "$oversized"; then rc=0; else rc=$?; fi
+  assert_eq 2 "$rc" "oversized numeric filename has a fail-closed result"
+  if duet_supersede_before "$box" 0000000002 > /dev/null 2>&1; then
+    fail "interrupt supersede accepted an oversized numeric sequence"
+  fi
+  assert_no_file "$marker" "supersede scan never evaluates hostile filename text"
+
+  DUET_MESSAGE_MODE=NORMAL
+  duet_process_one "$box" "$oversized" \
+    || fail "oversized numeric filename quarantine failed"
+  assert_file "$box/quarantine/$(basename "$oversized")" \
+    "oversized numeric filename is quarantined"
+  assert_eq invalid-message-filename \
+    "$(cat "$box/quarantine/$(basename "$oversized").reason" 2>/dev/null || true)" \
+    "oversized numeric filename quarantine reason"
+
+  DUET_MESSAGE_MODE=NORMAL
+  duet_process_one "$box" "$malicious" \
+    || fail "hostile nonnumeric filename quarantine failed"
+  assert_file "$box/quarantine/$(basename "$malicious")" \
+    "hostile nonnumeric filename is quarantined"
+  assert_no_file "$marker" "hostile filename remains inert during quarantine"
+}
+
+test_delivery_attempt_numeric_fences(){
+  local box message terminal marker
+
+  create_state invalid-delivery-attempt-count
+  FAKE_LOG="$DUET_DIR/fake.log"
+  : > "$FAKE_LOG"
+  FAKE_CODEX_RC=$DUET_SEND_NOT_LANDED
+  FAKE_INTERRUPT_RC=0
+  FAKE_ENTER_RC=0
+  box="$DUET_DIR/inbox/codex-1"
+  unit_enqueue codex-1 NORMAL invalid-attempt-sidecar
+  message="$UNIT_FILE"
+  printf '0001\n' > "$message.tries"
+  duet_process_one "$box" "$message" || fail "invalid attempt-count quarantine failed"
+  terminal="$box/quarantine/$(basename "$message")"
+  assert_file "$terminal" "noncanonical attempt count is quarantined"
+  assert_eq invalid-delivery-attempt-count \
+    "$(cat "$terminal.reason" 2>/dev/null || true)" \
+    "noncanonical attempt-count quarantine reason"
+  assert_eq 0 "$(grep -cE '^(FULL|ENTER)' "$FAKE_LOG" 2>/dev/null || true)" \
+    "invalid attempt count is rejected before any composer operation"
+
+  create_state oversized-delivery-attempt-count
+  FAKE_LOG="$DUET_DIR/fake.log"
+  : > "$FAKE_LOG"
+  FAKE_CODEX_RC=$DUET_SEND_NOT_LANDED
+  box="$DUET_DIR/inbox/codex-1"
+  marker="$DUET_DIR/TRIES-PWNED"
+  unit_enqueue codex-1 NORMAL oversized-attempt-sidecar
+  message="$UNIT_FILE"
+  printf '%s\n' '$(touch TRIES-PWNED)' > "$message.tries"
+  (cd "$DUET_DIR" && duet_process_one "$box" "$message") \
+    || fail "hostile attempt-count quarantine failed"
+  terminal="$box/quarantine/$(basename "$message")"
+  assert_file "$terminal" "hostile attempt count is quarantined"
+  assert_eq invalid-delivery-attempt-count \
+    "$(cat "$terminal.reason" 2>/dev/null || true)" \
+    "hostile attempt-count quarantine reason"
+  assert_no_file "$marker" "attempt-count text is never evaluated as arithmetic"
+  assert_eq 0 "$(grep -cE '^(FULL|ENTER)' "$FAKE_LOG" 2>/dev/null || true)" \
+    "hostile attempt count is rejected before any composer operation"
+
+  create_state maximum-delivery-attempt-count
+  FAKE_LOG="$DUET_DIR/fake.log"
+  : > "$FAKE_LOG"
+  FAKE_CODEX_RC=$DUET_SEND_NOT_LANDED
+  box="$DUET_DIR/inbox/codex-1"
+  unit_enqueue codex-1 NORMAL maximum-attempt-sidecar
+  message="$UNIT_FILE"
+  printf '9999999999\n' > "$message.tries"
+  duet_process_one "$box" "$message" || fail "maximum attempt-count quarantine failed"
+  terminal="$box/quarantine/$(basename "$message")"
+  assert_file "$terminal" "maximum attempt count is quarantined"
+  assert_eq delivery-attempt-count-exhausted \
+    "$(cat "$terminal.reason" 2>/dev/null || true)" \
+    "maximum attempt-count quarantine reason"
+  assert_eq 0 "$(grep -cE '^(FULL|ENTER)' "$FAKE_LOG" 2>/dev/null || true)" \
+    "exhausted attempt count is rejected before any composer operation"
+}
+
 test_terminal_counter_rollback_rejected(){
   local box first terminal before_transcript output rc
   create_state counter-rollback
@@ -1371,6 +1896,19 @@ run_case 'interrupt priority and supersede' test_interrupt_supersede
 run_case 'terminal interrupt restart reconciliation' test_interrupt_restart_reconcile
 run_case 'failure notice root and terminal dedupe' test_failure_notice_dedupe
 run_case 'malformed body64 rejection' test_malformed_body_rejected
+run_case 'strict DUETv1 envelope parser parity' test_strict_message_parser
+run_case 'NUL payload, leader-state, and dedupe fences' \
+  test_nul_payload_and_state_fences
+run_case 'retry timestamp numeric and arithmetic fences' \
+  test_retry_at_numeric_fences
+run_case 'D10 decimal parsing and normalization' test_decimal_d10_bounds
+run_case 'persistent counter and message-order D10 bounds' \
+  test_persistent_numeric_bounds
+run_case 'leader and envelope term D10 bounds' test_term_numeric_bounds
+run_case 'message filename numeric and arithmetic fences' \
+  test_message_filename_numeric_fences
+run_case 'delivery-attempt numeric and arithmetic fences' \
+  test_delivery_attempt_numeric_fences
 run_case 'terminal counter rollback rejection' test_terminal_counter_rollback_rejected
 run_case 'uncertain landing DEAD fencing' test_uncertain_dead_fencing
 run_case 'daemon stop owner mismatch fence' test_daemon_stop_owner_mismatch

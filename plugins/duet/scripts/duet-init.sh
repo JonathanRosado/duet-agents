@@ -362,6 +362,10 @@ if ! duet_publish_temp_file "$roster_tmp" "$DUET_DIR/roster.tsv"; then
   echo "duet: could not publish the session roster." >&2
   exit 7
 fi
+if ! duet_validate_roster "$DUET_DIR/roster.tsv"; then
+  echo "duet: generated session roster failed validation." >&2
+  exit 7
+fi
 
 env_tmp="$(mktemp "$DUET_DIR/.env.XXXXXX")"
 {

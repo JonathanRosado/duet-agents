@@ -52,6 +52,8 @@ DUET_CONFIG="$cfg"
 duet_validate_loaded_session "$caller_session_pin" "$cfg" || exit 7
 [ ! -f "$DUET_DIR/.ended" ] || { echo "duet: session has ended; refusing to enqueue." >&2; exit 1; }
 [ -f "$DUET_DIR/roster.tsv" ] || { echo "duet: session roster is missing." >&2; exit 1; }
+duet_validate_roster "$DUET_DIR/roster.tsv" \
+  || { echo "duet: session roster is invalid; refusing to enqueue." >&2; exit 1; }
 duet_read_leader_state
 duet_daemon_alive || { echo "duet: delivery daemon is not alive; message was not queued." >&2; exit 6; }
 

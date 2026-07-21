@@ -14,6 +14,7 @@ duet_doctor_usage(){
 }
 
 DUET_DOCTOR_ISSUES=0
+DUET_DOCTOR_ROSTER_VALID=""
 duet_doctor_issue(){
   DUET_DOCTOR_ISSUES=$((DUET_DOCTOR_ISSUES + 1))
   printf 'ISSUE: %s\n' "$*"
@@ -23,38 +24,124 @@ duet_doctor_ok(){
   printf 'ok   : %s\n' "$*"
 }
 
+duet_doctor_roster_diagnostics(){
+  LC_ALL=C awk '
+    function issue(message) { print message }
+    function int32(value, positive, normalized) {
+      if (value !~ /^[0-9]+$/) return 0
+      normalized=value
+      sub(/^0+/, "", normalized)
+      if (normalized == "") normalized="0"
+      if (positive && normalized == "0") return 0
+      if (length(normalized) > 10 \
+          || (length(normalized) == 10 \
+              && ("x" normalized) > "x2147483647")) return 0
+      return 1
+    }
+    BEGIN {
+      expected="name\tharness\tpane_id\tpane_pid\trank\tspawned"
+      cr=sprintf("%c", 13)
+    }
+    {
+      line=$0
+      if (substr(line, length(line), 1) == cr) {
+        line=substr(line, 1, length(line) - 1)
+      }
+      if (line == "") next
+      logical++
+      if (logical == 1) {
+        header_ok=(line == expected)
+        if (!header_ok) issue("invalid roster header")
+        next
+      }
+      if (!header_ok) next
+      rows++
+      count=split(line, column, "\t")
+      if (count != 6) {
+        issue("roster row " NR " does not have exactly six fields")
+        next
+      }
+      name=column[1]
+      harness=column[2]
+      pane=column[3]
+      pane_pid=column[4]
+      rank=column[5]
+      spawned=column[6]
+      if (name !~ /^[A-Za-z0-9_-]+$/) {
+        issue("roster row " NR " has an invalid name")
+      }
+      if (harness != "claude" && harness != "codex" && harness != "kimi") {
+        issue("member \047" name "\047 has unsupported harness \047" harness "\047")
+      }
+      if (pane !~ /^%[0-9]+$/) {
+        issue("member \047" name "\047 has invalid pane id \047" pane "\047")
+      }
+      if (!int32(pane_pid, 1)) {
+        issue("member \047" name "\047 has invalid pane pid \047" pane_pid "\047")
+      }
+      if (!int32(rank, 0)) {
+        issue("member \047" name "\047 has invalid rank \047" rank "\047")
+      }
+      if (spawned != "0" && spawned != "1") {
+        issue("member \047" name "\047 has invalid spawned flag \047" spawned "\047")
+      }
+      if (name in seen_name) issue("duplicate roster name \047" name "\047")
+      else seen_name[name]=1
+      if (pane in seen_pane) issue("duplicate roster pane \047" pane "\047")
+      else seen_pane[pane]=1
+      if (pane_pid in seen_pid) issue("duplicate roster pane pid \047" pane_pid "\047")
+      else seen_pid[pane_pid]=1
+      if (rank in seen_rank) issue("duplicate roster rank \047" rank "\047")
+      else seen_rank[rank]=1
+    }
+    END {
+      if (logical == 0) issue("invalid roster header")
+      else if (header_ok && rows == 0) issue("roster has no member rows")
+      if (header_ok && rows > 5) issue("roster exceeds the five-agent cap")
+    }
+  ' "$DUET_DIR/roster.tsv" 2>/dev/null
+}
+
 duet_doctor_check_roster(){
-  local expected_header header duplicates name harness pane recorded_pid rank spawned
-  local current_leaders=0
-  expected_header=$'name\tharness\tpane_id\tpane_pid\trank\tspawned'
-  header="$(sed -n '1p' "$DUET_DIR/roster.tsv" 2>/dev/null)"
-  if [ "$header" = "$expected_header" ]; then
-    duet_doctor_ok "roster header"
-  else
-    duet_doctor_issue "invalid roster header"
+  local diagnostics diagnostic schema_valid="" name harness pane recorded_pid rank spawned
+  local current_leaders=0 initiator_count=0 row_count=0
+  DUET_DOCTOR_ROSTER_VALID=""
+  if duet_validate_roster "$DUET_DIR/roster.tsv"; then
+    schema_valid=1
+    DUET_DOCTOR_ROSTER_VALID=1
+  fi
+  diagnostics="$(duet_doctor_roster_diagnostics)"
+  if [ -n "$diagnostics" ]; then
+    DUET_DOCTOR_ROSTER_VALID=""
+    while IFS= read -r diagnostic; do
+      [ -n "$diagnostic" ] && duet_doctor_issue "$diagnostic"
+    done <<< "$diagnostics"
+  elif [ -z "$schema_valid" ]; then
+    duet_doctor_issue "roster schema or tuple uniqueness is invalid"
   fi
 
-  duplicates="$(awk -F '\t' '
-    NR > 1 {
-      if (seen_name[$1]++) print "duplicate name " $1
-      if (seen_pane[$3]++) print "duplicate pane " $3
-      if (seen_rank[$5]++) print "duplicate rank " $5
-    }
-  ' "$DUET_DIR/roster.tsv" 2>/dev/null)"
-  while IFS= read -r duplicate; do
-    [ -n "$duplicate" ] || continue
-    duet_doctor_issue "$duplicate in roster"
-  done <<< "$duplicates"
+  # Structural ambiguity is identity uncertainty, not evidence that any tuple
+  # is dead. Do not probe or print per-member liveness from an invalid roster.
+  [ -n "$schema_valid" ] || {
+    duet_doctor_issue "member liveness is UNKNOWN because the roster is invalid"
+    return
+  }
 
+  duet_doctor_ok "roster schema and tuple uniqueness checked"
   while IFS=$'\t' read -r name harness pane recorded_pid rank spawned; do
-    [ "$name" != name ] || continue
-    [ -n "$name" ] || continue
-    case "$name" in *[!A-Za-z0-9_-]*) duet_doctor_issue "invalid roster name '$name'" ;; esac
-    case "$rank" in ''|*[!0-9]*) duet_doctor_issue "invalid rank '$rank' for $name" ;; esac
-    case "$spawned" in 0|1) : ;; *) duet_doctor_issue "invalid spawned flag '$spawned' for $name" ;; esac
-    [ -n "$harness" ] || duet_doctor_issue "missing harness for $name"
-    [ -n "$pane" ] || duet_doctor_issue "missing pane for $name"
+    row_count=$((row_count + 1))
     [ "$name" != "$DUET_CURRENT_LEADER" ] || current_leaders=$((current_leaders + 1))
+    if [ "$name" = "${DUET_INITIATOR:-}" ]; then
+      initiator_count=$((initiator_count + 1))
+      if [ "$rank" != 0 ] || [ "$spawned" != 0 ] \
+          || [ "$pane" != "${DUET_INITIATOR_PANE:-}" ]; then
+        DUET_DOCTOR_ROSTER_VALID=""
+        duet_doctor_issue "initiator row does not match config/rank/spawn invariants"
+      fi
+    elif [ "$spawned" != 1 ]; then
+      DUET_DOCTOR_ROSTER_VALID=""
+      duet_doctor_issue "worker '$name' is not marked spawned"
+    fi
 
     duet_diag_pane_state "$pane" "$recorded_pid"
     if [ "$DUET_DIAG_LIVENESS" = UNKNOWN ]; then
@@ -69,7 +156,26 @@ duet_doctor_check_roster(){
     if [ ! -f "$DUET_DIR/ready/$name" ]; then
       duet_doctor_issue "readiness marker missing for $name"
     fi
-  done < "$DUET_DIR/roster.tsv"
+  done < <(LC_ALL=C awk '
+    BEGIN { cr=sprintf("%c", 13) }
+    {
+      line=$0
+      if (substr(line, length(line), 1) == cr) {
+        line=substr(line, 1, length(line) - 1)
+      }
+      if (line == "") next
+      logical++
+      if (logical > 1) print line
+    }
+  ' "$DUET_DIR/roster.tsv")
+
+  if [ "$row_count" -gt 5 ]; then
+    DUET_DOCTOR_ROSTER_VALID=""
+  fi
+  if [ "$initiator_count" -ne 1 ]; then
+    DUET_DOCTOR_ROSTER_VALID=""
+    duet_doctor_issue "roster does not contain exactly one configured initiator"
+  fi
 
   if [ "$current_leaders" -ne 1 ]; then
     duet_doctor_issue "leader '$DUET_CURRENT_LEADER' is not represented exactly once in the roster"
@@ -154,11 +260,16 @@ duet_doctor_check_daemon(){
 # panes explicitly recorded as spawned by the explicitly pinned, ended session.
 duet_doctor_reap_ended(){
   local caller_socket="" caller_server="" caller_pane="" caller_pid=""
-  local name harness pane recorded_pid rank spawned
+  local name harness pane recorded_pid rank spawned failed=""
   [ -f "$DUET_DIR/.ended" ] || {
     echo "duet: --reap refuses an active session; use duet-end.sh for an orderly drain." >&2
     return 2
   }
+  if [ -z "${DUET_DOCTOR_ROSTER_VALID:-}" ] \
+      || ! duet_validate_roster "$DUET_DIR/roster.tsv"; then
+    echo "duet: --reap refuses an invalid or ambiguous session roster." >&2
+    return 9
+  fi
   duet_tmux_server_matches || {
     echo "duet: --reap refuses because the recorded tmux server identity does not match." >&2
     return 2
@@ -171,6 +282,7 @@ duet_doctor_reap_ended(){
   fi
 
   while IFS=$'\t' read -r name harness pane recorded_pid rank spawned; do
+    spawned="${spawned%$'\r'}"
     [ "$name" != name ] || continue
     [ "$spawned" = 1 ] || continue
     duet_diag_pane_state "$pane" "$recorded_pid"
@@ -185,9 +297,13 @@ duet_doctor_reap_ended(){
     _duet_tmux send-keys -t "$pane" C-c 2>/dev/null || true
     sleep 0.3
     duet_diag_pane_state "$pane" "$recorded_pid"
-    [ "$DUET_DIAG_ALIVE" = yes ] \
-      && _duet_tmux kill-pane -t "$pane" 2>/dev/null || true
+    if [ "$DUET_DIAG_ALIVE" = yes ] \
+        && ! _duet_tmux kill-pane -t "$pane" 2>/dev/null; then
+      printf 'fail : %s pane=%s could not be reaped\n' "$name" "$pane" >&2
+      failed=1
+    fi
   done < "$DUET_DIR/roster.tsv"
+  [ -z "$failed" ]
 }
 
 duet_doctor_main(){
