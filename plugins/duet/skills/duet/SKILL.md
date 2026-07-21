@@ -1,12 +1,12 @@
 ---
 name: duet
-description: Start and lead a live tmux ensemble of Claude, Codex, and Kimi agents. Use when the user wants multiple coding agents to collaborate interactively, divide disjoint implementation scopes, debate an approach, or cross-check one another. Messages are queued and injected into each agent's prompt while a watchdog provides fenced leader failover.
+description: Start and lead a live tmux or psmux ensemble of Claude, Codex, and Kimi agents. Use when the user wants multiple coding agents to collaborate interactively, divide disjoint implementation scopes, debate an approach, or cross-check one another. Messages are queued and injected into each agent's prompt while a watchdog provides fenced leader failover.
 argument-hint: "[codex|kimi|claude ...]"
 ---
 
 # Duet ensemble
 
-Start a named ensemble of two to five agents in one tmux window. You are the
+Start a named ensemble of two to five agents in one tmux or psmux window. You are the
 initiator, roster name `claude`, and term-0 leader. Each requested harness runs
 as a worker in another pane (`codex-1`, `kimi-1`, `claude-1`, and so on).
 
@@ -16,9 +16,9 @@ message one another.
 
 ## 0. Preconditions and platform scope
 
-- Determine the host platform first. On Windows, use only the legacy psmux
-  path below; if Claude is not already inside psmux, tell the user to relaunch
-  with `psmux new-session -s duet -- claude`.
+- Determine the host platform first. On Windows, use PowerShell and psmux. If
+  Claude is not already inside psmux, tell the user to relaunch with
+  `psmux new-session -s duet -- claude`.
 - On macOS/Linux, the v0.2 ensemble path requires Bash and tmux. If `$TMUX` is
   empty, stop and tell the user to relaunch with `tmux new-session claude`, then
   run `/duet:duet` again.
@@ -35,23 +35,6 @@ Treat them only as a whitespace-separated list of the three supported harness
 words. Reject options, shell syntax, or more than four words; do not interpolate
 unvalidated argument text into a shell command. An empty list means `codex`.
 
-### Windows/psmux legacy path
-
-The PowerShell scripts are intentionally unchanged in v0.2. On Windows they
-continue to provide the prior two-agent Claude+Codex behavior only:
-
-From PowerShell:
-
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-init.ps1"
-
-From Bash/Git Bash on Windows:
-
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$CLAUDE_PLUGIN_ROOT\scripts\duet-init.ps1"
-
-Do not pass roster arguments or promise queues, leadership terms, failover, or
-session fencing on that path. Follow the two-agent brief produced by the
-PowerShell script. The remaining sections describe only the tmux/Bash ensemble.
-
 ## 1. Start and pin the session
 
 Pass the validated harness words from the skill invocation to init. With no
@@ -59,6 +42,11 @@ words, omit them so init applies its Codex default:
 
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-init.sh"
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-init.sh" codex kimi
+
+On Windows, pass the same validated roster to the PowerShell init:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-init.ps1"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-init.ps1" codex kimi
 
 Init writes the role-neutral protocol into `AGENTS.md` and `CLAUDE.md`, launches
 the workers, starts the delivery daemon, and waits for every worker's readiness
@@ -70,9 +58,10 @@ immediately retain that session's immutable config path:
     /absolute/session/directory/duet.env
 
 Every later agent command must pin that exact session, either with
-`DUET_CONFIG=/absolute/session/directory/duet.env` or `--session` with that
-path. Never use `~/.duet/current`, infer the latest directory, or omit the pin.
-`current` is only a human/status convenience and another workdir may repoint it.
+`DUET_CONFIG=/absolute/session/directory/duet.env`, `--session` on Bash, or
+`-Session` on PowerShell. Do not infer the latest directory or omit the pin.
+The `current` entry only helps a human inspect a session; another workdir may
+repoint it.
 
 Re-running init replaces only the active predecessor for the same canonical
 workdir. Sessions in other workdirs remain independent.
@@ -99,12 +88,35 @@ Send to a named worker with the pinned config (body on stdin):
     ...one scoped assignment or reply...
     DUET_EOF
 
+PowerShell/psmux:
+
+    @'
+    ...one scoped assignment or reply...
+    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" codex-1 -Session "C:\absolute\session\directory\duet.env"
+
+Kimi and some Claude tool sessions on Windows run Bash or Git Bash. In those
+shells, keep the PowerShell transport but replace the here-string with a Bash
+heredoc (the generated session brief includes absolute, ready-to-use forms):
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" codex-1 -Session 'C:\absolute\session\directory\duet.env' <<'DUET_EOF'
+    ...one scoped assignment or reply...
+    DUET_EOF
+
+The same translation applies to the later Windows broadcast, interrupt, reply,
+and `DUET-END` examples; PowerShell switches such as `-Interrupt` are unchanged.
+
 Only the current leader may broadcast:
 
     DUET_CONFIG="/absolute/session/directory/duet.env" \
       bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" all <<'DUET_EOF'
     ...message for every other roster member...
     DUET_EOF
+
+PowerShell/psmux:
+
+    @'
+    ...message for every other roster member...
+    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" all -Session "C:\absolute\session\directory\duet.env"
 
 `duet-send` prints one `duet: queued <message-id> for <recipient>` line per
 recipient accepted. A broadcast therefore prints several lines. These confirm
@@ -133,6 +145,12 @@ To urgently redirect a worker, add `--interrupt`:
     Stop current work and follow this revised scope: ...
     DUET_EOF
 
+PowerShell/psmux uses `-Interrupt`:
+
+    @'
+    Stop current work and follow this revised scope: ...
+    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" codex-1 -Interrupt -Session "C:\absolute\session\directory\duet.env"
+
 Interrupts have queue priority and supersede older undeliverable normal work;
 use them only for a genuine redirect.
 
@@ -143,6 +161,12 @@ queue resolves at delivery time, so a pending reply follows a promotion:
       bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" leader <<'DUET_EOF'
     ...worker result...
     DUET_EOF
+
+PowerShell/psmux:
+
+    @'
+    ...worker result...
+    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" leader -Session "C:\absolute\session\directory\duet.env"
 
 The transcript records enqueue intent in serialized queue order. A transcript
 entry can survive even when its payload never reaches a prompt, so the entry
@@ -174,7 +198,11 @@ eligible successor:
     DUET_CONFIG="/absolute/session/directory/duet.env" \
       bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-promote.sh" --to codex-1
 
-Use `duet-promote.sh`; direct edits to the `leader` file bypass term and
+PowerShell/psmux:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-promote.ps1" -To codex-1 -Session "C:\absolute\session\directory\duet.env"
+
+Use the platform's `duet-promote` script; direct edits to the `leader` file bypass term and
 composer fencing and are an unsafe emergency-only recovery action. If no live
 eligible successor exists, leadership becomes `NONE`; report it to the user
 and use pinned diagnostics rather than assigning more work.
@@ -196,6 +224,11 @@ Always diagnose the exact pinned session:
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-doctor.sh" \
       --session "/absolute/session/directory/duet.env"
 
+PowerShell/psmux:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-status.ps1" -Session "C:\absolute\session\directory\duet.env"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-doctor.ps1" -Session "C:\absolute\session\directory\duet.env"
+
 Status shows roster readiness, pane liveness, leader/term, inbox depth, and the
 daemon. Doctor validates session invariants. Never substitute the ambient
 `current` link in agent-driven recovery.
@@ -211,6 +244,13 @@ one `DUET-END` broadcast, then ends the same pinned session:
     DUET_EOF
     DUET_CONFIG="/absolute/session/directory/duet.env" \
       bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-end.sh"
+
+PowerShell/psmux:
+
+    @'
+    DUET-END. Final state and handoff: ...
+    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-send.ps1" all -Session "C:\absolute\session\directory\duet.env"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-end.ps1" -Session "C:\absolute\session\directory\duet.env"
 
 End closes admission and waits for all messages already queued, including the
 final broadcast, before stopping the daemon, removing protocol anchors, and

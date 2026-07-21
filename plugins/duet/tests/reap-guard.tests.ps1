@@ -1,69 +1,104 @@
 # Windows/psmux reap-safety tests. Run:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File plugins/duet/tests/reap-guard.tests.ps1
-#
-# Guards the "re-init kills the shell" bug: on the Windows/psmux build a dead
-# Codex pane's id can be recycled/aliased onto the live Claude pane, so a naive
-# `kill-pane` on the recorded Codex id tears down THIS session. Stop-DuetSessionByConfig
-# now reaps at the OS-process level (Stop-Process) and refuses to touch any pid
-# that is the current Claude, a multiplexer, or an ancestor of our pane.
 $ErrorActionPreference = 'Stop'
 $common = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\duet-common.ps1'
 . $common
 
-$tmp = Join-Path $env:TEMP ("duettest_" + [guid]::NewGuid().ToString('N'))
+$script:passed = 0
+$script:failed = 0
+function Check([bool]$Condition, [string]$Name) {
+  if ($Condition) { $script:passed++; Write-Host "  PASS $Name" }
+  else { $script:failed++; Write-Host "  FAIL $Name" }
+}
+
+$tmp = Join-Path $env:TEMP ("duet-reap-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-$env:TMUX_PANE = '%1'
+$roster = Join-Path $tmp 'roster.tsv'
 
-# Real-topology-shaped process table: claude=23108 (parent psmux 23008); a
-# powershell 23024 in the same pane; the ghost pane's shell 15420 is a SIBLING of
-# claude (parent psmux 23008); a genuinely distinct codex shell 7576; plus a
-# synthetic ancestor chain 5000<-4000<-3000 to exercise the ancestor walk.
-$script:TABLE = @{
-  20596 = @{ Parent=1;     Name='psmux.exe' }
-  23008 = @{ Parent=1;     Name='psmux.exe' }
-  23108 = @{ Parent=23008; Name='claude.exe' }
-  23024 = @{ Parent=20596; Name='powershell.exe' }
-  15420 = @{ Parent=23008; Name='powershell.exe' }
-  7576  = @{ Parent=20596; Name='powershell.exe' }
-  3000  = @{ Parent=1;     Name='powershell.exe' }
-  4000  = @{ Parent=3000;  Name='powershell.exe' }
-  5000  = @{ Parent=4000;  Name='powershell.exe' }
-}
-$script:ALIVE   = @{}
-$script:PIDSETS = @{}
-$script:KILLED  = @()
-function Get-DuetProcessTable { return $script:TABLE }
-function Test-DuetPaneAlive { param([string]$Pane) return [bool]$script:ALIVE[$Pane] }
-function Get-DuetPanePidSet { param([string]$Pane) $v = $script:PIDSETS[$Pane]; if ($null -eq $v) { @() } else { @($v) } }
-function Stop-Process { param([int]$Id, [switch]$Force, $ErrorAction) $script:KILLED += $Id }
-
-function Run($name, $codexPane, $alive, $pidsets, $expectKilled) {
-  $script:KILLED = @(); $script:ALIVE = $alive; $script:PIDSETS = $pidsets
-  $cfg = [pscustomobject]@{
-    DUET_DIR = $tmp; CLAUDE_PANE = '%1'; CODEX_PANE = $codexPane
-    CLAUDE_PANE_PID = '23108 23024'; CODEX_PANE_PID = 'x'
-  }
-  $warn = & { Stop-DuetSessionByConfig -Config $cfg -KillCodexPane } 3>&1 | ForEach-Object { "$_" }
-  $killed = @($script:KILLED | Sort-Object)
-  $exp = @($expectKilled | Sort-Object)
-  $ok = (($killed -join ',') -eq ($exp -join ','))
-  if ($killed -contains 23108) { $ok = $false }   # hard invariant: never kill my Claude
-  $verdict = if ($ok) { 'PASS' } else { 'FAIL' }
-  Write-Host ("{0,-4} {1,-40} killed=[{2,-8}] expected=[{3,-8}] {4}" -f $verdict, $name, ($killed -join ','), ($exp -join ','), ($warn -join ' '))
-  return $ok
+function Write-Roster([string[]]$Rows) {
+  $content = @("name`tharness`tpane_id`tpane_pid`trank`tspawned") + $Rows
+  [System.IO.File]::WriteAllLines($roster, $content, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-$ok = @()
-$ok += Run 'A ghost %4 -> kill orphan 15420' '%4' @{ '%1'=$true; '%4'=$true } @{ '%1'=@('23024','23108'); '%4'=@('15420') } @(15420)
-$ok += Run 'B real codex %5 -> kill 7576'    '%5' @{ '%1'=$true; '%5'=$true } @{ '%1'=@('23024','23108'); '%5'=@('7576') }  @(7576)
-$ok += Run 'C target reports my claude'      '%4' @{ '%1'=$true; '%4'=$true } @{ '%1'=@('23024','23108'); '%4'=@('23108') } @()
-$ok += Run 'D target is psmux'               '%4' @{ '%1'=$true; '%4'=$true } @{ '%1'=@('23024','23108'); '%4'=@('23008') } @()
-$ok += Run 'E target is ancestor'            '%7' @{ '%1'=$true; '%7'=$true } @{ '%1'=@('5000'); '%7'=@('4000') }           @()
-$ok += Run 'F target unknown pid'            '%8' @{ '%1'=$true; '%8'=$true } @{ '%1'=@('23108'); '%8'=@('99999') }         @()
-$ok += Run 'G target not alive'              '%9' @{ '%1'=$true; '%9'=$false } @{ '%1'=@('23108') }                        @()
-$ok += Run 'H target == current pane'        '%1' @{ '%1'=$true } @{ '%1'=@('23108') }                                     @()
-$ok += Run 'I mixed orphan+claude'           '%4' @{ '%1'=$true; '%4'=$true } @{ '%1'=@('23024','23108'); '%4'=@('15420','23108') } @(15420)
+$script:ResolvePlan = @{}
+$script:ResolveCalls = @{}
+$script:Killed = @()
+$script:LivePids = @{}
+function Resolve-DuetPaneResolution {
+  param([string]$Session, [string]$ServerPid, [string]$PaneId, [string]$PanePid)
+  $index = if ($script:ResolveCalls.ContainsKey($PaneId)) { [int]$script:ResolveCalls[$PaneId] } else { 0 }
+  $script:ResolveCalls[$PaneId] = $index + 1
+  $plan = @($script:ResolvePlan[$PaneId])
+  if ($plan.Count -eq 0) { return [pscustomobject]@{ Known = $false; Alive = $false; Target = '' } }
+  if ($index -ge $plan.Count) { $index = $plan.Count - 1 }
+  return $plan[$index]
+}
+function Stop-Process {
+  param([int]$Id, [switch]$Force, $ErrorAction)
+  $script:Killed += $Id
+  $script:LivePids[[string]$Id] = $false
+}
+function Test-DuetProcessAlive([string]$ProcessId) { return [bool]$script:LivePids[[string]$ProcessId] }
+function Resolution([bool]$Known, [bool]$Alive, [string]$Target = '') {
+  return [pscustomobject]@{ Known = $Known; Alive = $Alive; Target = $Target }
+}
+function Reset-Fixture {
+  $script:ResolvePlan = @{}; $script:ResolveCalls = @{}; $script:Killed = @(); $script:LivePids = @{}
+}
 
-Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
-$fails = @($ok | Where-Object { -not $_ }).Count
-if ($fails -eq 0) { Write-Host "==== ALL PASS ===="; exit 0 } else { Write-Host "==== $fails FAILED ===="; exit 1 }
+try {
+  Reset-Fixture
+  Write-Roster @("worker`tcodex`t%2`t222`t1`t1")
+  $script:ResolvePlan['%2'] = @(Resolution $true $false)
+  $result = Stop-DuetSpawnedPanes -RosterPath $roster -ExemptPaneId '%1' -ExemptPanePid '111'
+  Check ($result -and $script:Killed.Count -eq 0) 'known-dead tuple is already stopped'
+
+  Reset-Fixture
+  $script:ResolvePlan['%2'] = @(Resolution $false $false)
+  $result = Stop-DuetSpawnedPanes -RosterPath $roster -ExemptPaneId '%1' -ExemptPanePid '111'
+  Check ((-not $result) -and $script:Killed.Count -eq 0) 'unknown tuple fails closed without signaling a pid'
+
+  Reset-Fixture
+  $script:ResolvePlan['%2'] = @((Resolution $true $true 's:%2'), (Resolution $true $true 's:%2'))
+  $script:LivePids['222'] = $true
+  $result = Stop-DuetSpawnedPanes -RosterPath $roster -ExemptPaneId '%1' -ExemptPanePid '111'
+  Check ($result -and ($script:Killed -join ',') -eq '222') 'live tuple is re-resolved and only its recorded pid is stopped'
+
+  Reset-Fixture
+  $script:ResolvePlan['%2'] = @((Resolution $true $true 's:%2'), (Resolution $false $false))
+  $script:LivePids['222'] = $true
+  $result = Stop-DuetSpawnedPanes -RosterPath $roster -ExemptPaneId '%1' -ExemptPanePid '111'
+  Check ((-not $result) -and $script:Killed.Count -eq 0) 'identity becoming unknown in the resolve-to-stop window blocks Stop-Process'
+
+  Reset-Fixture
+  Write-Roster @("caller`tclaude`t%1`t111`t0`t1")
+  $result = Stop-DuetSpawnedPanes -RosterPath $roster -ExemptPaneId '%1' -ExemptPanePid '111'
+  Check ($result -and $script:Killed.Count -eq 0 -and $script:ResolveCalls.Count -eq 0) 'exact caller tuple is exempt before resolution'
+
+  Reset-Fixture
+  Write-Roster @("recycled`tclaude`t%1`t222`t0`t1")
+  $script:ResolvePlan['%1'] = @((Resolution $true $true 's:%1'), (Resolution $true $true 's:%1'))
+  $script:LivePids['222'] = $true
+  $result = Stop-DuetSpawnedPanes -RosterPath $roster -ExemptPaneId '%1' -ExemptPanePid '111'
+  Check ($result -and ($script:Killed -join ',') -eq '222') 'pane id alone is not exempt when pane_pid differs'
+
+  Reset-Fixture
+  Write-Roster @("broken`tcodex`t`t222`t1`t1")
+  $result = Stop-DuetSpawnedPanes -RosterPath $roster -ExemptPaneId '%1' -ExemptPanePid '111'
+  Check ((-not $result) -and $script:Killed.Count -eq 0) 'spawned row missing a tuple fails closed'
+
+  Reset-Fixture
+  Write-Roster @("broken`tcodex`t%2`tnot-a-pid`t1`t1")
+  $script:ResolvePlan['%2'] = @(Resolution $true $true 's:%2')
+  $result = Stop-DuetSpawnedPanes -RosterPath $roster -ExemptPaneId '%1' -ExemptPanePid '111'
+  Check ((-not $result) -and $script:Killed.Count -eq 0) 'non-numeric pane_pid is never passed to Stop-Process'
+
+  $result = Stop-DuetSpawnedPanes -RosterPath (Join-Path $tmp 'missing.tsv') -ExemptPaneId '%1' -ExemptPanePid '111'
+  Check (-not $result) 'missing roster cannot authorize process teardown'
+}
+finally {
+  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "`nRESULT: $script:passed passed, $script:failed failed"
+if ($script:failed -gt 0) { exit 1 }

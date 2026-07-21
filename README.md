@@ -1,8 +1,8 @@
 # duet-agents
 
 Run **Claude Code**, **Codex CLI**, and **Kimi CLI** as a visible, leader-led
-agent ensemble in tmux. The Claude that starts the session leads; up to four
-named workers collaborate in adjacent panes, with automatic leader failover if
+agent ensemble in tmux or psmux. The Claude that starts the session leads; up
+to four named workers collaborate in adjacent panes, with leader failover if
 the leader disappears or can no longer receive messages.
 
 This repository is a Claude Code plugin marketplace. Installing the `duet`
@@ -27,9 +27,9 @@ queues, delivery daemon, and session transcript.
 Workers never message one another directly. Each leader-worker edge keeps the
 simple duet discipline: one message, one reply, then wait.
 
-> **Platform scope:** the n-agent v0.2 protocol is implemented for the
-> tmux/bash path on macOS and Linux. The PowerShell/psmux scripts remain the
-> unchanged v0.1 two-agent path for now.
+The queued n-agent protocol runs through Bash/tmux on macOS and Linux and
+through PowerShell/psmux on Windows. Both paths use the same roster, session
+fences, delivery states, and leader-failover rules.
 
 ## Why queues instead of screen-scraping
 
@@ -70,7 +70,8 @@ audit/recovery record, not proof that a recipient processed an entry.
 
 ## Requirements
 
-- macOS or Linux with [`tmux`](https://github.com/tmux/tmux)
+- macOS or Linux with [`tmux`](https://github.com/tmux/tmux), or Windows with
+  [psmux](https://github.com/psmux/psmux) 3.3.6
 - [Claude Code](https://claude.com/claude-code) (`claude` on `PATH`)
 - Each selected worker CLI must be on `PATH` and already authenticated:
   [Codex CLI](https://github.com/openai/codex) (`codex`),
@@ -92,10 +93,14 @@ Or use `/plugin marketplace add JonathanRosado/duet-agents`, followed by
 
 ## Use
 
-Start Claude inside tmux:
+Start Claude inside the multiplexer for your platform:
 
 ```bash
 tmux new-session claude
+```
+
+```powershell
+psmux new-session -s duet -- claude
 ```
 
 Then choose the worker roster. With no arguments, the existing two-agent
@@ -124,10 +129,10 @@ this session spawned.
 
 ## Pin every session operation
 
-`~/.duet/current` is a convenience for a human inspecting the newest session;
-it is not a safe routing mechanism. Two ensembles may be active in different
-workdirs, so every agent command must use the absolute session config injected
-at launch as `$DUET_CONFIG`, or pass the equivalent `--session` value.
+The `current` pointer under the state root helps a human inspect the newest
+session. Two ensembles may be active in different workdirs, so each agent
+command must use the absolute session config injected at launch as
+`DUET_CONFIG`, or pass `--session` on Bash and `-Session` on PowerShell.
 
 ```bash
 DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
@@ -139,15 +144,39 @@ DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
 DUET_EOF
 ```
 
-Do not make agent traffic depend on `~/.duet/current`, and do not mix a send
-script copied from another plugin version or session. The sender's tmux pane,
-`DUET_SELF`, roster membership, and session ID are cross-checked; cross-session
-sends are refused.
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-status.ps1" `
+  -Session "C:\absolute\state\<session>\duet.env"
+
+@'
+...message...
+'@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-send.ps1" leader `
+  -Session "C:\absolute\state\<session>\duet.env"
+```
+
+On Windows, Kimi and some Claude tool sessions use Bash or Git Bash. In that
+shell, invoke the same PowerShell script with a Bash heredoc instead of a
+PowerShell here-string:
+
+```bash
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File \
+  "$CLAUDE_PLUGIN_ROOT\scripts\duet-send.ps1" leader \
+  -Session 'C:\absolute\state\<session>\duet.env' <<'DUET_EOF'
+...message...
+DUET_EOF
+```
+
+Do not make agent traffic depend on the `current` pointer, and do not mix a
+send script copied from another plugin version or session. Duet cross-checks
+the sender's multiplexer pane, `DUET_SELF`, roster membership, and session ID;
+it refuses cross-session sends.
 
 One active session is allowed per workdir. Starting a replacement reaps only
 the same-workdir predecessor and cannot disturb a session in another workdir.
 Set `DUET_STATE_ROOT` before init to place session state somewhere other than
-the default `$HOME/.duet`.
+the default `$HOME/.duet` on Unix or `%USERPROFILE%\.duet` on Windows.
 
 ## Model and permission overrides
 
@@ -181,12 +210,13 @@ Workers are intentionally launched as capable peers. Codex defaults to
 `--dangerously-skip-permissions`, and Kimi workers to `--auto`. Advanced users
 can override these with `DUET_CODEX_SANDBOX`, `DUET_CODEX_APPROVAL`,
 `DUET_CLAUDE_PERMISSION_FLAG`, and `DUET_KIMI_MODE_FLAG`. Restricting a worker
-below tmux-socket or shared-workdir access can prevent delivery or collaboration.
+below multiplexer or shared-workdir access can prevent delivery or collaboration.
 
 ## Adding another CLI harness
 
-Add `plugins/duet/harnesses/<harness>.sh`. Init sources the adapter and requires
-this contract:
+Add `plugins/duet/harnesses/<harness>.sh` for Bash/tmux and a matching
+`<harness>.ps1` adapter for PowerShell/psmux. Bash adapters implement this
+contract:
 
 ```bash
 DUET_HARNESS_BOOT_RE='regex visible after a successful boot'
@@ -211,8 +241,9 @@ workdir, give the CLI access to the session directory, avoid approval dialogs,
 and export `DUET_SELF`, the absolute `DUET_CONFIG`, and the unique
 `DUET_SESSION`. The CLI must auto-load the selected durable brief.
 
-Also register the harness name and instance counter in `duet-init.sh`'s roster
-argument table. Keep model selection optional through a
+PowerShell adapters return a hashtable with `BootRegex`, `BriefFile`, `Check`,
+`Pretrust`, and `LaunchCommand`. Register the harness name and instance counter
+in both init scripts. Keep model selection optional through a
 `DUET_<HARNESS>_MODEL` variable so an unset value preserves the CLI default.
 
 ## Troubleshooting and recovery
@@ -225,6 +256,17 @@ DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
 
 DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
   bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-doctor.sh"
+```
+
+On Windows:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-status.ps1" `
+  -Session "C:\absolute\state\<session>\duet.env"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-doctor.ps1" `
+  -Session "C:\absolute\state\<session>\duet.env"
 ```
 
 - If a long or collapsed paste leaves a recipient composer non-empty and Enter
@@ -246,9 +288,15 @@ DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
     bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-promote.sh" --to codex-1
   ```
 
+  ```powershell
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+    "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-promote.ps1" -To codex-1 `
+    -Session "C:\absolute\state\<session>\duet.env"
+  ```
+
   Directly editing `leader` is an emergency-only, unsafe last resort: it skips
   the term compare-and-swap, failed-member exclusion, promotion-first ordering,
-  and notices. Prefer `duet-promote.sh`.
+  and notices. Prefer the platform's `duet-promote` script.
 
   Promotion is a permanent handoff within that session: the former incumbent
   becomes ineligible and `--force` is intentionally unsupported.
@@ -256,26 +304,25 @@ DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
 Session artifacts persist under `$DUET_STATE_ROOT/<session>/` after teardown so
 the transcript remains available.
 
-## Upgrading from 0.1.x
+## Upgrading from 0.1.x or Windows 0.2.0
 
-Version 0.2.0 changes the tmux/bash session and transport schema. End any live
-0.1.x session, update or reinstall the plugin through Claude's plugin manager,
+Version 0.2.1 brings the queued n-agent schema to Windows. End any live legacy
+Windows or 0.1.x session, update the plugin through Claude's plugin manager,
 restart Claude so it loads the new plugin cache, and start a fresh ensemble.
 Existing session directories are audit records; they are not upgraded in place.
 
 Compatibility notes:
 
 - `/duet:duet` with no arguments still starts one Codex worker.
-- Direct pane-to-pane send and the optional `DUET_RELAY` path are retired on
-  tmux. Every message now goes through the queue and delivery daemon.
+- Direct pane-to-pane send and the optional `DUET_RELAY` path are retired.
+  Every message now goes through the queue and delivery daemon.
 - Worker names are suffixed, and worker replies should target `leader` rather
   than a concrete agent name.
 - Every agent-facing send, end, or promotion command now requires an explicit
-  session pin (`DUET_CONFIG` or `--session`); `~/.duet/current` must not be used
-  for agent routing. Human-only status/doctor calls may inspect `current`, but
-  pinning them is safer when multiple sessions exist.
-- Do not use a cached 0.1.x `duet-send` against a 0.2.0 session.
-- Windows/psmux remains on the v0.1 two-agent behavior in this release.
+  session pin (`DUET_CONFIG`, `--session`, or `-Session`). Do not use the
+  `current` pointer for agent routing. Human-only status/doctor calls may inspect
+  `current`, but pinning them is safer when multiple sessions exist.
+- Do not use a cached 0.1.x `duet-send` against a current session.
 
 ## Repository layout
 
@@ -284,26 +331,22 @@ Compatibility notes:
 plugins/duet/
 ├── .claude-plugin/plugin.json
 ├── briefs/ENSEMBLE_BRIEF.md
-├── claude/CLAUDE_BRIEF.md       # legacy Windows/psmux
-├── codex/AGENTS_BRIEF.md        # legacy Windows/psmux
+├── briefs/ENSEMBLE_BRIEF.win.md
 ├── harnesses/
-│   ├── claude.sh
-│   ├── codex.sh
-│   └── kimi.sh
+│   ├── claude.sh / claude.ps1
+│   ├── codex.sh / codex.ps1
+│   └── kimi.sh / kimi.ps1
 ├── skills/duet/SKILL.md
 └── scripts/
-    ├── duet-common.sh
-    ├── duet-init.sh
-    ├── duet-send.sh
-    ├── duet-deliverd.sh
-    ├── duet-promote.sh
-    ├── duet-status.sh
-    ├── duet-doctor.sh
-    └── duet-end.sh
+    ├── duet-common.sh / duet-common.ps1
+    ├── duet-init.sh / duet-init.ps1
+    ├── duet-send.sh / duet-send.ps1
+    ├── duet-deliverd.sh / duet-deliverd.ps1
+    ├── duet-promote.sh / duet-promote.ps1
+    ├── duet-status.sh / duet-status.ps1
+    ├── duet-doctor.sh / duet-doctor.ps1
+    └── duet-end.sh / duet-end.ps1
 ```
-
-PowerShell/psmux compatibility scripts and their two legacy briefs remain in
-the plugin, but are outside the n-agent v0.2 milestone.
 
 ## Safety notes
 
@@ -314,6 +357,8 @@ the plugin, but are outside the n-agent v0.2 milestone.
 - Durable blocks in `AGENTS.md` and `CLAUDE.md` are delimited by
   `DUET:BEGIN`/`DUET:END`; teardown removes only those blocks.
 - End/reap kills only panes recorded as spawned and always exempts the caller.
+- The Windows path scopes each psmux operation to its recorded namespace and
+  session, then checks the recorded backend PID and pane PID before acting.
 
 ## License
 

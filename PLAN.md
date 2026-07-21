@@ -1,4 +1,9 @@
-# Plan: duet → n-agent ensemble protocol (v0.2.0)
+# Plan: duet → n-agent ensemble protocol (v0.2.0–0.2.1)
+
+> **Status:** v0.2.1 completes the Windows/psmux port of the queued ensemble
+> protocol described below. The original v0.2.0 Bash/tmux milestone is retained
+> here as design history; matching `.ps1` scripts, harnesses, tests, session
+> fences, delivery queues, and failover are now implemented.
 
 Evolve the duet plugin from a hardcoded 2-agent (Claude+Codex) protocol to an
 n-agent protocol (target 3 concurrent harnesses, protocol designed for up to 5),
@@ -25,8 +30,8 @@ Claude = planner/leader/reviewer, Codex = implementer + smoke tester.
 6. **Failover: the delivery daemon is also the watchdog.** It monitors leader
    liveness and promotes the next-ranked live agent.
 7. **Packaging: evolve duet in place.** 2-agent is just a roster of one worker.
-   Version 0.2.0. Scope this milestone to the tmux/bash path; the
-   Windows/psmux port follows in a later milestone (keep .ps1 files untouched).
+   Version 0.2.0 delivered the tmux/Bash path; v0.2.1 adds matching
+   PowerShell/psmux behavior without changing the wire protocol.
 
 ## Session layout (`$DUET_DIR` = `~/.duet/<stamp>/`)
 
