@@ -254,17 +254,16 @@ try {
   $SessionId = $created.Id
   $ConfigPath = Join-Path $DuetDir 'duet.env'
 
-  foreach ($dir in @('ready', 'failed-leaders')) { New-Item -ItemType Directory -Path (Join-Path $DuetDir $dir) -Force | Out-Null }
+  New-Item -ItemType Directory -Path (Join-Path $DuetDir 'ready') -Force | Out-Null
   foreach ($queue in @($InitiatorName) + @($specs | ForEach-Object { $_.Name }) + @('leader', 'promotions')) {
     foreach ($sub in @('delivered', 'failed', 'quarantine', 'superseded')) {
       New-Item -ItemType Directory -Path (Join-Path (Join-Path (Join-Path $DuetDir 'inbox') $queue) $sub) -Force | Out-Null
     }
   }
   Write-DuetUtf8NoBom -Path (Join-Path $DuetDir 'transcript.md') -Value ''
-  Write-DuetUtf8NoBom -Path (Join-Path $DuetDir 'assignments.md') -Value "# Duet assignments`n`nTerm 0 leader: claude`n"
+  Write-DuetUtf8NoBom -Path (Join-Path $DuetDir 'assignments.md') -Value "# Duet assignments`n`nGeneration 0 leader: claude`n"
   if (-not (Write-DuetAtomicMultiline -Path (Join-Path $DuetDir "ready\$InitiatorName") -Value 'ok') -or
-      -not (Write-DuetLeaderState -DuetDir $DuetDir -Term '0' -Leader $InitiatorName) -or
-      -not (Write-DuetWatchdog -DuetDir $DuetDir -Session $SessionId -Term '0' -Leader $InitiatorName -Count '0')) {
+      -not (Write-DuetLeaderState -DuetDir $DuetDir -Term '0' -Leader $InitiatorName)) {
     Stop-DuetInit 'duet: could not publish initial session state.'
   }
 
@@ -405,7 +404,7 @@ try {
     $finalExit = 5
   }
   else {
-    Write-Output "duet: all workers READY; leader=$InitiatorName term=0"
+    Write-Output "duet: all workers READY; leader=$InitiatorName generation=0"
   }
 }
 catch {

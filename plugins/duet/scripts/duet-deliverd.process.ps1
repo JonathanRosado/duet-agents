@@ -33,8 +33,8 @@ function Reconcile-ForeignNotices {
   return $true
 }
 
-# After a promotion notice reaches the new leader, fan a leadership-change notice
-# to every other live roster member (once each), then mark the promotion done.
+# After a manual handoff notice reaches the new leader, fan a notice to every
+# other live roster member once, then mark the handoff done.
 function Reconcile-PromotionFanout {
   $box = Join-Path $DuetDir 'inbox\promotions'
   foreach ($sub in @('delivered', 'quarantine')) {
@@ -46,7 +46,9 @@ function Reconcile-PromotionFanout {
       if ($null -eq (ConvertFrom-DuetDecimal $pterm)) { continue }
       $reason = Get-DuetFileText ($m.FullName + '.reason'); if ($reason) { $reason = $reason.Trim() }
       if (@('obsolete-promotion', 'foreign-session', 'missing-session', 'foreign-message-id') -contains $reason) { if (-not (SC-Set $m.FullName 'fanout_done' 'skip')) { return $false }; continue }
-      if (-not (Read-DuetMessage $m.FullName) -or $global:DUET_MESSAGE_SESSION -ne $Sid -or $global:DUET_MESSAGE_ORIGIN -ne 'SYSTEM' -or $global:DUET_MESSAGE_TERM -ne $pterm -or $global:DUET_MESSAGE_DEDUPE -ne "promotion-$pterm") { if (-not (SC-Set $m.FullName 'fanout_done' 'invalid')) { return $false }; continue }
+      if (-not (Read-DuetMessage $m.FullName) -or $global:DUET_MESSAGE_SESSION -ne $Sid `
+          -or $global:DUET_MESSAGE_HANDOFF_MODE -ne 'MANUAL' -or $global:DUET_MESSAGE_ORIGIN -ne 'SYSTEM' `
+          -or $global:DUET_MESSAGE_TERM -ne $pterm -or $global:DUET_MESSAGE_DEDUPE -ne "promotion-$pterm") { if (-not (SC-Set $m.FullName 'fanout_done' 'invalid')) { return $false }; continue }
       $recipient = $global:DUET_MESSAGE_RECIPIENT
       if (-not (Read-DuetLeaderState -DuetDir $DuetDir) -or $global:DUET_CURRENT_TERM -ne $pterm -or $global:DUET_CURRENT_LEADER -ne $recipient) { if (-not (SC-Set $m.FullName 'fanout_done' 'superseded')) { return $false }; continue }
       foreach ($r in (Import-DuetRoster $RosterPath)) {
@@ -54,7 +56,7 @@ function Reconcile-PromotionFanout {
         if (-not (Test-DuetMemberAlive -RosterPath $RosterPath -Name $r.name)) { continue }
         $marker = 'fanout-' + $r.name
         if (Test-Path -LiteralPath ($m.FullName + '.' + $marker)) { continue }
-        $body = "Leadership changed for session ${Sid}: term $pterm leader is $recipient. Read the leader file before continuing work."
+        $body = "Leadership handoff for session ${Sid}: generation $pterm leader is $recipient. Prior leader was $($global:DUET_MESSAGE_PRIOR_LEADER). Read the leader file before continuing work."
         if (-not (Add-DuetMessage -DuetDir $DuetDir -SessionId $Sid -Queue $r.name -Sender 'duet-system' -Recipient $r.name -Term $pterm -Mode 'NORMAL' -Origin 'SYSTEM' -LeaderAtSend $recipient -Body $body -Dedupe "promotion-fanout-$pterm-$($r.name)" -Internal)) { return $false }
         if (-not (SC-Set $m.FullName $marker $global:DUET_ENQUEUED_ID)) { return $false }
       }
@@ -82,7 +84,7 @@ function Reconcile-TerminalMoves {
       if (-not (Test-Path -LiteralPath $dpath)) { continue }
       foreach ($file in @(Get-ChildItem -LiteralPath $dpath -Filter '*.msg' -File -ErrorAction SilentlyContinue)) {
         $root = Join-Path $box.FullName $file.Name
-        foreach ($suffix in @('prior_term', 'failed', 'reason', 'promotion_term', 'quarantine_reason')) {
+        foreach ($suffix in @('reason', 'promotion_term', 'quarantine_reason')) {
           $rootSc = $root + '.' + $suffix
           if (-not (Test-Path -LiteralPath $rootSc)) { continue }
           $fileSc = $file.FullName + '.' + $suffix
@@ -103,92 +105,41 @@ function Reconcile-TerminalMoves {
   return $true
 }
 
-# Recover a no-live-successor terminal state whose CAS did not complete before a
-# crash. (duet_reconcile_no_successor)
-function Reconcile-NoSuccessor {
-  $file = Join-Path $DuetDir 'no-successor'
-  if (-not (Test-Path -LiteralPath $file)) { return $true }
-  $session = Get-DuetFirstLineValue -Path $file -Key 'session'
-  $fromTerm = Get-DuetFirstLineValue -Path $file -Key 'from_term'
-  $term = Get-DuetFirstLineValue -Path $file -Key 'term'
-  $failed = Get-DuetFirstLineValue -Path $file -Key 'failed'
-  $reason = Get-DuetFirstLineValue -Path $file -Key 'reason'
-  if ($session -ne $Sid -or -not $failed) { return $false }
-  $fromNumber = ConvertFrom-DuetDecimal $fromTerm
-  $termNumber = ConvertFrom-DuetDecimal $term
-  if ($null -eq $fromNumber -or $null -eq $termNumber -or $fromNumber -ge 9999999999) { return $false }
-  if (($fromNumber + 1) -ne $termNumber) { return $false }
-  if (-not $reason) { $reason = 'RECOVERY' }
-  if (-not (Read-DuetLeaderState -DuetDir $DuetDir)) { return $false }
-  if ($global:DUET_CURRENT_TERM -eq $fromTerm -and $global:DUET_CURRENT_LEADER -eq $failed) {
-    if (Test-DuetUncertainDelivery -DuetDir $DuetDir) { DLog "deferred no-successor recovery behind uncertain"; return $true }
-    if (-not (Set-DuetFailedLeader -DuetDir $DuetDir -Name $failed -Term $fromTerm -Reason $reason)) { return $false }
-    if (-not (Write-DuetLeaderState -DuetDir $DuetDir -Term $term -Leader 'NONE')) { return $false }
-    if (-not (Write-DuetWatchdog -DuetDir $DuetDir -Session $Sid -Term $term -Leader 'NONE' -Count '0')) { return $false }
-    DLog "recovered no-live-successor state at term $term"
-  }
-  elseif ($global:DUET_CURRENT_TERM -eq $term -and $global:DUET_CURRENT_LEADER -eq 'NONE') {
-    if (-not (Set-DuetFailedLeader -DuetDir $DuetDir -Name $failed -Term $fromTerm -Reason $reason)) { return $false }
-    if (-not (Write-DuetWatchdog -DuetDir $DuetDir -Session $Sid -Term $term -Leader 'NONE' -Count '0')) { return $false }
-  }
-  else { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
-  return $true
-}
-
-# A promotion notice is durably queued BEFORE the leader CAS. Complete that CAS
-# after a crash, or quarantine an obsolete intent. (duet_reconcile_promotion_intents)
+# A MANUAL handoff message is the operator's immutable crash journal. Complete
+# only its exact prior/current tuple; never infer a target or react to health.
 function Reconcile-PromotionIntents {
   $box = Join-Path $DuetDir 'inbox\promotions'
   if (-not (Test-Path -LiteralPath $box)) { return $true }
   foreach ($m in @(Get-ChildItem -LiteralPath $box -Filter 'N-*.msg' -File -ErrorAction SilentlyContinue)) {
     $file = $m.FullName
-    if (-not (Read-DuetMessage $file)) { continue }
-    if ($global:DUET_MESSAGE_SESSION -ne $Sid) { continue }
-    if ($global:DUET_MESSAGE_ID -notlike "m-$Sid-*") { if (-not (Quarantine $box $file 'foreign-message-id')) { return $false }; continue }
+    $rawSession = Get-DuetFirstLineValue -Path $file -Key 'session'
+    if (-not $rawSession) { if (-not (Quarantine $box $file 'missing-session')) { return $false }; continue }
+    if ($rawSession -ne $Sid) { if (-not (Quarantine $box $file 'foreign-session')) { return $false }; continue }
+    $rawId = Get-DuetFirstLineValue -Path $file -Key 'id'
+    if ($rawId -notlike "m-$Sid-*") { if (-not (Quarantine $box $file 'foreign-message-id')) { return $false }; continue }
+    if (-not (Read-DuetMessage $file)) { if (-not (Quarantine $box $file 'invalid-promotion-envelope')) { return $false }; continue }
     $mt = $global:DUET_MESSAGE_TERM
-    $mtNumber = ConvertFrom-DuetDecimal $mt
-    if ($null -eq $mtNumber -or $mtNumber -le 0) { DLog "quarantined invalid term-zero promotion $(Split-Path -Leaf $file)"; if (-not (Quarantine $box $file 'invalid-promotion-term')) { return $false }; continue }
-    if ($global:DUET_MESSAGE_ORIGIN -ne 'SYSTEM' -or $global:DUET_MESSAGE_DEDUPE -ne "promotion-$mt") { if (-not (Quarantine $box $file 'invalid-promotion-envelope')) { return $false }; continue }
     $recipient = $global:DUET_MESSAGE_RECIPIENT
-    $prior = SC-Get $file 'prior_term'
-    $priorNumber = ConvertFrom-DuetDecimal $prior
-    if ($null -eq $priorNumber) { $priorNumber = $mtNumber - 1; $prior = [string]$priorNumber }
-    if (($priorNumber + 1) -ne $mtNumber) { if (-not (Quarantine $box $file 'invalid-promotion-term')) { return $false }; continue }
-    $failed = SC-Get $file 'failed'
-    if (-not (Read-DuetLeaderState -DuetDir $DuetDir)) { return $false }
-    if (-not $failed -and $global:DUET_CURRENT_TERM -eq $prior) { $failed = $global:DUET_CURRENT_LEADER }
-    if (-not $failed) {
-      $found = ''
-      foreach ($cand in @(Get-ChildItem -LiteralPath (Join-Path $DuetDir 'failed-leaders') -File -ErrorAction SilentlyContinue)) {
-        if ((Get-DuetFirstLineValue -Path $cand.FullName -Key 'term') -ne $prior) { continue }
-        if ($found) { $found = ''; break }
-        $found = $cand.Name
-      }
-      $failed = $found
+    $prior = $global:DUET_MESSAGE_PRIOR_TERM
+    $priorLeader = $global:DUET_MESSAGE_PRIOR_LEADER
+    if ($global:DUET_MESSAGE_HANDOFF_MODE -ne 'MANUAL' -or $global:DUET_MESSAGE_ORIGIN -ne 'SYSTEM' `
+        -or $global:DUET_MESSAGE_DEDUPE -ne "promotion-$mt" `
+        -or -not (Test-DuetRosterHasName -RosterPath $RosterPath -Name $priorLeader) `
+        -or -not (Test-DuetRosterHasName -RosterPath $RosterPath -Name $recipient)) {
+      if (-not (Quarantine $box $file 'invalid-promotion-envelope')) { return $false }
+      continue
     }
-    if (-not $failed) { return $false }
-    $reason = SC-Get $file 'reason'; if (-not $reason) { $reason = 'RECOVERY' }
-    if (-not (Test-Path -LiteralPath ($file + '.prior_term'))) { if (-not (SC-Set $file 'prior_term' $prior)) { return $false } }
-    if (-not (Test-Path -LiteralPath ($file + '.failed'))) { if (-not (SC-Set $file 'failed' $failed)) { return $false } }
-    if (-not (Test-Path -LiteralPath ($file + '.reason'))) { if (-not (SC-Set $file 'reason' $reason)) { return $false } }
-    if (-not (Test-Path -LiteralPath ($file + '.promotion_term'))) { if (-not (SC-Set $file 'promotion_term' $mt)) { return $false } }
-    if ($global:DUET_CURRENT_TERM -eq $prior -and $global:DUET_CURRENT_LEADER -eq $failed) {
-      if (Test-DuetUncertainDelivery -DuetDir $DuetDir) { DLog "deferred promotion recovery behind uncertain"; continue }
-      if (-not (Set-DuetFailedLeader -DuetDir $DuetDir -Name $failed -Term $prior -Reason $reason)) { return $false }
+    if (-not (Read-DuetLeaderState -DuetDir $DuetDir)) { return $false }
+    if ($global:DUET_CURRENT_TERM -eq $prior -and $global:DUET_CURRENT_LEADER -eq $priorLeader) {
+      if (Test-DuetUncertainDelivery -DuetDir $DuetDir) { DLog "deferred manual handoff completion behind uncertain"; continue }
+      if (-not (Test-Path -LiteralPath ($file + '.promotion_term')) -and -not (SC-Set $file 'promotion_term' $mt)) { return $false }
       if (-not (Write-DuetLeaderState -DuetDir $DuetDir -Term $mt -Leader $recipient)) { return $false }
-      if (-not (Write-DuetWatchdog -DuetDir $DuetDir -Session $Sid -Term $mt -Leader $recipient -Count '0')) { return $false }
-      Remove-Item -LiteralPath (Join-Path $DuetDir 'no-successor') -Force -ErrorAction SilentlyContinue
-      DLog "recovered promotion term $mt -> $recipient"
+      DLog "completed recorded manual handoff term $mt -> $recipient"
     }
     elseif ($global:DUET_CURRENT_TERM -eq $mt -and $global:DUET_CURRENT_LEADER -eq $recipient) {
-      if (-not (Set-DuetFailedLeader -DuetDir $DuetDir -Name $failed -Term $prior -Reason $reason)) { return $false }
-      $wf = Join-Path $DuetDir 'watchdog'
-      $watchdogCount = Get-DuetFirstLineValue -Path $wf -Key 'count'
-      $wok = ((Get-DuetFirstLineValue -Path $wf -Key 'session') -eq $Sid -and (Get-DuetFirstLineValue -Path $wf -Key 'term') -eq $mt `
-        -and (Get-DuetFirstLineValue -Path $wf -Key 'leader') -eq $recipient -and $null -ne (ConvertFrom-DuetDecimal $watchdogCount))
-      if (-not $wok) { if (-not (Write-DuetWatchdog -DuetDir $DuetDir -Session $Sid -Term $mt -Leader $recipient -Count '0')) { return $false } }
+      if (-not (Test-Path -LiteralPath ($file + '.promotion_term')) -and -not (SC-Set $file 'promotion_term' $mt)) { return $false }
     }
-    else { DLog "quarantined obsolete promotion intent $(Split-Path -Leaf $file)"; if (-not (Quarantine $box $file 'obsolete-promotion')) { return $false } }
+    else { DLog "quarantined obsolete manual handoff $(Split-Path -Leaf $file)"; if (-not (Quarantine $box $file 'obsolete-promotion')) { return $false } }
   }
   return $true
 }
@@ -231,7 +182,6 @@ function Collect-Candidates {
     if ($priority -eq 3 -and -not (Retry-Due $file)) { continue }
     $order = Get-DuetFirstLineValue -Path $file -Key 'order'; if ($order -notmatch '^[0-9]+$') { $order = '0000000000' }
     $ct = Candidate-Target $queue $file
-    if ($queue -eq 'leader' -and $ct.Name -eq 'NONE') { continue }
     $out += [pscustomobject]@{ Priority = $priority; Order = $order; Key = $ct.Key; Box = $box.FullName; File = $file }
   }
   return $out
@@ -262,7 +212,7 @@ function Process-One([string]$Box, [string]$File) {
   $symbolic = $false
   switch ($queue) {
     'leader' { if ($global:DUET_MESSAGE_RECIPIENT -ne 'leader') { return (Finish-Quarantine $Box $File 'recipient-queue-mismatch') }; $symbolic = $true }
-    'promotions' { if ($global:DUET_MESSAGE_ORIGIN -ne 'SYSTEM' -or $global:DUET_MESSAGE_RECIPIENT -eq 'leader') { return (Finish-Quarantine $Box $File 'invalid-promotion-envelope') }; $symbolic = $true }
+    'promotions' { if ($global:DUET_MESSAGE_ORIGIN -ne 'SYSTEM' -or $global:DUET_MESSAGE_HANDOFF_MODE -ne 'MANUAL' -or $global:DUET_MESSAGE_RECIPIENT -eq 'leader') { return (Finish-Quarantine $Box $File 'invalid-promotion-envelope') }; $symbolic = $true }
     default { if ($global:DUET_MESSAGE_RECIPIENT -ne $queue) { return (Finish-Quarantine $Box $File 'recipient-queue-mismatch') } }
   }
 
@@ -331,7 +281,7 @@ function Process-One([string]$Box, [string]$File) {
 
   $harness = if ($row) { $row.harness } else { '' }
   $panePid = if ($row) { $row.pane_pid } else { '' }
-  $memberRes = if ($targetName -and $targetName -ne 'NONE' -and $row) { Get-DuetMemberResolution -RosterPath $RosterPath -Name $targetName } else { [pscustomobject]@{ Known = $true; Alive = $false; Target = $null } }
+  $memberRes = if ($targetName -and $row) { Get-DuetMemberResolution -RosterPath $RosterPath -Name $targetName } else { [pscustomobject]@{ Known = $true; Alive = $false; Target = $null } }
 
   $attemptText = SC-Get $File 'tries'
   if (-not $attemptText) { [uint64]$attempts = 0 }
@@ -348,7 +298,7 @@ function Process-One([string]$Box, [string]$File) {
   $result = $null
   $continuation = $false; $clearRecovery = $false
 
-  if ($targetName -eq 'NONE' -or -not $targetPane -or -not ($memberRes.Known -and $memberRes.Alive)) {
+  if (-not $targetPane -or -not ($memberRes.Known -and $memberRes.Alive)) {
     if ($memberRes.Known) { $result = [pscustomobject]@{ Code = $global:DUET_SEND_DEAD } }
     else { DLog "target $targetName unresolved (UNKNOWN); deferring $($global:DUET_MESSAGE_ID)"; if (-not (Set-Backoff $File ([Math]::Max(1, $attempts)))) { return $false }; return $true }
   }
@@ -374,10 +324,6 @@ function Process-One([string]$Box, [string]$File) {
     if ($result.LandingObserved) { if (-not (SC-Set $File 'landing_observed' $result.LandingObserved)) { return $false }; $landingObs = $result.LandingObserved }
   }
   $rc = [int]$result.Code
-
-  if ($clearRecovery) { }
-  elseif ($continuation) { if (-not (Watchdog-RecordOutcome $targetName $targetTerm 'ENTER_ONLY' $rc)) { return $false } }
-  else { if (-not (Watchdog-RecordOutcome $targetName $targetTerm $phase $rc)) { return $false } }
 
   # CLEAR_RETRY outcome handling.
   if ($clearRecovery) {

@@ -11,6 +11,7 @@ $ErrorActionPreference = 'Continue'
 . (Join-Path (Split-Path -Parent $PSCommandPath) 'duet-common.ps1')
 
 $script:IssueCount = 0
+$script:DoctorResolution = @{}
 function Add-DuetDoctorIssue { param([string]$Message); $script:IssueCount++; Write-Output "ISSUE: $Message" }
 function Add-DuetDoctorOk { param([string]$Message); Write-Output "OK: $Message" }
 
@@ -103,41 +104,30 @@ if ($rosterValid) {
   foreach ($row in $script:DoctorRoster) {
     if ($row.name -ne $cfg['DUET_INITIATOR'] -and $row.spawned -ne '1') { Add-DuetDoctorIssue "worker '$($row.name)' is not marked spawned" }
     $res = Resolve-DuetPaneResolution -PaneId $row.pane_id -PanePid $row.pane_pid
+    $script:DoctorResolution[$row.name] = $res
     $state = if (-not $res.Known) { 'UNKNOWN' } elseif ($res.Alive) { 'alive' } else { 'dead' }
     Write-Output ("PANE: {0} harness={1} rank={2} tuple={3}/{4} state={5}" -f $row.name, $row.harness, $row.rank, $row.pane_id, $row.pane_pid, $state)
     if (-not $res.Known) { Add-DuetDoctorIssue "member '$($row.name)' pane state is unknown" }
+    if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $DuetDir 'ready') $row.name))) { Add-DuetDoctorIssue "readiness marker missing for '$($row.name)'" }
   }
   Add-DuetDoctorOk 'roster schema and tuple uniqueness checked'
 }
 
 if (-not (Read-DuetLeaderState -DuetDir $DuetDir)) { Add-DuetDoctorIssue 'leadership state is invalid' }
 else {
-  if ($global:DUET_CURRENT_LEADER -ne 'NONE' -and -not @($script:DoctorRoster | Where-Object { $_.name -eq $global:DUET_CURRENT_LEADER })) { Add-DuetDoctorIssue "leader '$($global:DUET_CURRENT_LEADER)' is not in the roster" }
-  if ($global:DUET_CURRENT_LEADER -ne 'NONE' -and (Test-Path -LiteralPath (Join-Path (Join-Path $DuetDir 'failed-leaders') $global:DUET_CURRENT_LEADER))) { Add-DuetDoctorIssue 'current leader is also marked as a failed leader' }
-}
-
-$memberNames = @{}; foreach ($row in $script:DoctorRoster) { $memberNames[$row.name] = $true }
-$failedDir = Join-Path $DuetDir 'failed-leaders'
-if (Test-Path -LiteralPath $failedDir) {
-  foreach ($file in @(Get-ChildItem -LiteralPath $failedDir -File -ErrorAction SilentlyContinue)) {
-    if (-not $memberNames.ContainsKey($file.Name)) { Add-DuetDoctorIssue "failed-leader record names nonmember '$($file.Name)'" }
+  $leaderRows = @($script:DoctorRoster | Where-Object { $_.name -eq $global:DUET_CURRENT_LEADER })
+  if ($leaderRows.Count -ne 1) { Add-DuetDoctorIssue "leader '$($global:DUET_CURRENT_LEADER)' is not represented exactly once in the roster" }
+  foreach ($row in $script:DoctorRoster) {
+    if (-not $script:DoctorResolution.ContainsKey($row.name)) { continue }
+    $resolution = $script:DoctorResolution[$row.name]
+    if ($resolution.Known -and -not $resolution.Alive) {
+      if ($row.name -eq $global:DUET_CURRENT_LEADER) { Add-DuetDoctorIssue "leader '$($row.name)' is confirmed dead; an operator must choose a manual handoff target" }
+      else { Add-DuetDoctorIssue "member '$($row.name)' is confirmed dead" }
+    }
   }
 }
 
-$watchdog = Join-Path $DuetDir 'watchdog'
-$wdSession = Get-DuetFirstLineValue $watchdog 'session'; $wdTerm = Get-DuetFirstLineValue $watchdog 'term'
-$wdLeader = Get-DuetFirstLineValue $watchdog 'leader'; $wdCount = Get-DuetFirstLineValue $watchdog 'count'
-if ($wdSession -ne $Sid) { Add-DuetDoctorIssue 'watchdog session does not match config' }
-if ($wdTerm -ne $global:DUET_CURRENT_TERM -or $wdLeader -ne $global:DUET_CURRENT_LEADER) { Add-DuetDoctorIssue 'watchdog term/leader does not match leadership state' }
-[long]$wdCountValue = 0; if (-not [long]::TryParse([string]$wdCount, [ref]$wdCountValue) -or $wdCountValue -lt 0) { Add-DuetDoctorIssue 'watchdog count is invalid' }
-
-$noSuccessor = Join-Path $DuetDir 'no-successor'
-if ($global:DUET_CURRENT_LEADER -eq 'NONE' -and -not (Test-Path -LiteralPath $noSuccessor)) { Add-DuetDoctorIssue 'leader is NONE but no-successor record is missing' }
-if ($global:DUET_CURRENT_LEADER -ne 'NONE' -and (Test-Path -LiteralPath $noSuccessor)) { Add-DuetDoctorIssue 'stale no-successor record exists while a leader is active' }
-if (Test-Path -LiteralPath $noSuccessor) {
-  if ((Get-DuetFirstLineValue $noSuccessor 'session') -ne $Sid) { Add-DuetDoctorIssue 'no-successor record has a foreign session' }
-  if ((Get-DuetFirstLineValue $noSuccessor 'term') -ne $global:DUET_CURRENT_TERM) { Add-DuetDoctorIssue 'no-successor record term does not match leadership state' }
-}
+$memberNames = @{}; foreach ($row in $script:DoctorRoster) { $memberNames[$row.name] = $true }
 
 $promotionObligations = 0
 $inbox = Join-Path $DuetDir 'inbox'
@@ -153,12 +143,16 @@ else {
       if (@('leader', 'promotions') -notcontains $box.Name -and $global:DUET_MESSAGE_RECIPIENT -ne $box.Name) { Add-DuetDoctorIssue "named queue payload $($file.Name) redirects to $($global:DUET_MESSAGE_RECIPIENT)" }
       if ($box.Name -eq 'promotions') {
         $promotionObligations++
-        if ($global:DUET_MESSAGE_TERM -ne $global:DUET_CURRENT_TERM -or $global:DUET_MESSAGE_RECIPIENT -ne $global:DUET_CURRENT_LEADER) { Add-DuetDoctorIssue "pending promotion $($file.Name) does not target the current term/leader" }
+        $preCas = ($global:DUET_MESSAGE_PRIOR_TERM -eq $global:DUET_CURRENT_TERM -and $global:DUET_MESSAGE_PRIOR_LEADER -eq $global:DUET_CURRENT_LEADER)
+        $postCas = ($global:DUET_MESSAGE_TERM -eq $global:DUET_CURRENT_TERM -and $global:DUET_MESSAGE_RECIPIENT -eq $global:DUET_CURRENT_LEADER)
+        if ($global:DUET_MESSAGE_HANDOFF_MODE -ne 'MANUAL' -or -not $memberNames.ContainsKey($global:DUET_MESSAGE_PRIOR_LEADER) `
+            -or -not $memberNames.ContainsKey($global:DUET_MESSAGE_RECIPIENT)) { Add-DuetDoctorIssue "pending handoff $($file.Name) has an invalid manual intent" }
+        elseif (-not $preCas -and -not $postCas) { Add-DuetDoctorIssue "pending handoff $($file.Name) is obsolete for the current leader generation" }
       }
     }
   }
 }
-if ($promotionObligations -gt 1) { Add-DuetDoctorIssue "$promotionObligations simultaneous promotion obligations are active" }
+if ($promotionObligations -gt 1) { Add-DuetDoctorIssue "$promotionObligations simultaneous manual handoff obligations are active" }
 
 Test-DuetDoctorWorkdirFence -Config $cfg -DuetDir $DuetDir -Ended $ended
 

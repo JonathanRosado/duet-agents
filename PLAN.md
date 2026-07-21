@@ -1,9 +1,13 @@
-# Plan: duet → n-agent ensemble protocol (v0.2.0–0.2.1)
+# Historical plan: duet to n-agent ensemble protocol (v0.2.0-v0.2.1)
 
-> **Status:** v0.2.1 completes the Windows/psmux port of the queued ensemble
-> protocol described below. The original v0.2.0 Bash/tmux milestone is retained
-> here as design history; matching `.ps1` scripts, harnesses, tests, session
-> fences, delivery queues, and failover are now implemented.
+> **Archived design history:** Everything below this notice describes the
+> v0.2 implementation plan and is non-normative for v0.3.0. Current behavior is
+> specified in `README.md`, `plugins/duet/skills/duet/SKILL.md`, and the briefs.
+>
+> In v0.3.0, automatic election, watchdog counters, ranked succession, and
+> failed-leader exclusion were removed. The initiator leads until an operator
+> explicitly selects a live target. Generation and delivery fences remain, and
+> the daemon may finish only an exact recorded MANUAL handoff.
 
 Evolve the duet plugin from a hardcoded 2-agent (Claude+Codex) protocol to an
 n-agent protocol (target 3 concurrent harnesses, protocol designed for up to 5),

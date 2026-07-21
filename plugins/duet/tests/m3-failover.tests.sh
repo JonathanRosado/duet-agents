@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Deterministic M3 failover, fencing, and session-isolation tests.
+# Deterministic M3 manual-handoff, fencing, and session-isolation tests.
 #
 # The suite owns two isolated tmux servers whose panes run plain Bash only. It
 # never starts Claude, Codex, or Kimi; never addresses the default tmux server;
 # and never reads or writes ~/.duet/current.
 set -u
 set -o pipefail
+
+# The gate may be launched from an active psmux pane on Windows. Its tmux
+# compatibility shim must not inherit the caller's session routing.
+unset TMUX TMUX_PANE PSMUX_SESSION PSMUX_PANE PSMUX_TARGET_SESSION
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$TEST_DIR/.." && pwd)"
@@ -254,6 +258,14 @@ stage_message(){
     "$origin" "$leader_at_send" "$body" "$dedupe" || return 1
   STAGED_FILE="$DUET_ENQUEUED_FILE"
   STAGED_ID="$DUET_ENQUEUED_ID"
+}
+
+stage_manual_handoff_intent(){
+  local target="$1" new_term="$2" prior_term="$3" prior_leader="$4" body="$5"
+  DUET_HANDOFF_MODE=MANUAL DUET_HANDOFF_PRIOR_TERM="$prior_term" \
+    DUET_HANDOFF_PRIOR_LEADER="$prior_leader" \
+    stage_message promotions duet-system "$target" "$new_term" SYSTEM "$target" \
+      "$body" NORMAL "promotion-$new_term"
 }
 
 test_codex_collapsed_composer(){
@@ -520,8 +532,8 @@ test_refused_composer_clear_requeue(){
   assert_eq 0 "$(grep -c '^CLEAR' "$FAKE_LOG" 2>/dev/null || true)" \
     "recovery keys wait until CLEAR_RETRY is durable"
 
-  if duet_promote_locked 0 claude SOFT; then rc=0; else rc=$?; fi
-  assert_eq 11 "$rc" "CLEAR_RETRY blocks promotion CAS"
+  if duet_promote_locked 0 claude MANUAL kimi-1; then rc=0; else rc=$?; fi
+  assert_eq 11 "$rc" "CLEAR_RETRY blocks manual handoff CAS"
   duet_atomic_write "$message.retry_at" 0 || fail "could not make failed clear due"
   duet_deliverd_pass || { fail "failed clear-recovery pass failed"; return; }
   assert_eq CLEAR_RETRY "$(cat "$message.phase" 2>/dev/null || true)" \
@@ -568,7 +580,6 @@ test_clear_retry_raw_cas_poison(){
   : > "$FAKE_LOG"
   DUET_DELIVERY_RETRY_BASE=0
   duet_write_leader_state 1 codex-1 || { fail "could not promote fixture leader"; return; }
-  duet_watchdog_write 1 codex-1 0 || fail "could not stage fixture watchdog"
   FAKE_RC=$DUET_SEND_COMPOSER_REFUSED
   FAKE_LANDING_OBSERVED=marker
   FAKE_ENTER_TOKEN=codexPastedContent2048charsPastedContent2048chars
@@ -585,7 +596,6 @@ test_clear_retry_raw_cas_poison(){
   # is not a stale leader assignment, so its durable physical binding is the
   # only thing preventing the old pane from being released.
   duet_write_leader_state 2 kimi-1 || { fail "could not stage raw leader edit"; return; }
-  duet_watchdog_write 2 kimi-1 0 || fail "could not stage raw-edit watchdog"
   duet_candidate_target leader "$owner" || fail "could not resolve owner candidate"
   candidate="$DUET_CANDIDATE_NAME:$DUET_CANDIDATE_PANE"
   assert_eq "codex-1:$A_CODEX_PANE" "$candidate" \
@@ -605,105 +615,69 @@ test_clear_retry_raw_cas_poison(){
   assert_file "$newer" "new-term traffic waits behind old physical pane owner"
   assert_eq 1 "$(grep -c '^FULL' "$FAKE_LOG" 2>/dev/null || true)" \
     "no later paste reaches the poison-owned pane"
-  if duet_promote_locked 2 kimi-1 SOFT; then rc=0; else rc=$?; fi
-  assert_eq 11 "$rc" "raw-CAS CLEAR_RETRY continues to block later promotion"
+  if duet_promote_locked 2 kimi-1 MANUAL claude; then rc=0; else rc=$?; fi
+  assert_eq 11 "$rc" "raw-CAS CLEAR_RETRY continues to block later handoff"
 
   FAKE_RC=0
   FAKE_LANDING_OBSERVED=""
   FAKE_ENTER_TOKEN=""
 }
 
-test_promotion_cas_exclusion_no_successor(){
-  local rc
-  create_state promotion-cas
+test_manual_handoff_cas_and_return(){
+  local first rc
+  create_state manual-handoff-cas || return
   : > "$FAKE_LOG"
 
-  if duet_promote_locked 0 claude HARD; then rc=0; else rc=$?; fi
-  assert_eq 0 "$rc" "first promotion succeeds"
-  duet_read_leader_state || { fail "could not read first promoted state"; return; }
-  assert_eq 1 "$DUET_CURRENT_TERM" "first promotion term"
-  assert_eq codex-1 "$DUET_CURRENT_LEADER" "rank-one successor"
-  assert_file "$DUET_DIR/failed-leaders/claude" "failed incumbent exclusion"
-  assert_file "$DUET_PROMOTION_FILE" "durable promotion intent"
-  assert_eq 0 "$(cat "$DUET_PROMOTION_FILE.prior_term" 2>/dev/null || true)" \
-    "promotion intent prior term"
-  assert_eq 1 "$(cat "$DUET_PROMOTION_FILE.promotion_term" 2>/dev/null || true)" \
-    "promotion intent target term"
+  if duet_promote_locked 0 claude MANUAL kimi-1; then rc=0; else rc=$?; fi
+  assert_eq 0 "$rc" "explicit rank-two target is accepted"
+  [ "$rc" -eq 0 ] || return
+  duet_read_leader_state || { fail "could not read first handoff state"; return; }
+  assert_eq '1:kimi-1' "$DUET_CURRENT_TERM:$DUET_CURRENT_LEADER" \
+    "operator target, not roster rank, becomes leader"
+  first="$DUET_PROMOTION_FILE"
+  assert_file "$first" "durable manual handoff intent"
+  duet_read_message "$first" || { fail "manual handoff envelope is unreadable"; return; }
+  assert_eq MANUAL "$DUET_MESSAGE_HANDOFF_MODE" "manual intent marker"
+  assert_eq 0 "$DUET_MESSAGE_PRIOR_TERM" "manual intent prior generation"
+  assert_eq claude "$DUET_MESSAGE_PRIOR_LEADER" "neutral prior leader record"
+  assert_no_file "$DUET_DIR/failed-leaders/claude" \
+    "handoff creates no permanent exclusion metadata"
 
-  if duet_promote_locked 0 claude HARD; then rc=0; else rc=$?; fi
-  assert_eq 2 "$rc" "stale promotion CAS is rejected"
-  duet_read_leader_state || return
-  assert_eq 1 "$DUET_CURRENT_TERM" "stale CAS does not increment term"
+  if duet_promote_locked 0 claude MANUAL codex-1; then rc=0; else rc=$?; fi
+  assert_eq 2 "$rc" "stale handoff CAS is rejected"
+  assert_eq '1:kimi-1' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
+    "stale CAS does not change leadership"
 
-  if duet_promote_locked 1 codex-1 HARD; then rc=0; else rc=$?; fi
-  assert_eq 0 "$rc" "second promotion succeeds"
-  duet_read_leader_state || return
-  assert_eq kimi-1 "$DUET_CURRENT_LEADER" \
-    "failed rank-zero incumbent is never re-elected"
-  assert_file "$DUET_DIR/failed-leaders/codex-1" "second incumbent exclusion"
-
-  if duet_promote_locked 2 kimi-1 HARD; then rc=0; else rc=$?; fi
-  assert_eq 10 "$rc" "no-live-successor outcome"
-  duet_read_leader_state || return
-  assert_eq 3 "$DUET_CURRENT_TERM" "terminal term increments once"
-  assert_eq NONE "$DUET_CURRENT_LEADER" "terminal leader is NONE"
-  assert_file "$DUET_DIR/no-successor" "durable no-successor marker"
-  assert_eq 3 "$(field "$DUET_DIR/no-successor" term)" "no-successor term"
+  if duet_promote_locked 1 kimi-1 MANUAL claude; then rc=0; else rc=$?; fi
+  assert_eq 0 "$rc" "prior leader may be selected again"
+  assert_eq '2:claude' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
+    "manual promote-back advances exactly one generation"
 }
 
-test_force_rejected_and_manual_eligible_target(){
-  local rc leader_before watchdog_before counter_before output
-  create_state force-rejected || return
+test_manual_handoff_requires_target_and_rejects_force(){
+  local counter_before output rc
+  create_state manual-target-required || return
+  counter_before="$(cat "$DUET_DIR/inbox/promotions/.counter" 2>/dev/null || true)"
 
-  if duet_promote_locked 0 claude HARD; then rc=0; else rc=$?; fi
-  assert_eq 0 "$rc" "initial failure promotes to rank-one successor"
-  assert_file "$DUET_DIR/failed-leaders/claude" \
-    "initial failed leader is automatically excluded"
-  leader_before="$(cat "$DUET_DIR/leader")"
-  watchdog_before="$(cat "$DUET_DIR/watchdog")"
-  counter_before="$(cat "$DUET_DIR/inbox/promotions/.counter")"
-
-  if duet_promote_locked 1 codex-1 MANUAL claude 1; then rc=0; else rc=$?; fi
-  assert_eq 3 "$rc" "internal force bypass is rejected"
-  assert_eq "$leader_before" "$(cat "$DUET_DIR/leader")" \
-    "rejected internal force leaves leader state unchanged"
-  assert_eq "$watchdog_before" "$(cat "$DUET_DIR/watchdog")" \
-    "rejected internal force leaves watchdog unchanged"
-  assert_eq "$counter_before" "$(cat "$DUET_DIR/inbox/promotions/.counter")" \
-    "rejected internal force publishes no promotion"
-  assert_file "$DUET_DIR/failed-leaders/claude" \
-    "rejected internal force preserves permanent exclusion"
-  assert_no_file "$DUET_DIR/failed-leaders/codex-1" \
-    "rejected internal force does not exclude incumbent"
+  if duet_promote_locked 0 claude MANUAL; then rc=0; else rc=$?; fi
+  assert_eq 3 "$rc" "core requires an explicit target"
+  assert_eq "$counter_before" \
+    "$(cat "$DUET_DIR/inbox/promotions/.counter" 2>/dev/null || true)" \
+    "missing target publishes no intent"
 
   output="$TEST_ROOT/force-rejected.out"
-  if DUET_CONFIG="$CURRENT_CONFIG" bash "$SCRIPTS_DIR/duet-promote.sh" \
-      --session "$CURRENT_CONFIG" --to claude --force > "$output" 2>&1; then
-    rc=0
-  else
-    rc=$?
-  fi
-  assert_eq 2 "$rc" "CLI rejects removed --force option"
+  if bash "$SCRIPTS_DIR/duet-promote.sh" --to codex-1 --force \
+      > "$output" 2>&1; then rc=0; else rc=$?; fi
+  assert_eq 2 "$rc" "CLI rejects a force bypass"
   assert_contains "$output" 'force is not supported' \
-    "CLI force refusal is actionable"
-  assert_eq "$leader_before" "$(cat "$DUET_DIR/leader")" \
-    "CLI force refusal leaves leader state unchanged"
-  assert_eq "$counter_before" "$(cat "$DUET_DIR/inbox/promotions/.counter")" \
-    "CLI force refusal publishes no promotion"
-
-  if duet_promote_locked 1 codex-1 MANUAL kimi-1; then rc=0; else rc=$?; fi
-  assert_eq 0 "$rc" "ordinary manual --to accepts an eligible member"
-  duet_read_leader_state || return
-  assert_eq 2 "$DUET_CURRENT_TERM" "ordinary manual promotion advances term"
-  assert_eq kimi-1 "$DUET_CURRENT_LEADER" \
-    "ordinary manual promotion selects requested eligible target"
+    "force refusal tells the operator to resolve uncertainty"
 }
 
 test_promotion_dedupe_target_mismatch(){
   local existing counter_before rc
   create_state promotion-dedupe-mismatch || return
-  stage_message promotions duet-system codex-1 1 SYSTEM codex-1 \
-    'preexisting term-one promotion intent' NORMAL promotion-1 \
+  stage_manual_handoff_intent codex-1 1 0 claude \
+    'preexisting generation-one manual handoff intent' \
     || { fail "could not stage existing promotion intent"; return; }
   existing="$STAGED_FILE"
   counter_before="$(cat "$DUET_DIR/inbox/promotions/.counter" 2>/dev/null || true)"
@@ -733,41 +707,6 @@ test_promotion_dedupe_target_mismatch(){
     "reconciliation commits only the original promotion target"
 }
 
-test_promotion_reconciliation(){
-  local intent base before
-  create_state promotion-reconcile
-  stage_message promotions duet-system codex-1 1 SYSTEM codex-1 \
-    'recover this promotion' NORMAL promotion-1 \
-    || { fail "could not stage promotion intent"; return; }
-  intent="$STAGED_FILE"
-  duet_atomic_write "$intent.prior_term" 0 || fail "could not stage prior term"
-  duet_atomic_write "$intent.failed" claude || fail "could not stage failed incumbent"
-  duet_atomic_write "$intent.reason" RECOVERY || fail "could not stage reason"
-  duet_atomic_write "$intent.promotion_term" 1 || fail "could not stage promotion term"
-
-  duet_reconcile_promotion_intents || { fail "promotion intent reconciliation failed"; return; }
-  duet_read_leader_state || return
-  assert_eq 1 "$DUET_CURRENT_TERM" "recovered promotion term"
-  assert_eq codex-1 "$DUET_CURRENT_LEADER" "recovered successor"
-  assert_file "$DUET_DIR/failed-leaders/claude" "recovery persists incumbent exclusion"
-  assert_file "$intent" "reconciled intent remains due for delivery"
-  before="$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)"
-  duet_reconcile_promotion_intents || fail "repeat promotion reconciliation failed"
-  assert_eq "$before" "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
-    "promotion reconciliation is idempotent"
-
-  create_state no-successor-reconcile
-  base="$DUET_DIR/no-successor"
-  duet_atomic_write "$base" "$(printf 'session\t%s\nfrom_term\t0\nterm\t1\nfailed\tclaude\nreason\tRECOVERY' \
-    "$DUET_SESSION_ID")" || { fail "could not stage no-successor intent"; return; }
-  duet_reconcile_no_successor || { fail "no-successor reconciliation failed"; return; }
-  duet_read_leader_state || return
-  assert_eq 1 "$DUET_CURRENT_TERM" "recovered terminal term"
-  assert_eq NONE "$DUET_CURRENT_LEADER" "recovered terminal leader"
-  duet_reconcile_no_successor || fail "repeat no-successor reconciliation failed"
-  assert_eq '1:NONE' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
-    "no-successor reconciliation is idempotent"
-}
 
 test_terminal_move_reconciliation(){
   local metadata_active metadata_terminal intent_active intent_terminal
@@ -775,15 +714,12 @@ test_terminal_move_reconciliation(){
   create_state terminal-move-reconcile || return
 
   # Crash after the immutable root reaches a terminal directory but before its
-  # durable promotion metadata and mutable delivery state are moved/cleared.
-  stage_message promotions duet-system codex-1 1 SYSTEM codex-1 \
-    'terminal metadata recovery' NORMAL promotion-1 \
+  # durable handoff metadata and mutable delivery state are moved/cleared.
+  stage_manual_handoff_intent codex-1 1 0 claude \
+    'terminal manual handoff metadata recovery' \
     || { fail "could not stage metadata fixture"; return; }
   metadata_active="$STAGED_FILE"
   metadata_terminal="$DUET_DIR/inbox/promotions/delivered/$(basename "$metadata_active")"
-  duet_atomic_write "$metadata_active.prior_term" 0 || fail "could not stage prior term"
-  duet_atomic_write "$metadata_active.failed" claude || fail "could not stage failed leader"
-  duet_atomic_write "$metadata_active.reason" HARD || fail "could not stage failure reason"
   duet_atomic_write "$metadata_active.promotion_term" 1 \
     || fail "could not stage promotion term"
   duet_atomic_write "$metadata_active.phase" INFLIGHT || fail "could not stage phase"
@@ -820,17 +756,13 @@ test_terminal_move_reconciliation(){
     || { fail "terminal move reconciliation failed"; return; }
 
   assert_file "$metadata_terminal" "terminal metadata immutable root"
-  assert_eq 0 "$(cat "$metadata_terminal.prior_term" 2>/dev/null || true)" \
-    "terminal prior term recovered"
-  assert_eq claude "$(cat "$metadata_terminal.failed" 2>/dev/null || true)" \
-    "terminal failed leader recovered"
-  assert_eq HARD "$(cat "$metadata_terminal.reason" 2>/dev/null || true)" \
-    "terminal failure reason recovered"
+  duet_read_message "$metadata_terminal" \
+    || { fail "terminal manual handoff envelope is unreadable"; return; }
+  assert_eq 0 "$DUET_MESSAGE_PRIOR_TERM" "terminal prior generation retained"
+  assert_eq claude "$DUET_MESSAGE_PRIOR_LEADER" "terminal prior leader retained"
+  assert_eq MANUAL "$DUET_MESSAGE_HANDOFF_MODE" "terminal manual marker retained"
   assert_eq 1 "$(cat "$metadata_terminal.promotion_term" 2>/dev/null || true)" \
     "terminal promotion term recovered"
-  assert_no_file "$metadata_active.prior_term" "active prior-term sidecar removed"
-  assert_no_file "$metadata_active.failed" "active failed sidecar removed"
-  assert_no_file "$metadata_active.reason" "active reason sidecar removed"
   assert_no_file "$metadata_active.promotion_term" "active promotion sidecar removed"
   assert_no_file "$metadata_active.phase" "orphaned delivery phase cleared"
   assert_no_file "$metadata_active.tries" "orphaned retry count cleared"
@@ -858,137 +790,121 @@ test_terminal_move_reconciliation(){
     "terminal move reconciliation is idempotent"
 }
 
-test_promotion_intent_crash_windows(){
-  local intent
+test_manual_handoff_intent_crash_windows(){
+  local foreign foreign_tmp intent malformed obsolete roster_edit
 
-  # The message root is durable before its promotion sidecars. Recover all
-  # derivable metadata, the exclusion marker, leader CAS, and watchdog.
-  create_state promotion-missing-sidecars || return
-  stage_message promotions duet-system codex-1 1 SYSTEM codex-1 \
-    'recover promotion without sidecars' NORMAL promotion-1 \
-    || { fail "could not stage sidecar-free promotion"; return; }
+  # Crash after publishing the immutable operator intent but before the CAS.
+  # Completion follows the recorded target even if its later health probe is
+  # inconclusive or stale; the daemon never selects a replacement.
+  create_state handoff-before-cas || return
+  stage_manual_handoff_intent codex-1 1 0 claude \
+    'complete this exact recorded operator handoff' \
+    || { fail "could not stage pre-CAS manual intent"; return; }
   intent="$STAGED_FILE"
+  roster_edit="$DUET_DIR/roster.edit"
+  awk -F '\t' 'BEGIN { OFS="\t" } $1 == "codex-1" { $4=99999999 } { print }' \
+    "$DUET_DIR/roster.tsv" > "$roster_edit" && mv "$roster_edit" "$DUET_DIR/roster.tsv"
   duet_reconcile_promotion_intents \
-    || { fail "sidecar-free promotion reconciliation failed"; return; }
-  assert_eq 0 "$(cat "$intent.prior_term" 2>/dev/null || true)" \
-    "missing prior term reconstructed"
-  assert_eq claude "$(cat "$intent.failed" 2>/dev/null || true)" \
-    "missing failed leader reconstructed"
-  assert_eq RECOVERY "$(cat "$intent.reason" 2>/dev/null || true)" \
-    "missing recovery reason reconstructed"
+    || { fail "pre-CAS manual intent reconciliation failed"; return; }
+  assert_eq '1:codex-1' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
+    "recovery completes only the recorded target without health re-decision"
   assert_eq 1 "$(cat "$intent.promotion_term" 2>/dev/null || true)" \
-    "missing promotion term reconstructed"
+    "pre-CAS recovery publishes the handoff generation"
+  duet_reconcile_promotion_intents || fail "repeat pre-CAS reconciliation failed"
   assert_eq '1:codex-1' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
-    "sidecar-free promotion completes leader CAS"
-  assert_file "$DUET_DIR/failed-leaders/claude" \
-    "sidecar-free promotion excludes failed incumbent"
-  assert_eq "$DUET_SESSION_ID" "$(field "$DUET_DIR/watchdog" session)" \
-    "sidecar-free promotion watchdog session"
-  assert_eq '1:codex-1:0' \
-    "$(field "$DUET_DIR/watchdog" term):$(field "$DUET_DIR/watchdog" leader):$(field "$DUET_DIR/watchdog" count)" \
-    "sidecar-free promotion initializes watchdog"
+    "pre-CAS recovery is idempotent"
 
-  # Crash after the leader CAS but before the next-term watchdog write. A
-  # stale prior-term watchdog models the state left by a normally running M2.
-  create_state promotion-cas-before-watchdog || return
-  stage_message promotions duet-system codex-1 1 SYSTEM codex-1 \
-    'recover promotion watchdog after CAS' NORMAL promotion-1 \
-    || { fail "could not stage post-CAS promotion"; return; }
+  # Crash after the CAS but before its derivable sidecar is published.
+  create_state handoff-after-cas || return
+  stage_manual_handoff_intent codex-1 1 0 claude \
+    'repair exact manual metadata after CAS' \
+    || { fail "could not stage post-CAS manual intent"; return; }
   intent="$STAGED_FILE"
-  duet_atomic_write "$intent.prior_term" 0 || fail "could not stage post-CAS prior term"
-  duet_atomic_write "$intent.failed" claude || fail "could not stage post-CAS failed leader"
-  duet_atomic_write "$intent.reason" HARD || fail "could not stage post-CAS reason"
-  duet_atomic_write "$intent.promotion_term" 1 \
-    || fail "could not stage post-CAS promotion term"
-  duet_mark_failed_leader claude 0 HARD || fail "could not stage failed incumbent"
-  duet_watchdog_write 0 claude 2 || fail "could not stage stale watchdog"
   duet_write_leader_state 1 codex-1 || fail "could not stage completed leader CAS"
-
   duet_reconcile_promotion_intents \
-    || { fail "post-CAS watchdog reconciliation failed"; return; }
+    || { fail "post-CAS manual intent reconciliation failed"; return; }
   assert_eq '1:codex-1' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
-    "post-CAS recovery does not advance leadership twice"
-  assert_eq "$DUET_SESSION_ID" "$(field "$DUET_DIR/watchdog" session)" \
-    "post-CAS watchdog session repaired"
-  assert_eq '1:codex-1:0' \
-    "$(field "$DUET_DIR/watchdog" term):$(field "$DUET_DIR/watchdog" leader):$(field "$DUET_DIR/watchdog" count)" \
-    "post-CAS watchdog is repaired to promoted term"
-  duet_reconcile_promotion_intents || fail "repeat post-CAS reconciliation failed"
-  assert_eq '1:codex-1' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
-    "post-CAS recovery is idempotent"
+    "post-CAS recovery never advances twice"
+  assert_eq 1 "$(cat "$intent.promotion_term" 2>/dev/null || true)" \
+    "post-CAS recovery repairs derivable metadata"
+
+  # A promotion-shaped message without the MANUAL tuple cannot mutate state.
+  create_state malformed-handoff-intent || return
+  stage_message promotions duet-system codex-1 1 SYSTEM codex-1 \
+    'not an operator handoff' NORMAL promotion-1 \
+    || { fail "could not stage malformed intent"; return; }
+  malformed="$STAGED_FILE"
+  duet_reconcile_promotion_intents || { fail "malformed reconciliation failed"; return; }
+  assert_eq '0:claude' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
+    "nonmanual message cannot mutate leadership"
+  assert_file "$DUET_DIR/inbox/promotions/quarantine/$(basename "$malformed")" \
+    "nonmanual promotion-shaped message is quarantined"
+
+  # A foreign-session handoff cannot hide behind the promotion scheduler's
+  # current-generation filter.
+  create_state foreign-handoff-intent || return
+  stage_manual_handoff_intent codex-1 1 0 claude 'foreign handoff fixture' \
+    || { fail "could not stage foreign intent"; return; }
+  foreign="$STAGED_FILE"
+  foreign_tmp="$DUET_DIR/inbox/promotions/.foreign-edit"
+  awk -F '\t' 'BEGIN { OFS="\t" } $1 == "session" { $2="other-session" } { print }' \
+    "$foreign" > "$foreign_tmp" && mv "$foreign_tmp" "$foreign"
+  duet_reconcile_promotion_intents || { fail "foreign intent reconciliation failed"; return; }
+  assert_eq '0:claude' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
+    "foreign handoff cannot mutate leadership"
+  assert_file "$DUET_DIR/inbox/promotions/quarantine/$(basename "$foreign")" \
+    "foreign handoff is terminalized instead of stalling the queue"
+
+  # An exact but obsolete tuple is quarantined instead of retargeted.
+  create_state obsolete-handoff-intent || return
+  stage_manual_handoff_intent codex-1 1 0 claude 'obsolete operator intent' \
+    || { fail "could not stage obsolete intent"; return; }
+  obsolete="$STAGED_FILE"
+  duet_write_leader_state 1 kimi-1 || fail "could not stage unrelated current state"
+  duet_reconcile_promotion_intents || { fail "obsolete reconciliation failed"; return; }
+  assert_eq '1:kimi-1' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
+    "obsolete intent cannot overwrite current leadership"
+  assert_file "$DUET_DIR/inbox/promotions/quarantine/$(basename "$obsolete")" \
+    "obsolete operator intent is quarantined"
 }
 
-test_no_successor_cas_before_watchdog(){
-  local journal
-  create_state no-successor-cas-before-watchdog || return
-  journal="$DUET_DIR/no-successor"
-  duet_atomic_write "$journal" "$(printf 'session\t%s\nfrom_term\t0\nterm\t1\nfailed\tclaude\nreason\tHARD' \
-    "$DUET_SESSION_ID")" || { fail "could not stage no-successor journal"; return; }
-  duet_mark_failed_leader claude 0 HARD || fail "could not stage terminal exclusion"
-  duet_watchdog_write 0 claude 3 || fail "could not stage terminal stale watchdog"
-  duet_write_leader_state 1 NONE || fail "could not stage terminal leader CAS"
-
-  duet_reconcile_no_successor \
-    || { fail "post-CAS no-successor reconciliation failed"; return; }
-  assert_eq '1:NONE' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
-    "no-successor recovery preserves terminal leadership"
-  assert_eq "$DUET_SESSION_ID" "$(field "$DUET_DIR/watchdog" session)" \
-    "no-successor watchdog session repaired"
-  assert_eq '1:NONE:0' \
-    "$(field "$DUET_DIR/watchdog" term):$(field "$DUET_DIR/watchdog" leader):$(field "$DUET_DIR/watchdog" count)" \
-    "no-successor watchdog is repaired after leader CAS"
-  assert_file "$journal" "no-successor journal remains durable"
-  assert_file "$DUET_DIR/failed-leaders/claude" \
-    "no-successor recovery preserves incumbent exclusion"
-  duet_reconcile_no_successor || fail "repeat post-CAS no-successor reconciliation failed"
-  assert_eq '1:NONE:0' \
-    "$(field "$DUET_DIR/watchdog" term):$(field "$DUET_DIR/watchdog" leader):$(field "$DUET_DIR/watchdog" count)" \
-    "post-CAS no-successor recovery is idempotent"
+test_daemon_never_decides_leadership(){
+  local roster_edit
+  create_state no-autonomous-handoff || return
+  roster_edit="$DUET_DIR/roster.edit"
+  awk -F '\t' 'BEGIN { OFS="\t" } $1 == "claude" { $4=99999999 } { print }' \
+    "$DUET_DIR/roster.tsv" > "$roster_edit" && mv "$roster_edit" "$DUET_DIR/roster.tsv"
+  duet_deliverd_pass || { fail "idle daemon pass failed"; return; }
+  assert_eq '0:claude' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
+    "daemon observes a dead leader without mutating leadership"
+  assert_eq 0 "$(active_message_count "$DUET_DIR/inbox/promotions")" \
+    "dead leader observation publishes no handoff intent"
+  declare -F duet_watchdog_check >/dev/null && fail "autonomous leadership checker still exists"
+  declare -F duet_reconcile_no_successor >/dev/null \
+    && fail "inferred no-successor transition still exists"
 }
 
-test_watchdog_counter_and_soft_promotion(){
-  create_state watchdog-soft
-  duet_watchdog_failure 0 claude || fail "first watchdog failure write"
-  duet_watchdog_failure 0 claude || fail "second watchdog failure write"
-  duet_watchdog_count 0 claude || fail "watchdog count read"
-  assert_eq 2 "$DUET_WATCHDOG_COUNT" "two failures do not yet promote"
-  duet_watchdog_write 0 claude 0 || fail "watchdog success reset"
-  duet_watchdog_count 0 claude || fail "watchdog reset read"
-  assert_eq 0 "$DUET_WATCHDOG_COUNT" "successful leader delivery resets failures"
-  duet_watchdog_failure 0 claude || fail "soft failure one"
-  duet_watchdog_failure 0 claude || fail "soft failure two"
-  duet_watchdog_failure 0 claude || fail "soft failure three"
-  duet_watchdog_check || { fail "soft watchdog promotion failed"; return; }
-  duet_read_leader_state || return
-  assert_eq 1 "$DUET_CURRENT_TERM" "third consecutive failure promotes"
-  assert_eq codex-1 "$DUET_CURRENT_LEADER" "soft promotion successor"
-  assert_contains "$DUET_DIR/failed-leaders/claude" $'reason\tSOFT' \
-    "soft incumbent exclusion reason"
-}
-
-test_delivery_watchdog_integration(){
+test_delivery_failure_has_no_leadership_side_effect(){
   local message
-  create_state delivery-watchdog
+  create_state delivery-failure-no-handoff
   : > "$FAKE_LOG"
   DUET_DELIVERY_RETRY_BASE=0
   FAKE_RC=$DUET_SEND_NOT_LANDED
-  stage_message leader codex-1 leader 0 WORKER claude 'leader failure probe' \
-    || { fail "could not stage leader failure probe"; return; }
+  stage_message leader codex-1 leader 0 WORKER claude 'leader delivery retry' \
+    || { fail "could not stage leader delivery retry"; return; }
   message="$STAGED_FILE"
 
   duet_deliverd_pass || { fail "first failed delivery pass"; return; }
-  duet_watchdog_count 0 claude || fail "first integrated watchdog count"
-  assert_eq 1 "$DUET_WATCHDOG_COUNT" "leader verifier failure increments watchdog"
   duet_atomic_write "$message.retry_at" 0 || fail "could not make retry due"
   duet_deliverd_pass || { fail "second failed delivery pass"; return; }
-  duet_watchdog_count 0 claude || fail "second integrated watchdog count"
-  assert_eq 2 "$DUET_WATCHDOG_COUNT" "second leader failure increments watchdog"
+  assert_eq '0:claude' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
+    "delivery failures never trigger leadership mutation"
+  assert_eq 0 "$(active_message_count "$DUET_DIR/inbox/promotions")" \
+    "delivery failures publish no handoff intent"
 
   FAKE_RC=0
   duet_atomic_write "$message.retry_at" 0 || fail "could not make success retry due"
   duet_deliverd_pass || { fail "successful leader delivery pass"; return; }
-  duet_watchdog_count 0 claude || fail "integrated watchdog reset read"
-  assert_eq 0 "$DUET_WATCHDOG_COUNT" "leader delivery success resets watchdog"
 }
 
 test_partial_inflight_binding_recovery(){
@@ -1032,7 +948,6 @@ test_term_fencing_and_worker_reroute(){
   local stale stale_terminal reply
   create_state term-fence
   duet_write_leader_state 1 codex-1 || { fail "could not stage promoted state"; return; }
-  duet_watchdog_write 1 codex-1 0 || fail "could not stage promoted watchdog"
   : > "$FAKE_LOG"
 
   stage_message codex-1 claude codex-1 0 LEADER claude \
@@ -1063,8 +978,8 @@ test_uncertain_composer_blocks_promotion_cas(){
   FAKE_ENTER_CLEAR=1
   FAKE_ENTER_OBSERVED=""
 
-  # The old leader's paste owns codex-1's composer when the soft watchdog
-  # fires. The original paste-buffer succeeded without a verified landing, so
+  # The old leader's paste owns codex-1's composer when the operator requests
+  # a handoff. The original paste-buffer succeeded without a verified landing, so
   # later probe absence alone is not positive evidence that the composer is
   # clean. The term must remain old until a verified continuation resolves.
   stage_message codex-1 claude codex-1 0 LEADER claude \
@@ -1084,18 +999,16 @@ test_uncertain_composer_blocks_promotion_cas(){
     || fail "could not persist uncertain phase"
   duet_atomic_write "$uncertain.retry_at" 0 \
     || fail "could not make uncertain continuation due"
-  duet_watchdog_write 0 claude 3 || fail "could not arm soft watchdog"
-
-  if duet_promote_locked 0 claude SOFT; then rc=0; else rc=$?; fi
-  assert_eq 11 "$rc" "direct promotion reports the uncertain-composer fence"
+  if duet_promote_locked 0 claude MANUAL codex-1; then rc=0; else rc=$?; fi
+  assert_eq 11 "$rc" "manual handoff reports the uncertain-composer fence"
   assert_eq '0:claude' \
     "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
-    "promotion CAS is deferred before any stale term exists"
-  assert_no_file "$DUET_DIR/failed-leaders/claude" \
-    "deferred promotion does not exclude the incumbent"
+    "handoff CAS is deferred before any stale generation exists"
+  assert_eq 0 "$(active_message_count "$DUET_DIR/inbox/promotions")" \
+    "blocked handoff publishes no intent"
 
   duet_deliverd_pass \
-    || { fail "dirty-composer watchdog pass failed"; return; }
+    || { fail "dirty-composer daemon pass failed"; return; }
   assert_eq '0:claude' \
     "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
     "unobserved landing keeps leadership on the old term despite probe absence"
@@ -1106,35 +1019,38 @@ test_uncertain_composer_blocks_promotion_cas(){
   assert_no_file "$DUET_DIR/inbox/codex-1/quarantine/$(basename "$uncertain")" \
     "probe absence without landing evidence is not terminalized"
   assert_eq 0 "$(grep -c '^FULL' "$FAKE_LOG" 2>/dev/null || true)" \
-    "no promotion or ordinary payload is pasted while composer is dirty"
+    "no handoff or ordinary payload is pasted while composer is dirty"
 
-  # A later verified Enter clears/submits the old assignment while term zero
-  # is still authoritative. The post-attempt watchdog may then CAS term one.
+  # A later verified Enter clears/submits the old assignment while generation
+  # zero is still authoritative. Leadership remains unchanged until an explicit
+  # retry records the operator's target.
   FAKE_ENTER_RC=0
   FAKE_ENTER_CLEAR=""
   duet_atomic_write "$uncertain.retry_at" 0 \
     || fail "could not retry uncertain continuation"
   duet_deliverd_pass \
-    || { fail "resolved-composer watchdog pass failed"; return; }
+    || { fail "resolved-composer daemon pass failed"; return; }
   assert_file "$DUET_DIR/inbox/codex-1/delivered/$(basename "$uncertain")" \
     "resolved old-term assignment reaches a terminal delivery state"
   assert_eq 0 "$(awk -F '\t' -v id="$uncertain_id" \
     '$1 == "ENTER" && $2 == id { print $5; exit }' "$FAKE_LOG")" \
     "old assignment is submitted only while its original term is current"
-  assert_eq '1:codex-1' \
+  assert_eq '0:claude' \
     "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
-    "watchdog promotes only after composer resolution"
-  promotion="$(find "$DUET_DIR/inbox/promotions" -maxdepth 1 -name 'N-*.msg' -print -quit)"
-  assert_file "$promotion" "promotion notice is queued after the guarded CAS"
+    "daemon never initiates a handoff after composer resolution"
+  if duet_promote_locked 0 claude MANUAL codex-1; then rc=0; else rc=$?; fi
+  assert_eq 0 "$rc" "operator retry succeeds after composer resolution"
+  promotion="$DUET_PROMOTION_FILE"
+  assert_file "$promotion" "manual handoff notice is queued before the CAS"
   promotion_id="$(field "$promotion" id)"
   assert_eq 0 "$(grep -c '^FULL' "$FAKE_LOG" 2>/dev/null || true)" \
-    "promotion notice waits for the next rebuilt scheduler pass"
+    "manual handoff notice waits for the next rebuilt scheduler pass"
 
   duet_deliverd_pass \
-    || { fail "post-composer promotion pass failed"; return; }
+    || { fail "post-composer handoff pass failed"; return; }
   first_full="$(awk -F '\t' '$1 == "FULL" { print $2; exit }' "$FAKE_LOG")"
   assert_eq "$promotion_id" "$first_full" \
-    "promotion notice is the first new payload after composer resolution"
+    "manual handoff notice is the first new payload after composer resolution"
   FAKE_ENTER_RC=0
   FAKE_ENTER_CLEAR=""
   FAKE_ENTER_OBSERVED=""
@@ -1177,8 +1093,8 @@ test_inflight_owner_precedes_newer_interrupt(){
   assert_eq 0 "$(grep -c '^FULL' "$FAKE_LOG" 2>/dev/null || true)" \
     "evidence-less INFLIGHT recovery never repastes"
   assert_file "$interrupt" "newer interrupt waits behind poisoned ownership"
-  if duet_promote_locked 0 claude SOFT; then rc=0; else rc=$?; fi
-  assert_eq 11 "$rc" "poisoned INFLIGHT recovery continues to fence promotion"
+  if duet_promote_locked 0 claude MANUAL kimi-1; then rc=0; else rc=$?; fi
+  assert_eq 11 "$rc" "poisoned INFLIGHT recovery continues to fence handoff"
 
   FAKE_FOREIGN_MARKER=""
   FAKE_ENTER_RC=0
@@ -1237,8 +1153,8 @@ test_marker_evidence_without_token_stays_poisoned(){
     "marker-only crash state is not delivered"
   assert_no_file "$DUET_DIR/inbox/codex-1/quarantine/$(basename "$owner")" \
     "apparent composer absence cannot terminalize marker-only crash state"
-  if duet_promote_locked 0 claude SOFT; then rc=0; else rc=$?; fi
-  assert_eq 11 "$rc" "marker-only crash state continues to fence promotion"
+  if duet_promote_locked 0 claude MANUAL kimi-1; then rc=0; else rc=$?; fi
+  assert_eq 11 "$rc" "marker-only crash state continues to fence handoff"
 
   FAKE_ENTER_RC=0
   FAKE_ENTER_CLEAR=""
@@ -1288,12 +1204,13 @@ test_foreign_payload_quarantine(){
     "foreign notice reconciliation is deduplicated"
 }
 
-test_pane_coalescing_and_promotion_priority(){
+test_pane_coalescing_and_handoff_priority(){
   local promotion promotion_id concrete symbolic other codex_calls first_codex_id
   create_state pane-coalesce
   : > "$FAKE_LOG"
   FAKE_RC=0
-  duet_promote_locked 0 claude HARD || { fail "could not stage promotion"; return; }
+  duet_promote_locked 0 claude MANUAL codex-1 \
+    || { fail "could not stage manual handoff"; return; }
   promotion="$DUET_PROMOTION_FILE"
   promotion_id="$(field "$promotion" id)"
   stage_message codex-1 duet-system codex-1 1 SYSTEM codex-1 \
@@ -1312,11 +1229,11 @@ test_pane_coalescing_and_promotion_priority(){
   first_codex_id="$(awk -F '\t' '$1 == "FULL" && $3 == "codex-1" { print $2; exit }' \
     "$FAKE_LOG")"
   assert_eq 1 "$codex_calls" "one bounded attempt per resolved pane per pass"
-  assert_eq "$promotion_id" "$first_codex_id" "promotion notice is strictly first"
+  assert_eq "$promotion_id" "$first_codex_id" "handoff notice is strictly first"
   assert_file "$DUET_DIR/inbox/promotions/delivered/$(basename "$promotion")" \
-    "promotion notice delivered"
-  assert_file "$concrete" "concrete traffic waits behind promotion"
-  assert_file "$symbolic" "symbolic traffic waits behind promotion"
+    "handoff notice delivered"
+  assert_file "$concrete" "concrete traffic waits behind handoff"
+  assert_file "$symbolic" "symbolic traffic waits behind handoff"
   assert_file "$DUET_DIR/inbox/kimi-1/delivered/$(basename "$other")" \
     "independent pane advances during promotion pass"
 }
@@ -1377,7 +1294,6 @@ test_status_and_doctor_healthy_fixture(){
     duet_atomic_write "$DUET_DIR/ready/$name" ready \
       || fail "could not stage readiness for $name"
   done
-  duet_watchdog_write 0 claude 0 || fail "could not stage healthy watchdog"
   assert_eq "$DUET_DIR" \
     "$(cat "$DUET_STATE_ROOT/workdirs/$DUET_WORKDIR_KEY.active" 2>/dev/null || true)" \
     "diagnostic fixture owns its active workdir registry"
@@ -1399,12 +1315,12 @@ test_status_and_doctor_healthy_fixture(){
     "status reports pinned session"
   assert_contains "$status_output" 'workdir fence : owned key=' \
     "status reports owned workdir fence"
-  assert_contains "$status_output" 'leadership    : term=0 leader=claude' \
+  assert_contains "$status_output" 'leadership    : generation=0 leader=claude' \
     "status reports healthy leadership"
   assert_contains "$status_output" 'daemon        : alive pid=' \
     "status reports live daemon"
-  assert_contains "$status_output" 'watchdog      : count=0 term=0 leader=claude' \
-    "status reports synchronized watchdog"
+  assert_contains "$status_output" 'mode          : manual handoff only' \
+    "status reports operator-controlled leadership"
 
   doctor_output="$TEST_ROOT/doctor-healthy.out"
   if env -u DUET_CONFIG -u DUET_SESSION -u TMUX -u TMUX_PANE -u DUET_SELF \
@@ -1469,24 +1385,76 @@ test_explicit_session_and_membership_fence(){
   assert_no_file "$dir_b/inbox/leader/.counter" \
     "cross-session refusal publishes no message"
 
+  output="$TEST_ROOT/external-promote-no-pin.out"
+  if env -u TMUX -u TMUX_PANE -u DUET_SESSION -u DUET_SELF \
+      DUET_CONFIG="$config_b" DUET_STATE_ROOT="$STATE_ROOT" \
+      bash "$SCRIPTS_DIR/duet-promote.sh" --to claude > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "external handoff requires an explicit session argument"
+  assert_contains "$output" 'external shell must pin' \
+    "external handoff refusal is actionable"
+
+  output="$TEST_ROOT/cross-session-promote.out"
+  if env -u DUET_SESSION -u DUET_SELF \
+      TMUX="$TMUX_SOCKET_A,$TMUX_SERVER_PID_A,0" TMUX_PANE="$A_INIT_PANE" \
+      DUET_CONFIG="$config_b" DUET_STATE_ROOT="$STATE_ROOT" \
+      bash "$SCRIPTS_DIR/duet-promote.sh" --session "$config_b" --to claude \
+      > "$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  assert_eq 7 "$rc" "known member of another session cannot hand off the target session"
+  assert_contains "$output" "not pinned session 'member-b'" \
+    "cross-session handoff refusal names the pinned session"
+
   kill -TERM "$daemon_pid" 2>/dev/null || true
   wait "$daemon_pid" 2>/dev/null || true
   rm -f "$dir_b/daemon.pid" "$dir_b/.daemon.lock"
 }
 
-test_leader_name_path_fence(){
-  local escaped="$STATE_ROOT/escaped-leader" rc
-  create_state leader-name-fence || return
-  printf 'term\t0\nleader\t../../escaped-leader\n' > "$DUET_DIR/leader"
-  if duet_read_leader_state >/dev/null 2>&1; then rc=0; else rc=$?; fi
-  assert_eq 1 "$rc" "leadership state rejects path-like leader name"
-  if duet_mark_failed_leader ../../escaped-leader 0 TEST >/dev/null 2>&1; then
+test_handoff_cli_from_surviving_nonleader(){
+  local daemon_pid intent output rc
+  create_state nonleader-cli-handoff || return
+  start_fake_daemon "$DUET_DIR"
+  daemon_pid="$STARTED_FAKE_DAEMON_PID"
+  sleep 0.1
+  output="$TEST_ROOT/nonleader-promote.out"
+
+  if env TMUX="$TMUX_SOCKET_A,$TMUX_SERVER_PID_A,0" TMUX_PANE="$A_KIMI_PANE" \
+      DUET_SELF=kimi-1 DUET_SESSION="$DUET_SESSION_ID" \
+      DUET_CONFIG="$CURRENT_CONFIG" DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+      bash "$SCRIPTS_DIR/duet-promote.sh" --session "$CURRENT_CONFIG" --to codex-1 \
+      > "$output" 2>&1; then
     rc=0
   else
     rc=$?
   fi
-  assert_eq 1 "$rc" "failed-leader sink rejects path-like name"
-  assert_no_file "$escaped" "failed-leader marker cannot escape session directory"
+  assert_eq 0 "$rc" "surviving nonleader member may invoke explicit handoff"
+  assert_eq '1:codex-1' "$(field "$DUET_DIR/leader" term):$(field "$DUET_DIR/leader" leader)" \
+    "nonleader CLI handoff commits the selected target"
+  intent="$(find "$DUET_DIR/inbox/promotions" -maxdepth 1 -name 'N-*.msg' -print -quit)"
+  assert_file "$intent" "nonleader CLI publishes a durable handoff intent"
+  duet_read_message "$intent" || { fail "nonleader CLI intent is unreadable"; return; }
+  case "$DUET_MESSAGE_BODY" in
+    *'Operator record: MANUAL:kimi-1.'*) : ;;
+    *) fail "operator record does not identify the invoking member" ;;
+  esac
+
+  kill -TERM "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  rm -f "$DUET_DIR/daemon.pid" "$DUET_DIR/.daemon.lock"
+}
+
+test_leader_name_path_fence(){
+  local rc
+  create_state leader-name-fence || return
+  printf 'term\t0\nleader\t../../escaped-leader\n' > "$DUET_DIR/leader"
+  if duet_read_leader_state >/dev/null 2>&1; then rc=0; else rc=$?; fi
+  assert_eq 1 "$rc" "leadership state rejects path-like leader name"
 }
 
 run_case 'Codex cursor-row collapsed composer' test_codex_collapsed_composer
@@ -1494,44 +1462,42 @@ run_case 'Codex refused composer clear and stable-ID requeue' \
   test_refused_composer_clear_requeue
 run_case 'CLEAR_RETRY raw-CAS poison and physical-pane coalescing' \
   test_clear_retry_raw_cas_poison
-run_case 'promotion CAS, exclusions, and no successor' \
-  test_promotion_cas_exclusion_no_successor
-run_case 'force refusal and ordinary eligible manual target' \
-  test_force_rejected_and_manual_eligible_target
-run_case 'promotion dedupe target mismatch rejects alternate CAS' \
+run_case 'explicit handoff CAS, rank independence, and promote-back' \
+  test_manual_handoff_cas_and_return
+run_case 'manual handoff requires a target and rejects force' \
+  test_manual_handoff_requires_target_and_rejects_force
+run_case 'handoff dedupe target mismatch rejects alternate CAS' \
   test_promotion_dedupe_target_mismatch
-run_case 'promotion and no-successor crash reconciliation' \
-  test_promotion_reconciliation
 run_case 'terminal metadata and quarantine-intent crash recovery' \
   test_terminal_move_reconciliation
-run_case 'promotion sidecar and post-CAS watchdog crash recovery' \
-  test_promotion_intent_crash_windows
-run_case 'no-successor post-CAS watchdog crash recovery' \
-  test_no_successor_cas_before_watchdog
-run_case 'watchdog counter reset and soft promotion' \
-  test_watchdog_counter_and_soft_promotion
-run_case 'leader delivery watchdog integration' test_delivery_watchdog_integration
+run_case 'exact manual handoff crash recovery and malformed-intent quarantine' \
+  test_manual_handoff_intent_crash_windows
+run_case 'daemon never decides leadership' test_daemon_never_decides_leadership
+run_case 'delivery failure has no leadership side effect' \
+  test_delivery_failure_has_no_leadership_side_effect
 run_case 'partial INFLIGHT binding safe-outcome recovery' \
   test_partial_inflight_binding_recovery
 run_case 'term fence and old worker reply reroute' test_term_fencing_and_worker_reroute
-run_case 'uncertain composer fences promotion CAS until old-term resolution' \
+run_case 'uncertain composer fences manual handoff until old-generation resolution' \
   test_uncertain_composer_blocks_promotion_cas
 run_case 'INFLIGHT composer owner precedes newer interrupt' \
   test_inflight_owner_precedes_newer_interrupt
 run_case 'marker landing evidence without exact token stays poisoned' \
   test_marker_evidence_without_token_stays_poisoned
 run_case 'foreign-session payload quarantine and notice' test_foreign_payload_quarantine
-run_case 'pane coalescing and promotion-first scheduling' \
-  test_pane_coalescing_and_promotion_priority
+run_case 'pane coalescing and handoff-first scheduling' \
+  test_pane_coalescing_and_handoff_priority
 run_case 'status and doctor healthy active fixture' \
   test_status_and_doctor_healthy_fixture
 run_case 'explicit session and cross-session membership fence' \
   test_explicit_session_and_membership_fence
+run_case 'handoff CLI accepts a surviving nonleader member' \
+  test_handoff_cli_from_surviving_nonleader
 run_case 'leader name path fence' test_leader_name_path_fence
 
 if [ "$FAILURES" -eq 0 ]; then
-  printf '==== ALL M3 FAILOVER TESTS PASS ====\n'
+  printf '==== ALL M3 MANUAL LEADERSHIP TESTS PASS ====\n'
   exit 0
 fi
-printf '==== %s M3 FAILOVER ASSERTION(S) FAILED ====\n' "$FAILURES" >&2
+printf '==== %s M3 MANUAL LEADERSHIP ASSERTION(S) FAILED ====\n' "$FAILURES" >&2
 exit 1

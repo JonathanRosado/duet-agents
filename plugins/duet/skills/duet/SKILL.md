@@ -1,13 +1,13 @@
 ---
 name: duet
-description: Start and lead a live tmux or psmux ensemble of Claude, Codex, and Kimi agents. Use when the user wants multiple coding agents to collaborate interactively, divide disjoint implementation scopes, debate an approach, or cross-check one another. Messages are queued and injected into each agent's prompt while a watchdog provides fenced leader failover.
+description: Start and lead a live tmux or psmux ensemble of Claude, Codex, and Kimi agents. Use when the user wants multiple coding agents to collaborate interactively, divide disjoint implementation scopes, debate an approach, or cross-check one another. Messages use fenced queues; leadership remains with the initiator until an operator explicitly hands it to a named member.
 argument-hint: "[codex|kimi|claude ...]"
 ---
 
 # Duet ensemble
 
 Start a named ensemble of two to five agents in one tmux or psmux window. You are the
-initiator, roster name `claude`, and term-0 leader. Each requested harness runs
+initiator, roster name `claude`, and generation-0 leader. Each requested harness runs
 as a worker in another pane (`codex-1`, `kimi-1`, `claude-1`, and so on).
 
 The topology is a leader hub: the leader may talk to every worker, while each
@@ -19,7 +19,7 @@ message one another.
 - Determine the host platform first. On Windows, use PowerShell and psmux. If
   Claude is not already inside psmux, tell the user to relaunch with
   `psmux new-session -s duet -- claude`.
-- On macOS/Linux, the v0.2 ensemble path requires Bash and tmux. If `$TMUX` is
+- On macOS/Linux, the v0.3 ensemble path requires Bash and tmux. If `$TMUX` is
   empty, stop and tell the user to relaunch with `tmux new-session claude`, then
   run `/duet:duet` again.
 - Validate every harness argument before starting. Supported values are
@@ -69,10 +69,10 @@ workdir. Sessions in other workdirs remain independent.
 ## 2. Lead through the hub
 
 Read the pinned session's `leader` file before assigning work. It records the
-current term and leader. While it names you:
+current generation and leader. While it names you:
 
 1. Decompose the goal into disjoint file or subsystem scopes. Record owner,
-   scope, state, and relevant term in `assignments.md` before dispatching.
+   scope, state, and relevant generation in `assignments.md` before dispatching.
 2. Keep at most one outstanding task per worker. You may fan out one task to
    each worker and integrate replies asynchronously as they arrive.
 3. Send each worker a self-contained task with acceptance criteria. If scopes
@@ -155,7 +155,7 @@ Interrupts have queue priority and supersede older undeliverable normal work;
 use them only for a genuine redirect.
 
 Workers always reply to `leader`, never a concrete leader name. The symbolic
-queue resolves at delivery time, so a pending reply follows a promotion:
+queue resolves at delivery time, so a pending reply follows a manual handoff:
 
     DUET_CONFIG="/absolute/session/directory/duet.env" \
       bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" leader <<'DUET_EOF'
@@ -173,46 +173,52 @@ entry can survive even when its payload never reaches a prompt, so the entry
 alone is not proof that the recipient acted. Do not blindly re-enqueue a
 message when delivery is uncertain; inspect the pinned session first.
 
-## 4. Promotion and recovery
+## 4. Manual leadership and recovery
 
-The delivery daemon watches the current leader. It advances the leadership
-term after the leader pane dies or after three consecutive verified-delivery
-failures to it. The failed incumbent becomes ineligible for automatic
-succession; the next-ranked live eligible roster member is promoted. The new
-leader's promotion notice is delivered before its ordinary traffic, and the
-other live agents receive a leadership-change notice.
+The daemon never elects a leader. The initiator remains leader until the user
+or another human operator explicitly chooses a live target. Do not infer a
+handoff from pane death, delivery failure, roster rank, or apparent inactivity.
 
-On a promotion:
+If the leader looks dead or wedged, run pinned status. A confirmed-dead result
+prints one complete handoff command for each confirmed-live target. An UNKNOWN
+result means the pane identity could not be proved; report that uncertainty and
+do not recommend a target. Wait for the user to choose. The user may also hand
+off a leader that is alive but unresponsive.
 
-- If you are the new leader, read `leader`, `transcript.md`, and
-  `assignments.md`; reconcile each outstanding assignment before dispatching
-  more work, preserve disjoint scopes, and take over user-facing coordination.
-- If another agent was promoted, stop assigning immediately, accept the worker
-  role, and send future replies only to `leader`.
-- If a former leader's pane recovers, it remains a worker. It must not resume
-  old-term assignments or leadership on its own.
+Every handoff requires `--to` or `-To`:
 
-The current leader may request a fenced manual promotion, optionally naming an
-eligible successor:
-
-    DUET_CONFIG="/absolute/session/directory/duet.env" \
-      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-promote.sh" --to codex-1
+    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-promote.sh" --to codex-1 \
+      --session "/absolute/session/directory/duet.env"
 
 PowerShell/psmux:
 
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-promote.ps1" -To codex-1 -Session "C:\absolute\session\directory\duet.env"
 
-Use the platform's `duet-promote` script; direct edits to the `leader` file bypass term and
-composer fencing and are an unsafe emergency-only recovery action. If no live
-eligible successor exists, leadership becomes `NONE`; report it to the user
-and use pinned diagnostics rather than assigning more work.
+Any surviving session member may run the command after the operator names the
+target. A shell outside the roster must pass an explicit session path. A caller
+known to belong to another session is rejected.
 
-Manual promotion is a permanent handoff for that session: the old incumbent is
-added to `failed-leaders` and cannot be promoted back automatically or with
-`--force`.
+The handoff transaction increments the generation, records the exact prior
+leader and operator-selected target, and queues the new leader's notice before
+ordinary delivery resumes. It refuses to advance while a composer has an
+uncertain delivery obligation. Let the daemon finish that recovery, then retry;
+there is no force bypass. If the process crashes mid-transaction, the daemon may
+finish only that recorded target and generation. It never chooses a substitute.
+
+After a handoff:
+
+- If you are the new leader, read `leader`, `transcript.md`, and
+  `assignments.md`; reconcile outstanding work before assigning more.
+- If another member now leads, stop assigning, accept the worker role, and
+  send future replies only to `leader`.
+- A recovered prior leader remains a worker unless another explicit handoff
+  selects it. Prior leaders are not permanently excluded.
+
+Use `duet-promote`; editing `leader` directly bypasses the generation CAS,
+composer fence, durable intent, and notices.
 
 If context is compacted or lost, recover from the same three pinned files:
-`leader`, `transcript.md`, and `assignments.md`. Re-establish the current term,
+`leader`, `transcript.md`, and `assignments.md`. Re-establish the current generation,
 your role, completed message IDs, and outstanding scopes before acting.
 
 ## 5. Diagnostics
@@ -229,8 +235,10 @@ PowerShell/psmux:
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-status.ps1" -Session "C:\absolute\session\directory\duet.env"
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${env:CLAUDE_PLUGIN_ROOT}\scripts\duet-doctor.ps1" -Session "C:\absolute\session\directory\duet.env"
 
-Status shows roster readiness, pane liveness, leader/term, inbox depth, and the
-daemon. Doctor validates session invariants. Never substitute the ambient
+Status shows roster readiness, tri-state pane liveness, leader generation,
+inbox depth, and the daemon. For a confirmed-dead leader it prints pinned
+manual-handoff commands; for UNKNOWN it does not recommend a target. Doctor
+validates session invariants. Never substitute the ambient
 `current` link in agent-driven recovery.
 
 ## 6. End cleanly

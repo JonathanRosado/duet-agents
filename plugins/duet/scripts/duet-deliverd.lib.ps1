@@ -1,8 +1,8 @@
 # Delivery-daemon function library (dot-sourced by duet-deliverd.ps1 and by the
 # daemon tests). Reads $DuetDir, $Sid, $RosterPath, $DUET_DELIVERY_MAX_ATTEMPTS
 # from the dot-sourcing scope. All pane injection lives in the verified-send FSM
-# (duet-common.ps1); this file owns the queue state machine, watchdog, scheduler,
-# and crash-window reconciliation.
+# (duet-common.ps1); this file owns the queue state machine, scheduler, and
+# crash-window reconciliation.
 
 function DLog([string]$Msg) {
   try { [System.IO.File]::AppendAllText((Join-Path $DuetDir 'deliverd.log'), ("[{0}] {1}`n" -f (Get-DuetUtcStamp), $Msg), (New-Object System.Text.UTF8Encoding($false))) } catch { }
@@ -35,7 +35,7 @@ function Move-Terminal([string]$File, [string]$Directory) {
   $dest = Join-Path (Join-Path $box $Directory) (Split-Path -Leaf $File)
   # No-replace: a terminal record must never overwrite an existing one.
   if (-not (Move-DuetFileNoReplace -Source $File -Destination $dest)) { DLog "terminal move failed/collision for $(Split-Path -Leaf $File) in $Directory"; return $false }
-  foreach ($s in @('prior_term', 'failed', 'reason', 'promotion_term', 'quarantine_reason')) {
+  foreach ($s in @('reason', 'promotion_term', 'quarantine_reason')) {
     $src = $File + '.' + $s
     if (Test-Path -LiteralPath $src) {
       if (-not (Move-DuetFileNoReplace -Source $src -Destination ($dest + '.' + $s))) { return $false }
@@ -125,45 +125,6 @@ function Validate-Envelope([string]$File) {
   return $true
 }
 
-function Watchdog-Promote([string]$ExpTerm, [string]$ExpLeader, [string]$Reason, [string]$Requested) {
-  $rc = Invoke-DuetPromoteLocked -DuetDir $DuetDir -SessionId $Sid -RosterPath $RosterPath -ExpectedTerm $ExpTerm -ExpectedLeader $ExpLeader -Reason $Reason -Requested $Requested
-  switch ($rc) {
-    0 { DLog "promoted $ExpLeader -> $($global:DUET_PROMOTED_LEADER) term $($global:DUET_PROMOTED_TERM) ($Reason)"; $global:DUET_PASS_REBUILD = $true; return $true }
-    10 { DLog "no live successor after excluding $ExpLeader; term $($global:DUET_PROMOTED_TERM) leader NONE"; $global:DUET_PASS_REBUILD = $true; return $true }
-    3 { DLog "promotion candidate ineligible before CAS; rescan"; $global:DUET_PASS_REBUILD = $true; return $true }
-    11 { DLog "deferred promotion behind uncertain $(Split-Path -Leaf $global:DUET_PROMOTION_BLOCKER)"; return $true }
-    2 { $global:DUET_PASS_REBUILD = $true; return $true }
-    default { return $false }
-  }
-}
-
-function Watchdog-Check {
-  if (-not (Read-DuetLeaderState -DuetDir $DuetDir)) { return $false }
-  $term = $global:DUET_CURRENT_TERM; $leader = $global:DUET_CURRENT_LEADER
-  if ($leader -eq 'NONE') {
-    if (Select-DuetSuccessor -DuetDir $DuetDir -RosterPath $RosterPath -Failed 'NONE') { [void](Watchdog-Promote $term 'NONE' 'RECOVERY' $global:DUET_SUCCESSOR) }
-    return $true
-  }
-  if (Test-Path -LiteralPath (Join-Path (Join-Path $DuetDir 'failed-leaders') $leader)) { return (Watchdog-Promote $term $leader 'RECOVERY' '') }
-  $res = Get-DuetMemberResolution -RosterPath $RosterPath -Name $leader
-  if ($res.Known -and -not $res.Alive) { return (Watchdog-Promote $term $leader 'HARD' '') }
-  if (-not $res.Known) { return $true }
-  if (-not (Get-DuetWatchdogCount -DuetDir $DuetDir -Term $term -Leader $leader -SessionId $Sid)) { return $false }
-  if ([uint64]$global:DUET_WATCHDOG_COUNT -ge 3) { return (Watchdog-Promote $term $leader 'SOFT' '') }
-  return $true
-}
-
-function Watchdog-RecordOutcome([string]$TargetName, [string]$TargetTerm, [string]$Phase, [int]$Rc) {
-  if (-not (Read-DuetLeaderState -DuetDir $DuetDir)) { return $false }
-  if ($TargetName -ne $global:DUET_CURRENT_LEADER -or $TargetTerm -ne $global:DUET_CURRENT_TERM) { return $true }
-  if ($Rc -eq 0) { return (Write-DuetWatchdog -DuetDir $DuetDir -Session $Sid -Term $global:DUET_CURRENT_TERM -Leader $global:DUET_CURRENT_LEADER -Count '0') }
-  if (@($global:DUET_SEND_NOT_LANDED, $global:DUET_SEND_LANDED_UNVERIFIED, $global:DUET_SEND_COMPOSER_REFUSED) -contains $Rc) {
-    if ($Phase -eq 'ENTER_ONLY' -or $Phase -eq 'CLEAR_RETRY') { return $true }
-    return (Add-DuetWatchdogFailure -DuetDir $DuetDir -SessionId $Sid -Term $global:DUET_CURRENT_TERM -Leader $global:DUET_CURRENT_LEADER)
-  }
-  return $true
-}
-
 function Reconcile-FailureNotices {
   foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $DuetDir 'inbox') -Directory -ErrorAction SilentlyContinue)) {
     if ($f.Name -eq 'leader' -or $f.Name -eq 'promotions') { continue }
@@ -196,25 +157,20 @@ function Reconcile-InterruptSupersedes {
 . (Join-Path (Split-Path -Parent $PSCommandPath) 'duet-deliverd.process.ps1')
 
 function Deliverd-Pass {
-  $global:DUET_PASS_REBUILD = $false
   $null = @(Import-DuetRoster $RosterPath)
   if (-not $global:DUET_ROSTER_VALID) { DLog 'roster validation failed; halting'; return $false }
   if (-not (Reconcile-TerminalMoves)) { return $false }
-  if (-not (Reconcile-NoSuccessor)) { return $false }
   if (-not (Reconcile-PromotionIntents)) { return $false }
   if (-not (Reconcile-InterruptSupersedes)) { return $false }
   if (-not (Reconcile-FailureNotices)) { return $false }
   if (-not (Reconcile-ForeignNotices)) { return $false }
   if (-not (Reconcile-PromotionFanout)) { return $false }
-  if (-not (Watchdog-Check)) { return $false }
   $candidates = Collect-Candidates
   $seen = @{}
   foreach ($c in ($candidates | Sort-Object @{E = { $_.Priority } }, @{E = { $_.Order } })) {
     if ($seen.ContainsKey($c.Key)) { continue }
     $seen[$c.Key] = $true
     if (-not (Process-One $c.Box $c.File)) { return $false }
-    if (-not (Watchdog-Check)) { return $false }
-    if ($global:DUET_PASS_REBUILD) { break }
   }
   if (-not (Reconcile-PromotionFanout)) { return $false }
   return $true

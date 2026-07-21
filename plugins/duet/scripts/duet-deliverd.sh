@@ -99,7 +99,7 @@ duet_move_terminal(){
     return 1
   }
   mv "$file" "$destination" || return 1
-  for suffix in prior_term failed reason promotion_term quarantine_reason; do
+  for suffix in reason promotion_term quarantine_reason; do
     [ ! -f "$file.$suffix" ] || {
       [ ! -e "$destination.$suffix" ] && [ ! -L "$destination.$suffix" ] \
         || return 1
@@ -134,7 +134,7 @@ duet_reconcile_terminal_moves(){
       for file in "$box/$directory"/*.msg; do
         [ -f "$file" ] || continue
         root="$box/$(basename "$file")"
-        for suffix in prior_term failed reason promotion_term quarantine_reason; do
+        for suffix in reason promotion_term quarantine_reason; do
           [ -f "$root.$suffix" ] || continue
           if [ ! -e "$file.$suffix" ] && [ ! -L "$file.$suffix" ]; then
             mv "$root.$suffix" "$file.$suffix" || return 1
@@ -276,115 +276,60 @@ duet_reconcile_foreign_notices(){
   done
 }
 
-duet_reconcile_no_successor(){
-  local file="${DUET_DIR:?}/no-successor" session from_term term failed reason
-  [ -f "$file" ] || return 0
-  session="$(awk -F '\t' '$1 == "session" { print $2; exit }' "$file")"
-  from_term="$(awk -F '\t' '$1 == "from_term" { print $2; exit }' "$file")"
-  term="$(awk -F '\t' '$1 == "term" { print $2; exit }' "$file")"
-  failed="$(awk -F '\t' '$1 == "failed" { print $2; exit }' "$file")"
-  reason="$(awk -F '\t' '$1 == "reason" { sub(/^[^\t]*\t/, ""); print; exit }' "$file")"
-  [ "$session" = "${DUET_SESSION_ID:?}" ] && [ -n "$failed" ] || return 1
-  case "$from_term" in ''|*[!0-9]*) return 1;; esac
-  case "$term" in ''|*[!0-9]*) return 1;; esac
-  [ "$((10#$from_term + 1))" -eq "$((10#$term))" ] || return 1
-  [ -n "$reason" ] || reason=RECOVERY
-  duet_read_leader_state || return 1
-  if [ "$DUET_CURRENT_TERM" = "$from_term" ] \
-      && [ "$DUET_CURRENT_LEADER" = "$failed" ]; then
-    if duet_has_uncertain_delivery; then
-      duet_deliverd_log "deferred no-successor recovery behind uncertain $(basename "$DUET_UNCERTAIN_FILE")"
-      return 0
-    fi
-    duet_mark_failed_leader "$failed" "$from_term" "$reason" || return 1
-    duet_write_leader_state "$term" NONE || return 1
-    duet_watchdog_write "$term" NONE 0 || return 1
-    duet_deliverd_log "recovered no-live-successor state at term $term"
-  elif [ "$DUET_CURRENT_TERM" = "$term" ] \
-      && [ "$DUET_CURRENT_LEADER" = NONE ]; then
-    duet_mark_failed_leader "$failed" "$from_term" "$reason" || return 1
-    duet_watchdog_write "$term" NONE 0 || return 1
-  else
-    rm -f "$file" 2>/dev/null || return 1
-  fi
-}
-
-# A promotion message is durably queued before the leader CAS. Complete that
-# CAS after a crash, or quarantine an obsolete intent after a later promotion.
+# A MANUAL handoff message is the operator's immutable crash journal. Complete
+# only its exact prior/current tuple; never infer a target or react to health.
 duet_reconcile_promotion_intents(){
-  local box="${DUET_DIR:?}/inbox/promotions" file prior failed message_term reason candidate
+  local box="${DUET_DIR:?}/inbox/promotions" file raw_session raw_id
+  local prior prior_leader message_term
   [ -d "$box" ] || return 0
   for file in "$box"/N-*.msg; do
     [ -f "$file" ] || continue
-    duet_read_message "$file" || continue
-    [ "$DUET_MESSAGE_SESSION" = "${DUET_SESSION_ID:?}" ] || continue
-    case "$DUET_MESSAGE_ID" in
+    raw_session="$(duet_raw_message_field "$file" session)"
+    if [ -z "$raw_session" ]; then
+      duet_quarantine_reason "$file" missing-session || return 1
+      continue
+    fi
+    if [ "$raw_session" != "${DUET_SESSION_ID:?}" ]; then
+      duet_quarantine_reason "$file" foreign-session || return 1
+      continue
+    fi
+    raw_id="$(duet_raw_message_field "$file" id)"
+    case "$raw_id" in
       "m-${DUET_SESSION_ID}-"*) : ;;
       *) duet_quarantine_reason "$file" foreign-message-id || return 1; continue ;;
     esac
-    message_term="$DUET_MESSAGE_TERM"
-    [ "$message_term" -gt 0 ] || {
-      duet_deliverd_log "quarantined invalid term-zero promotion $(basename "$file")"
-      duet_quarantine_reason "$file" invalid-promotion-term || return 1
-      continue
-    }
-    if [ "$DUET_MESSAGE_ORIGIN" != SYSTEM ] \
-        || [ "$DUET_MESSAGE_DEDUPE" != "promotion-$message_term" ]; then
+    if ! duet_read_message "$file"; then
       duet_quarantine_reason "$file" invalid-promotion-envelope || return 1
       continue
     fi
-    prior="$(cat "$file.prior_term" 2>/dev/null || true)"
-    case "$prior" in
-      ''|*[!0-9]*) prior=$((10#$message_term - 1)) ;;
-    esac
-    failed="$(cat "$file.failed" 2>/dev/null || true)"
+    message_term="$DUET_MESSAGE_TERM"
+    prior="$DUET_MESSAGE_PRIOR_TERM"
+    prior_leader="$DUET_MESSAGE_PRIOR_LEADER"
+    if [ "$DUET_MESSAGE_HANDOFF_MODE" != MANUAL ] \
+        || [ "$DUET_MESSAGE_ORIGIN" != SYSTEM ] \
+        || [ "$DUET_MESSAGE_DEDUPE" != "promotion-$message_term" ] \
+        || ! duet_roster_has_name "$prior_leader" \
+        || ! duet_roster_has_name "$DUET_MESSAGE_RECIPIENT"; then
+      duet_quarantine_reason "$file" invalid-promotion-envelope || return 1
+      continue
+    fi
     duet_read_leader_state || return 1
-    if [ -z "$failed" ] && [ "$DUET_CURRENT_TERM" = "$prior" ]; then
-      failed="$DUET_CURRENT_LEADER"
-    fi
-    if [ -z "$failed" ]; then
-      for candidate in "$DUET_DIR"/failed-leaders/*; do
-        [ -f "$candidate" ] || continue
-        [ "$(awk -F '\t' '$1 == "term" { print $2; exit }' "$candidate")" = "$prior" ] \
-          || continue
-        [ -z "$failed" ] || { failed=""; break; }
-        failed="$(basename "$candidate")"
-      done
-    fi
-    [ -n "$failed" ] || return 1
-    reason="$(cat "$file.reason" 2>/dev/null || true)"
-    [ -n "$reason" ] || reason=RECOVERY
-    [ -f "$file.prior_term" ] || duet_atomic_write "$file.prior_term" "$prior" || return 1
-    [ -f "$file.failed" ] || duet_atomic_write "$file.failed" "$failed" || return 1
-    [ -f "$file.reason" ] || duet_atomic_write "$file.reason" "$reason" || return 1
-    [ -f "$file.promotion_term" ] \
-      || duet_atomic_write "$file.promotion_term" "$message_term" || return 1
     if [ "$DUET_CURRENT_TERM" = "$prior" ] \
-        && [ "$DUET_CURRENT_LEADER" = "$failed" ]; then
+        && [ "$DUET_CURRENT_LEADER" = "$prior_leader" ]; then
       if duet_has_uncertain_delivery; then
-        duet_deliverd_log "deferred promotion recovery behind uncertain $(basename "$DUET_UNCERTAIN_FILE")"
+        duet_deliverd_log "deferred manual handoff completion behind uncertain $(basename "$DUET_UNCERTAIN_FILE")"
         continue
       fi
-      duet_mark_failed_leader "$failed" "$prior" "$reason" || return 1
+      [ -f "$file.promotion_term" ] \
+        || duet_atomic_write "$file.promotion_term" "$message_term" || return 1
       duet_write_leader_state "$message_term" "$DUET_MESSAGE_RECIPIENT" || return 1
-      duet_watchdog_write "$message_term" "$DUET_MESSAGE_RECIPIENT" 0 || return 1
-      rm -f "$DUET_DIR/no-successor" 2>/dev/null || true
-      duet_deliverd_log "recovered promotion term $message_term -> $DUET_MESSAGE_RECIPIENT"
+      duet_deliverd_log "completed recorded manual handoff term $message_term -> $DUET_MESSAGE_RECIPIENT"
     elif [ "$DUET_CURRENT_TERM" = "$message_term" ] \
         && [ "$DUET_CURRENT_LEADER" = "$DUET_MESSAGE_RECIPIENT" ]; then
-      duet_mark_failed_leader "$failed" "$prior" "$reason" || return 1
-      if ! awk -F '\t' -v session="${DUET_SESSION_ID:?}" \
-          -v term="$message_term" -v leader="$DUET_MESSAGE_RECIPIENT" '
-            $1 == "session" { s=$2 }
-            $1 == "term" { t=$2 }
-            $1 == "leader" { l=$2 }
-            $1 == "count" && $2 ~ /^[0-9]+$/ { c=1 }
-            END { exit !(s == session && t == term && l == leader && c) }
-          ' "$DUET_DIR/watchdog" 2>/dev/null; then
-        duet_watchdog_write "$message_term" "$DUET_MESSAGE_RECIPIENT" 0 || return 1
-      fi
+      [ -f "$file.promotion_term" ] \
+        || duet_atomic_write "$file.promotion_term" "$message_term" || return 1
     else
-      duet_deliverd_log "quarantined obsolete promotion intent $(basename "$file")"
+      duet_deliverd_log "quarantined obsolete manual handoff $(basename "$file")"
       duet_quarantine_reason "$file" obsolete-promotion || return 1
     fi
   done
@@ -410,6 +355,7 @@ duet_reconcile_promotion_fanout(){
     esac
     if ! duet_read_message "$file" \
         || [ "$DUET_MESSAGE_SESSION" != "${DUET_SESSION_ID:?}" ] \
+        || [ "$DUET_MESSAGE_HANDOFF_MODE" != MANUAL ] \
         || [ "$DUET_MESSAGE_ORIGIN" != SYSTEM ] \
         || [ "$DUET_MESSAGE_TERM" != "$promotion_term" ] \
         || [ "$DUET_MESSAGE_DEDUPE" != "promotion-$promotion_term" ]; then
@@ -428,7 +374,7 @@ duet_reconcile_promotion_fanout(){
       duet_roster_member_alive "$name" || continue
       marker="fanout-$name"
       [ ! -f "$file.$marker" ] || continue
-      body="Leadership changed for session ${DUET_SESSION_ID:?}: term $promotion_term leader is $DUET_MESSAGE_RECIPIENT. Read the leader file before continuing work."
+      body="Leadership handoff for session ${DUET_SESSION_ID:?}: generation $promotion_term leader is $DUET_MESSAGE_RECIPIENT. Prior leader was $DUET_MESSAGE_PRIOR_LEADER. Read the leader file before continuing work."
       if ! DUET_INTERNAL_ENQUEUE=1 duet_enqueue_message "$name" duet-system "$name" \
           "$promotion_term" NORMAL SYSTEM "$DUET_MESSAGE_RECIPIENT" "$body" \
           "promotion-fanout-$promotion_term-$name"; then
@@ -438,63 +384,6 @@ duet_reconcile_promotion_fanout(){
     done < <(awk -F '\t' 'NR > 1 { print $1 }' "$DUET_DIR/roster.tsv")
     duet_write_sidecar "$file" fanout_done complete || return 1
   done
-}
-
-duet_watchdog_promote(){
-  local expected_term="${1:?term required}" expected_leader="${2:?leader required}"
-  local reason="${3:?reason required}" requested="${4:-}" rc
-  if duet_promote_locked "$expected_term" "$expected_leader" "$reason" "$requested"; then
-    rc=0
-  else
-    rc=$?
-  fi
-  case "$rc" in
-    0)
-      duet_deliverd_log "promoted $expected_leader -> $DUET_PROMOTED_LEADER term $DUET_PROMOTED_TERM ($reason)"
-      DUET_PASS_REBUILD=1
-      return 0
-      ;;
-    10)
-      duet_deliverd_log "no live successor after excluding $expected_leader; term $DUET_PROMOTED_TERM leader NONE"
-      DUET_PASS_REBUILD=1
-      return 0
-      ;;
-    3)
-      duet_deliverd_log "promotion candidate became ineligible before CAS; rescan scheduled"
-      DUET_PASS_REBUILD=1
-      return 0
-      ;;
-    11)
-      duet_deliverd_log "deferred promotion behind uncertain $(basename "$DUET_PROMOTION_BLOCKER")"
-      return 0
-      ;;
-    2) DUET_PASS_REBUILD=1; return 0 ;;
-    *) return "$rc" ;;
-  esac
-}
-
-duet_watchdog_check(){
-  local count
-  duet_read_leader_state || return 1
-  if [ "$DUET_CURRENT_LEADER" = NONE ]; then
-    if duet_select_successor NONE; then
-      duet_watchdog_promote "$DUET_CURRENT_TERM" NONE RECOVERY "$DUET_SUCCESSOR"
-    fi
-    return 0
-  fi
-  if [ -f "$DUET_DIR/failed-leaders/$DUET_CURRENT_LEADER" ]; then
-    duet_watchdog_promote "$DUET_CURRENT_TERM" "$DUET_CURRENT_LEADER" RECOVERY
-    return
-  fi
-  if ! duet_roster_member_alive "$DUET_CURRENT_LEADER"; then
-    duet_watchdog_promote "$DUET_CURRENT_TERM" "$DUET_CURRENT_LEADER" HARD
-    return
-  fi
-  duet_watchdog_count "$DUET_CURRENT_TERM" "$DUET_CURRENT_LEADER" || return 1
-  count="$DUET_WATCHDOG_COUNT"
-  if [ "$count" -ge 3 ]; then
-    duet_watchdog_promote "$DUET_CURRENT_TERM" "$DUET_CURRENT_LEADER" SOFT
-  fi
 }
 
 duet_clear_target_binding(){
@@ -511,24 +400,6 @@ duet_finish_quarantine(){
   if [ "${DUET_MESSAGE_MODE:-}" = INTERRUPT ]; then
     duet_complete_interrupt_supersede "$box" "$DUET_TERMINAL_FILE" || return 1
   fi
-}
-
-# Only attempts against the leader of the same term affect the soft watchdog.
-# Enter-only and clear-recovery retries do not add failures; a verified success
-# resets the count.
-duet_watchdog_record_outcome(){
-  local target_name="${1:-}" target_term="${2:-}" phase="${3:-}" rc="${4:-}"
-  duet_read_leader_state || return 1
-  [ "$target_name" = "$DUET_CURRENT_LEADER" ] \
-    && [ "$target_term" = "$DUET_CURRENT_TERM" ] || return 0
-  case "$rc" in
-    0) duet_watchdog_write "$DUET_CURRENT_TERM" "$DUET_CURRENT_LEADER" 0 ;;
-    "$DUET_SEND_NOT_LANDED"|"$DUET_SEND_LANDED_UNVERIFIED"|"$DUET_SEND_COMPOSER_REFUSED")
-      [ "$phase" != ENTER_ONLY ] && [ "$phase" != CLEAR_RETRY ] || return 0
-      duet_watchdog_failure "$DUET_CURRENT_TERM" "$DUET_CURRENT_LEADER"
-      ;;
-    *) return 0 ;;
-  esac
 }
 
 # Check the immutable routing envelope before decoding or displaying its body.
@@ -599,6 +470,7 @@ duet_process_one(){
       ;;
     promotions)
       [ "$DUET_MESSAGE_ORIGIN" = SYSTEM ] \
+        && [ "$DUET_MESSAGE_HANDOFF_MODE" = MANUAL ] \
         && [ "$DUET_MESSAGE_RECIPIENT" != leader ] || {
           duet_finish_quarantine "$box" "$file" invalid-promotion-envelope
           return
@@ -743,7 +615,7 @@ duet_process_one(){
   fi
 
   target_harness="$(duet_roster_harness_for_name "$DUET_TARGET_NAME")"
-  if [ "$DUET_TARGET_NAME" = NONE ] || [ -z "$DUET_TARGET_PANE" ] \
+  if [ -z "$DUET_TARGET_PANE" ] \
       || ! duet_roster_member_alive "$DUET_TARGET_NAME"; then
     rc=$DUET_SEND_DEAD
   elif [ "$phase" = CLEAR_RETRY ]; then
@@ -802,7 +674,7 @@ duet_process_one(){
     DUET_PROCESS_ATTEMPTED=1
     if duet_send_verified "$DUET_TARGET_PANE" "$payload" "$interrupt" "$target_harness"; then rc=0; else rc=$?; fi
     # Publish causal landing capabilities immediately on verifier return and
-    # before logging/watchdog work.  This minimizes the only unavoidable
+    # before later state transitions. This minimizes the only unavoidable
     # crash window between observing the live composer and durable recovery.
     if [ -n "${DUET_SEND_ENTER_TOKEN:-}" ]; then
       enter_token="$DUET_SEND_ENTER_TOKEN"
@@ -817,15 +689,6 @@ duet_process_one(){
     fi
   fi
 
-  if [ -n "$DUET_PROCESS_ATTEMPTED" ]; then
-    if [ -n "$clear_recovery" ]; then
-      :
-    elif [ -n "$continuation" ]; then
-      duet_watchdog_record_outcome "$DUET_TARGET_NAME" "$target_term" ENTER_ONLY "$rc" || return 1
-    else
-      duet_watchdog_record_outcome "$DUET_TARGET_NAME" "$target_term" "$phase" "$rc" || return 1
-    fi
-  fi
   if [ -n "$continuation" ] && [ "$rc" -ne 0 ] \
       && [ "$rc" -ne "$DUET_SEND_LANDED_UNVERIFIED" ] \
       && [ "$rc" -ne "$DUET_SEND_COMPOSER_REFUSED" ]; then
@@ -904,7 +767,7 @@ duet_process_one(){
           duet_finish_quarantine "$box" "$file" enter-only-unverified
         else
           attempts=$((attempts + 1))
-          duet_deliverd_log "composer ownership remains uncertain for $DUET_MESSAGE_ID; promotion remains fenced"
+          duet_deliverd_log "composer ownership remains uncertain for $DUET_MESSAGE_ID; handoff remains fenced"
           duet_write_sidecar "$file" tries "$attempts" || return 1
           duet_set_backoff "$file" "$attempts" || return 1
         fi
@@ -1048,7 +911,6 @@ duet_collect_candidates(){
     order="$(duet_raw_message_field "$file" order)"
     case "$order" in ''|*[!0-9]*) order=0000000000;; esac
     duet_candidate_target "$queue" "$file" || return 1
-    [ "$queue" != leader ] || [ "$DUET_CANDIDATE_NAME" != NONE ] || continue
     printf '%s\t%s\t%s\t%s\t%s\n' \
       "$priority" "$order" "$DUET_CANDIDATE_KEY" "$box" "$file"
   done
@@ -1056,15 +918,12 @@ duet_collect_candidates(){
 
 duet_deliverd_pass(){
   local candidates seen priority order key box file
-  DUET_PASS_REBUILD=""
   duet_reconcile_terminal_moves || return 1
-  duet_reconcile_no_successor || return 1
   duet_reconcile_promotion_intents || return 1
   duet_reconcile_interrupt_supersedes || return 1
   duet_reconcile_failure_notices || return 1
   duet_reconcile_foreign_notices || return 1
   duet_reconcile_promotion_fanout || return 1
-  duet_watchdog_check || return 1
 
   candidates="$(mktemp "${DUET_DIR:?}/.schedule.XXXXXX")" || return 1
   seen="$(mktemp "${DUET_DIR:?}/.schedule-seen.XXXXXX")" || {
@@ -1083,11 +942,6 @@ duet_deliverd_pass(){
       rm -f "$candidates" "$seen"
       return 1
     fi
-    if ! duet_watchdog_check; then
-      rm -f "$candidates" "$seen"
-      return 1
-    fi
-    [ -z "${DUET_PASS_REBUILD:-}" ] || break
   done < "$candidates"
   rm -f "$candidates" "$seen"
   duet_reconcile_promotion_fanout || return 1

@@ -1,6 +1,6 @@
 # Deterministic daemon tests: delivery FSM outcomes, interrupt supersession, and
-# the crash-window RECONCILIATIONS (terminal moves, quarantine-intent, promotion
-# pre/post-CAS recovery, obsolete-intent quarantine, no-successor recovery).
+# the crash-window reconciliations (terminal moves, quarantine intent, and exact
+# manual-handoff pre/post-CAS completion).
 # The verified-send FSM is stubbed; real composer behavior is the live-TUI smoke.
 # Run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File daemon.tests.ps1
 $ErrorActionPreference = 'Stop'
@@ -37,12 +37,18 @@ function New-Duet {
   $d = Join-Path $root ([guid]::NewGuid().ToString('N').Substring(0, 8))
   New-Item -ItemType Directory -Path $d | Out-Null
   Write-DuetLeaderState -DuetDir $d -Term '0' -Leader 'claude' | Out-Null
-  Write-DuetWatchdog -DuetDir $d -Session $Sid -Term '0' -Leader 'claude' -Count '0' | Out-Null
   Write-DuetAtomicMultiline -Path (Join-Path $d 'roster.tsv') -Value ("name`tharness`tpane_id`tpane_pid`trank`tspawned`nclaude`tclaude`t%1`t111`t0`t0`ncodex-1`tcodex`t%4`t222`t1`t1`nkimi-1`tkimi`t%7`t333`t2`t1") | Out-Null
   return $d
 }
 function Enq([string]$Queue, [string]$Recipient, [string]$Mode, [string]$Origin, [string]$Term, [string]$Sender, [string]$Body, [string]$Dedupe) {
   Add-DuetMessage -DuetDir $DuetDir -SessionId $Sid -Queue $Queue -Sender $Sender -Recipient $Recipient -Term $Term -Mode $Mode -Origin $Origin -LeaderAtSend 'claude' -Body $Body -Dedupe $Dedupe -Internal | Out-Null
+  return $global:DUET_ENQUEUED_FILE
+}
+function EnqHandoff([string]$Recipient, [string]$Term, [string]$PriorTerm, [string]$PriorLeader) {
+  Add-DuetMessage -DuetDir $DuetDir -SessionId $Sid -Queue 'promotions' -Sender 'duet-system' `
+    -Recipient $Recipient -Term $Term -Mode 'NORMAL' -Origin 'SYSTEM' -LeaderAtSend $Recipient `
+    -Body "manual handoff to $Recipient" -Dedupe "promotion-$Term" -HandoffMode 'MANUAL' `
+    -PriorTerm $PriorTerm -PriorLeader $PriorLeader -Internal | Out-Null
   return $global:DUET_ENQUEUED_FILE
 }
 
@@ -101,66 +107,74 @@ try {
   Check (Reconcile-TerminalMoves) "Reconcile-TerminalMoves returns true (metadata)"
   Check ((Test-Path -LiteralPath (Join-Path $box 'delivered\N-0000000002.msg.reason')) -and -not (Test-Path -LiteralPath (Join-Path $box 'N-0000000002.msg.reason'))) "orphan terminal metadata moved beside its terminal record"
 
-  # --- 7. RECONCILE promotion-intent PRE-CAS (crash after enqueue, before CAS) --
+  # --- 7. Exact MANUAL intent completes the crash window before the CAS --------
   $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
   $script:StubMemberAlive = $true
-  [void](Enq 'promotions' 'codex-1' 'NORMAL' 'SYSTEM' '1' 'duet-system' 'you are leader term 1' 'promotion-1')
-  # leader state still at term 0 / claude (CAS never ran).
-  Check (Reconcile-PromotionIntents) "Reconcile-PromotionIntents returns true"
+  $pf = EnqHandoff 'codex-1' '1' '0' 'claude'
+  Check (Reconcile-PromotionIntents) 'manual intent reconciliation succeeds pre-CAS'
   Read-DuetLeaderState -DuetDir $DuetDir | Out-Null
-  Check ($global:DUET_CURRENT_TERM -eq '1' -and $global:DUET_CURRENT_LEADER -eq 'codex-1') "pre-CAS promotion intent recovered: leader advanced to term 1 / codex-1"
-  Check (Test-Path -LiteralPath (Join-Path $DuetDir 'failed-leaders\claude')) "recovered promotion excluded the failed incumbent"
+  Check ($global:DUET_CURRENT_TERM -eq '1' -and $global:DUET_CURRENT_LEADER -eq 'codex-1') 'pre-CAS manual intent advances the exact generation/target'
+  Check (Test-Path -LiteralPath ($pf + '.promotion_term')) 'pre-CAS completion publishes the delivery obligation'
+  Check (-not (Test-Path -LiteralPath (Join-Path $DuetDir 'failed-leaders'))) 'crash completion creates no permanent exclusion metadata'
 
-  # --- 8. RECONCILE obsolete promotion intent -> quarantine --------------------
+  # --- 8. Post-CAS restart repairs only delivery metadata ----------------------
   $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
-  Write-DuetLeaderState -DuetDir $DuetDir -Term '2' -Leader 'kimi-1' | Out-Null   # already advanced past term 1
-  $pf = Enq 'promotions' 'codex-1' 'NORMAL' 'SYSTEM' '1' 'duet-system' 'stale promotion' 'promotion-1'
-  # Sidecars a real promotion transaction wrote before the state moved on.
-  Set-Content -LiteralPath ($pf + '.prior_term') -Value '0' -Encoding ascii
-  Set-Content -LiteralPath ($pf + '.failed') -Value 'claude' -Encoding ascii
-  Set-Content -LiteralPath ($pf + '.promotion_term') -Value '1' -Encoding ascii
-  $pbox = Join-Path (Join-Path $DuetDir 'inbox') 'promotions'
-  Check (Reconcile-PromotionIntents) "Reconcile-PromotionIntents returns true (obsolete)"
-  Check (@(Get-ChildItem -LiteralPath (Join-Path $pbox 'quarantine') -Filter 'N-*.msg' -File -ErrorAction SilentlyContinue).Count -eq 1) "obsolete promotion intent quarantined"
+  $pf = EnqHandoff 'codex-1' '1' '0' 'claude'
+  Write-DuetLeaderState -DuetDir $DuetDir -Term '1' -Leader 'codex-1' | Out-Null
+  Check (Reconcile-PromotionIntents) 'manual intent reconciliation succeeds post-CAS'
+  Check (Test-Path -LiteralPath ($pf + '.promotion_term')) 'post-CAS restart repairs the delivery obligation'
 
-  # --- 9. RECONCILE no-successor terminal state --------------------------------
+  # --- 9. Obsolete and nonmanual intents cannot mutate leadership -------------
   $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
-  Write-DuetAtomicMultiline -Path (Join-Path $DuetDir 'no-successor') -Value ("session`t$Sid`nfrom_term`t0`nterm`t1`nfailed`tclaude`nreason`tHARD") | Out-Null
-  # leader still at from_term 0 / claude (CAS never ran).
-  Check (Reconcile-NoSuccessor) "Reconcile-NoSuccessor returns true"
-  Read-DuetLeaderState -DuetDir $DuetDir | Out-Null
-  Check ($global:DUET_CURRENT_TERM -eq '1' -and $global:DUET_CURRENT_LEADER -eq 'NONE') "no-successor recovered: term 1 / leader NONE"
+  $pf = EnqHandoff 'codex-1' '1' '0' 'claude'
+  Write-DuetLeaderState -DuetDir $DuetDir -Term '2' -Leader 'kimi-1' | Out-Null
+  $pbox = Join-Path $DuetDir 'inbox\promotions'
+  Check (Reconcile-PromotionIntents) 'obsolete manual intent reconciliation returns cleanly'
+  Check (Test-Path -LiteralPath (Join-Path $pbox "quarantine\$(Split-Path -Leaf $pf)")) 'obsolete manual intent is quarantined'
+  [void](Read-DuetLeaderState -DuetDir $DuetDir)
+  Check ($global:DUET_CURRENT_TERM -eq '2' -and $global:DUET_CURRENT_LEADER -eq 'kimi-1') 'obsolete intent does not change leadership'
 
-  # --- 10. RECONCILE promotion POST-CAS (leader advanced, metadata unfinished) -
   $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
-  Write-DuetLeaderState -DuetDir $DuetDir -Term '1' -Leader 'codex-1' | Out-Null    # CAS already applied
-  Write-DuetWatchdog -DuetDir $DuetDir -Session $Sid -Term '0' -Leader 'claude' -Count '0' | Out-Null  # stale (pre-CAS)
-  $pf = Enq 'promotions' 'codex-1' 'NORMAL' 'SYSTEM' '1' 'duet-system' 'you are leader' 'promotion-1'
-  Set-Content -LiteralPath ($pf + '.prior_term') -Value '0' -Encoding ascii
-  Set-Content -LiteralPath ($pf + '.failed') -Value 'claude' -Encoding ascii
-  Set-Content -LiteralPath ($pf + '.promotion_term') -Value '1' -Encoding ascii
-  Check (Reconcile-PromotionIntents) "Reconcile-PromotionIntents returns true (post-CAS)"
-  Check (Test-Path -LiteralPath (Join-Path $DuetDir 'failed-leaders\claude')) "post-CAS repair marks the failed incumbent"
-  Check ((Get-DuetFirstLineValue -Path (Join-Path $DuetDir 'watchdog') -Key 'term') -eq '1' -and (Get-DuetFirstLineValue -Path (Join-Path $DuetDir 'watchdog') -Key 'leader') -eq 'codex-1') "post-CAS repair rewrites the watchdog to the new term/leader"
+  $bad = Enq 'promotions' 'codex-1' 'NORMAL' 'SYSTEM' '1' 'duet-system' 'not an operator intent' 'promotion-1'
+  Check (Reconcile-PromotionIntents) 'nonmanual promotion-shaped message is handled'
+  Check (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $bad) "quarantine\$(Split-Path -Leaf $bad)")) 'nonmanual promotion-shaped message is quarantined'
+  [void](Read-DuetLeaderState -DuetDir $DuetDir)
+  Check ($global:DUET_CURRENT_TERM -eq '0' -and $global:DUET_CURRENT_LEADER -eq 'claude') 'nonmanual message cannot initiate leadership'
 
-  # --- 11. RECONCILE no-successor POST-CAS (leader already NONE) --------------
   $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
-  Write-DuetLeaderState -DuetDir $DuetDir -Term '1' -Leader 'NONE' | Out-Null
-  Write-DuetWatchdog -DuetDir $DuetDir -Session $Sid -Term '0' -Leader 'claude' -Count '0' | Out-Null
-  Write-DuetAtomicMultiline -Path (Join-Path $DuetDir 'no-successor') -Value ("session`t$Sid`nfrom_term`t0`nterm`t1`nfailed`tclaude`nreason`tHARD") | Out-Null
-  Check (Reconcile-NoSuccessor) "Reconcile-NoSuccessor returns true (post-CAS NONE)"
-  Check (Test-Path -LiteralPath (Join-Path $DuetDir 'failed-leaders\claude')) "post-CAS no-successor marks the failed incumbent"
-  Check ((Get-DuetFirstLineValue -Path (Join-Path $DuetDir 'watchdog') -Key 'leader') -eq 'NONE' -and (Get-DuetFirstLineValue -Path (Join-Path $DuetDir 'watchdog') -Key 'term') -eq '1') "post-CAS no-successor rewrites the watchdog to NONE/term 1"
+  $foreignHandoff = EnqHandoff 'codex-1' '1' '0' 'claude'
+  $foreignText = (Get-DuetFileText $foreignHandoff) -replace '(?m)^session\tsess$', "session`tOTHER"
+  [IO.File]::WriteAllText($foreignHandoff, $foreignText, $enc)
+  Check (Reconcile-PromotionIntents) 'foreign manual handoff is handled before scheduling'
+  Check (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $foreignHandoff) "quarantine\$(Split-Path -Leaf $foreignHandoff)")) 'foreign handoff is terminalized instead of stalling the promotion queue'
+  [void](Read-DuetLeaderState -DuetDir $DuetDir)
+  Check ($global:DUET_CURRENT_TERM -eq '0' -and $global:DUET_CURRENT_LEADER -eq 'claude') 'foreign handoff cannot mutate leadership'
 
-  # --- 12. Promotion-intent recovery DEFERRED behind an uncertain delivery ----
-  $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'   # leader still term 0 / claude
-  [void](Enq 'promotions' 'codex-1' 'NORMAL' 'SYSTEM' '1' 'duet-system' 'promo' 'promotion-1')
+  # --- 10. Completion waits for uncertain composer ownership ------------------
+  $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
+  [void](EnqHandoff 'codex-1' '1' '0' 'claude')
   $ubox = Join-Path $DuetDir 'inbox\codex-1'; New-Item -ItemType Directory -Path $ubox -Force | Out-Null
   WriteRaw (Join-Path $ubox 'N-0000000001.msg') @('DUETv1', "id`tm-sess-codex-1-1", "session`tsess", "order`t1", "mode`tNORMAL", "sender`tclaude", "recipient`tcodex-1", "term`t0", "origin`tLEADER")
   Set-Content -LiteralPath (Join-Path $ubox 'N-0000000001.msg.phase') -Value 'CLEAR_RETRY' -Encoding ascii
-  Check (Reconcile-PromotionIntents) "Reconcile-PromotionIntents returns true (deferred)"
+  Check (Reconcile-PromotionIntents) 'manual intent recovery defers cleanly behind uncertain delivery'
   Read-DuetLeaderState -DuetDir $DuetDir | Out-Null
-  Check ($global:DUET_CURRENT_TERM -eq '0' -and $global:DUET_CURRENT_LEADER -eq 'claude') "promotion CAS deferred while an uncertain delivery is pending"
+  Check ($global:DUET_CURRENT_TERM -eq '0' -and $global:DUET_CURRENT_LEADER -eq 'claude') 'uncertain composer prevents crash-completion CAS'
+
+  # --- 11. Recorded operator choice completes without a new health decision ---
+  $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
+  [void](EnqHandoff 'codex-1' '1' '0' 'claude')
+  $script:StubMemberAlive = $false
+  Check (Reconcile-PromotionIntents) 'recorded intent completion does not re-decide target by health'
+  [void](Read-DuetLeaderState -DuetDir $DuetDir)
+  Check ($global:DUET_CURRENT_TERM -eq '1' -and $global:DUET_CURRENT_LEADER -eq 'codex-1') 'exact recorded target is preserved across the crash window'
+  $script:StubMemberAlive = $true
+
+  # --- 12. Recovered ex-leader traffic is fenced after handoff ----------------
+  $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
+  $stale = Enq 'kimi-1' 'kimi-1' 'NORMAL' 'LEADER' '0' 'claude' 'old leader broadcast' ''
+  Write-DuetLeaderState -DuetDir $DuetDir -Term '1' -Leader 'codex-1' | Out-Null
+  Check (Process-One (Split-Path -Parent $stale) $stale) 'ex-leader message is processed under the new generation'
+  Check (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $stale) "quarantine\$(Split-Path -Leaf $stale)")) 'ex-leader authority is rejected after handoff'
 
   # --- 13. A failed durable write HALTS the pass (fail-closed) ----------------
   $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
@@ -193,11 +207,8 @@ try {
   Check (Process-One (Split-Path -Parent $f) $f) "oversized attempt count is terminalized without a cast exception"
   Check ((Get-DuetFileText ((Join-Path (Split-Path -Parent $f) "quarantine\$(Split-Path -Leaf $f)") + '.reason')).Trim() -eq 'invalid-delivery-attempt-count') "oversized attempt count is quarantined with a durable reason"
 
-  $DuetDir = New-Duet; $RosterPath = Join-Path $DuetDir 'roster.tsv'
-  Write-DuetWatchdog -DuetDir $DuetDir -Session 'foreign' -Term '0' -Leader 'claude' -Count '2' | Out-Null
-  Check (-not (Watchdog-Check)) "foreign-session watchdog state fails closed"
-  Write-DuetAtomicMultiline -Path (Join-Path $DuetDir 'no-successor') -Value ("session`t$Sid`nfrom_term`t$('9' * 1000)`nterm`t1`nfailed`tclaude`nreason`tHARD") | Out-Null
-  Check (-not (Reconcile-NoSuccessor)) "oversized no-successor term is rejected without throwing"
+  Check (-not (Get-Command Watchdog-Check -ErrorAction SilentlyContinue)) 'daemon has no autonomous leadership checker'
+  Check (-not (Get-Command Reconcile-NoSuccessor -ErrorAction SilentlyContinue)) 'daemon has no inferred no-successor transition'
 }
 finally { try { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue } catch { } }
 

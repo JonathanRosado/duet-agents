@@ -142,7 +142,11 @@ fi
 
 # Worker traffic is canonicalized to the symbolic leader queue, even when the
 # caller used the current leader's concrete name. Delivery-time resolution then
-# preserves an in-flight reply across a later promotion.
+# preserves an in-flight reply across a later handoff.
+if [ "$recipient_token" = all ]; then
+  echo "duet: hub violation: worker '$sender' may send only to leader '$DUET_CURRENT_LEADER'; broadcast requires the current leader." >&2
+  exit 8
+fi
 if [ "$recipient_token" != leader ]; then
   recipient="$(duet_resolve_roster_name "$recipient_token")" || {
     echo "duet: unknown or ambiguous recipient '$recipient_token'." >&2

@@ -14,6 +14,9 @@ $ErrorActionPreference = 'Continue'
 
 $callerPin = $env:DUET_SESSION
 $callerSelf = $env:DUET_SELF
+$hadCaller = Get-DuetCallerIdentity
+$actualCallerSession = if ($hadCaller) { $global:DUET_CALLER_SESSION } else { '' }
+$actualCallerServerPid = if ($hadCaller) { $global:DUET_CALLER_SERVER_PID } else { '' }
 
 if (-not (Resolve-DuetConfig $Session 0)) { exit 1 }
 $cfgPath = $global:DUET_RESOLVED_CONFIG
@@ -33,6 +36,10 @@ if (-not (Test-DuetDaemonAlive -DuetDir $DuetDir -SessionId $Sid)) { Write-DuetE
 $paneName = ''
 if (Get-DuetCallerRosterName -RosterPath $RosterPath -ExpectedSession $cfg['DUET_PSMUX_SESSION'] -ExpectedServerPid $cfg['DUET_PSMUX_SERVER_PID']) { $paneName = $global:DUET_CALLER_NAME }
 if ($paneName -and $callerSelf -and $paneName -ne $callerSelf) { Write-DuetError "duet: identity mismatch: pane is '$paneName' but DUET_SELF is '$callerSelf'."; exit 7 }
+if (-not $paneName -and $hadCaller -and ($actualCallerSession -ne $cfg['DUET_PSMUX_SESSION'] -or $actualCallerServerPid -ne $cfg['DUET_PSMUX_SERVER_PID'])) {
+  Write-DuetError "duet: caller belongs to psmux session '$actualCallerSession', not pinned session '$Sid'."
+  exit 7
+}
 
 $sender = ''
 if ($From) {
@@ -73,7 +80,11 @@ if ($sender -eq $global:DUET_CURRENT_LEADER) {
   exit 0
 }
 
-# Worker traffic canonicalizes to the symbolic leader queue (survives promotion).
+# Worker traffic canonicalizes to the symbolic leader queue (survives handoff).
+if ($Recipient -eq 'all') {
+  Write-DuetError "duet: hub violation: worker '$sender' may send only to leader '$($global:DUET_CURRENT_LEADER)'; broadcast requires the current leader."
+  exit 8
+}
 if ($Recipient -ne 'leader') {
   $rcpt = Resolve-DuetRosterName -RosterPath $RosterPath -Token $Recipient
   if (-not $rcpt) { Write-DuetError "duet: unknown or ambiguous recipient '$Recipient'."; exit 2 }

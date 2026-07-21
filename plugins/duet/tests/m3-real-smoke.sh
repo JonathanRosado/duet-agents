@@ -2,7 +2,7 @@
 # Destructive-to-its-own-fixtures M3/M4 gate against real Claude, Codex, and
 # Kimi TUIs. All tmux and duet state is isolated; HOME remains the caller's
 # real home so the installed CLIs can use their normal authentication. Besides
-# failover/fencing, this is the release-candidate fan-out/fan-in and teardown
+# manual-handoff fencing, this is the release-candidate fan-out/fan-in and teardown
 # check used after documentation or packaging changes.
 set -u
 set -o pipefail
@@ -12,6 +12,7 @@ PLUGIN_DIR="$(cd "$TEST_DIR/.." && pwd)"
 SCRIPTS_DIR="$PLUGIN_DIR/scripts"
 INIT_SCRIPT="$SCRIPTS_DIR/duet-init.sh"
 SEND_SCRIPT="$SCRIPTS_DIR/duet-send.sh"
+PROMOTE_SCRIPT="$SCRIPTS_DIR/duet-promote.sh"
 END_SCRIPT="$SCRIPTS_DIR/duet-end.sh"
 STATUS_SCRIPT="$SCRIPTS_DIR/duet-status.sh"
 DOCTOR_SCRIPT="$SCRIPTS_DIR/duet-doctor.sh"
@@ -26,6 +27,7 @@ KIMI_MODEL=kimi-code/kimi-for-coding
 # A gate may itself be launched from a live agent pane. Drop every ambient
 # routing hint before doing anything: all test routing below is explicit.
 unset DUET_CONFIG DUET_SESSION DUET_SESSION_ID DUET_SELF TMUX TMUX_PANE
+unset PSMUX_SESSION PSMUX_PANE PSMUX_TARGET_SESSION
 
 REAL_HOME="${HOME:?m3 real smoke requires the caller real HOME}"
 REAL_CODEX_HOME="${CODEX_HOME:-$REAL_HOME/.codex}"
@@ -41,7 +43,6 @@ SOFT_CONFIG=""
 HARD_DIR=""
 SOFT_DIR=""
 ACTIVE_PID=""
-SOFT_DAEMON_STOPPED=""
 SUCCESS=""
 CLEANING=""
 DRIVER_PID="${BASHPID:-$$}"
@@ -257,11 +258,6 @@ cleanup(){
   if [ -z "$SUCCESS" ] || [ "$status" -ne 0 ]; then
     write_failure_diagnostics
   fi
-  [ -z "$SOFT_DAEMON_STOPPED" ] || {
-    stopped_pid="$(exact_daemon_pid "$SOFT_DAEMON_STOPPED" 2>/dev/null || true)"
-    [ -z "$stopped_pid" ] || kill -CONT "$stopped_pid" 2>/dev/null || true
-    SOFT_DAEMON_STOPPED=""
-  }
   for partial_config in "$STATE_ROOT"/*/duet.env; do
     [ -f "$partial_config" ] || continue
     stop_exact_daemon "$partial_config"
@@ -422,7 +418,7 @@ message_delivered(){
   return 1
 }
 
-promotion_delivered(){
+handoff_delivered(){
   local dir="$1" term="$2" recipient="$3" file file_term file_recipient
   for file in "$dir/inbox/promotions/delivered"/*.msg; do
     [ -f "$file" ] || continue
@@ -537,7 +533,7 @@ current_points_to(){
 say "models: Claude=$CLAUDE_MODEL Codex=$CODEX_MODEL Kimi=$KIMI_MODEL"
 say "fixtures: $TEST_ROOT (HOME remains $REAL_HOME)"
 
-# --- Hard-failover session: real Claude initiator, Codex, and Kimi. ---
+# --- Confirmed-dead leader: real Claude initiator, Codex, and Kimi. ---
 printf -v CLAUDE_COMMAND 'exec env DUET_CLAUDE_MODEL=%q %q --model %q --dangerously-skip-permissions' \
   "$CLAUDE_MODEL" "$(command -v claude)" "$CLAUDE_MODEL"
 tmux_hard -f /dev/null new-session -d -s "$HARD_TMUX_SESSION" \
@@ -649,20 +645,33 @@ grep -qF "observed collapsed composer for $LONG_ID -> codex-1" \
   "$HARD_DIR/deliverd.log" \
   || die "long Codex message did not exercise the collapsed-composer marker path"
 
-say "killing hard leader and awaiting ranked promotion"
+say "killing the leader, verifying no automatic mutation, then handing off explicitly"
 pane_pid_is hard "$HARD_CLAUDE_PANE" "$HARD_CLAUDE_PID" \
   || die "hard leader pane identity changed before kill"
 tmux_hard kill-pane -t "$HARD_CLAUDE_PANE" || die "could not kill hard leader pane"
-wait_until 45 "hard promotion to codex-1" leader_is "$HARD_DIR" 1 codex-1
-[ -f "$HARD_DIR/failed-leaders/claude" ] \
-  || die "hard promotion did not permanently exclude claude"
-wait_until 90 "hard promotion notice delivery" promotion_delivered "$HARD_DIR" 1 codex-1
+sleep 6
+leader_is "$HARD_DIR" 0 claude \
+  || die "daemon changed leadership without an explicit operator handoff"
+env HOME="$REAL_HOME" bash "$STATUS_SCRIPT" --session "$HARD_CONFIG" \
+  > "$LOG_DIR/hard-dead-status.txt" 2>&1 || die "dead-leader status failed"
+grep -qF 'leader unavailable: confirmed dead' "$LOG_DIR/hard-dead-status.txt" \
+  || die "status did not distinguish the confirmed-dead leader"
+grep -qF -- "--to codex-1 --session $HARD_CONFIG" "$LOG_DIR/hard-dead-status.txt" \
+  || die "status did not print the pinned Codex handoff command"
+if ! run_timed_log 60 "$LOG_DIR/hard-handoff.log" env HOME="$REAL_HOME" \
+    bash "$PROMOTE_SCRIPT" --to codex-1 --session "$HARD_CONFIG"; then
+  die "explicit dead-leader handoff failed"
+fi
+wait_until 30 "manual handoff to codex-1" leader_is "$HARD_DIR" 1 codex-1
+[ ! -d "$HARD_DIR/failed-leaders" ] \
+  || die "manual handoff created removed failed-leader metadata"
+wait_until 90 "manual handoff notice delivery" handoff_delivered "$HARD_DIR" 1 codex-1
 
-# --- Soft-failover session: a live, non-accepting leader and real Codex worker. ---
+# --- Human-observed wedge: a live, non-accepting leader and real Codex worker. ---
 # The fixture renders bracketed pastes so landing is positively observed, but
 # holds the apparent composer longer than the verifier timeout. It then clears
 # without accepting the task. The daemon can therefore terminalize each
-# Enter-only continuation safely while retaining the consecutive failure count.
+# Enter-only continuation safely. Leadership still changes only on command.
 SOFT_FAIL_BODY='
 trap "" INT
 printf "\033[?2004hsoft-failure-ready\n"
@@ -755,21 +764,25 @@ grep -qF 'override refused' "$CROSS_OUTPUT" \
 
 env HOME="$REAL_HOME" bash "$STATUS_SCRIPT" --session "$HARD_CONFIG" \
   > "$LOG_DIR/hard-status.txt" 2>&1 || die "hard status failed"
-env HOME="$REAL_HOME" bash "$DOCTOR_SCRIPT" --session "$HARD_CONFIG" \
-  > "$LOG_DIR/hard-doctor.txt" 2>&1 || die "hard doctor found an issue"
-grep -qF 'doctor: healthy' "$LOG_DIR/hard-doctor.txt" \
-  || die "hard doctor did not report healthy"
+grep -qF 'leadership    : generation=1 leader=codex-1' "$LOG_DIR/hard-status.txt" \
+  || die "hard status did not report the explicit handoff"
+if env HOME="$REAL_HOME" bash "$DOCTOR_SCRIPT" --session "$HARD_CONFIG" \
+    > "$LOG_DIR/hard-doctor.txt" 2>&1; then
+  die "doctor reported healthy despite the intentionally dead former member"
+fi
+grep -qF 'member claude is confirmed dead' "$LOG_DIR/hard-doctor.txt" \
+  || die "doctor did not report the intentionally dead former member"
 HARD_DAEMON_PID="$(exact_daemon_pid "$HARD_CONFIG" 2>/dev/null || true)"
 case "$HARD_DAEMON_PID" in
   ''|*[!0-9]*) die "hard daemon identity is invalid before end" ;;
 esac
 
-say "broadcasting DUET-END from the promoted leader"
+say "broadcasting DUET-END from the selected leader"
 send_all_from "$HARD_CONFIG" codex-1 \
   "DUET-END — M4 release-candidate teardown. Do not send another duet message; stop and wait for session cleanup."
 wait_until 90 "DUET-END delivery to remaining live worker" \
   message_delivered "$HARD_DIR/inbox/kimi-1" "$SEND_ALL_KIMI_ID"
-# The broadcast also has a copy for the dead former leader. It cannot be
+# The broadcast also has a copy for the dead prior leader. It cannot be
 # delivered, but must reach one durable terminal state so the drain barrier is
 # not hiding an active queue obligation.
 wait_until 60 "DUET-END dead-incumbent copy terminal" \
@@ -796,29 +809,39 @@ pane_pid_is soft "$SOFT_CLAUDE_PANE" "$SOFT_CLAUDE_PID" \
 pane_pid_is soft "$SOFT_CODEX_PANE" "$SOFT_CODEX_PID" \
   || die "ending hard session disturbed soft worker pane"
 
-say "queuing three failures against the live non-accepting leader"
+say "observing the live wedge, then handing off explicitly"
 SOFT_DAEMON_PID="$(exact_daemon_pid "$SOFT_CONFIG" 2>/dev/null || true)"
 case "$SOFT_DAEMON_PID" in ''|*[!0-9]*) die "soft daemon identity is invalid";; esac
-kill -STOP "$SOFT_DAEMON_PID" || die "could not pause soft daemon for deterministic enqueue"
-SOFT_DAEMON_STOPPED="$SOFT_CONFIG"
-soft_index=1
-while [ "$soft_index" -le 3 ]; do
-  send_from "$SOFT_CONFIG" codex-1 leader \
-    "Soft watchdog probe $soft_index: the non-accepting leader must not verify this delivery."
-  soft_index=$((soft_index + 1))
-done
-RESUME_PID="$(exact_daemon_pid "$SOFT_CONFIG" 2>/dev/null || true)"
-[ "$RESUME_PID" = "$SOFT_DAEMON_PID" ] || die "soft daemon identity changed while paused"
-kill -CONT "$RESUME_PID" || die "could not resume soft daemon"
-SOFT_DAEMON_STOPPED=""
-
-wait_until 60 "soft promotion to codex-1" leader_is "$SOFT_DIR" 1 codex-1
+sleep 8
+leader_is "$SOFT_DIR" 0 claude \
+  || die "daemon changed a live wedged leader without an operator command"
 pane_pid_is soft "$SOFT_CLAUDE_PANE" "$SOFT_CLAUDE_PID" \
-  || die "soft failover killed or replaced the still-live incumbent pane"
-[ -f "$SOFT_DIR/failed-leaders/claude" ] \
-  || die "soft promotion did not permanently exclude claude"
-wait_until 90 "soft promotion notice delivery" promotion_delivered "$SOFT_DIR" 1 codex-1
-wait_until 120 "soft symbolic queue drain after reroute" all_messages_terminal "$SOFT_DIR"
+  || die "wedged leader did not remain alive before handoff"
+if ! run_timed_log 60 "$LOG_DIR/soft-handoff.log" env HOME="$REAL_HOME" \
+    bash "$PROMOTE_SCRIPT" --to codex-1 --session "$SOFT_CONFIG"; then
+  die "explicit live-wedge handoff failed"
+fi
+wait_until 30 "live-wedge handoff to codex-1" leader_is "$SOFT_DIR" 1 codex-1
+pane_pid_is soft "$SOFT_CLAUDE_PANE" "$SOFT_CLAUDE_PID" \
+  || die "manual handoff killed or replaced the still-live prior leader pane"
+[ ! -d "$SOFT_DIR/failed-leaders" ] \
+  || die "live-wedge handoff created removed failed-leader metadata"
+wait_until 90 "live-wedge handoff notice delivery" handoff_delivered "$SOFT_DIR" 1 codex-1
+
+say "verifying prior-leader authority fencing and symbolic reroute"
+EX_LEADER_OUTPUT="$LOG_DIR/ex-leader-broadcast.txt"
+if printf '%s' 'stale leader broadcast must be refused' | env HOME="$REAL_HOME" \
+    DUET_CONFIG="$SOFT_CONFIG" DUET_ALLOW_FROM_OVERRIDE=1 \
+    bash "$SEND_SCRIPT" all --from claude --session "$SOFT_CONFIG" \
+    > "$EX_LEADER_OUTPUT" 2>&1; then
+  die "prior leader retained broadcast authority after handoff"
+fi
+send_from "$SOFT_CONFIG" claude leader \
+  'Prior leader now behaves as a worker; this symbolic reply must reach codex-1.'
+SOFT_REROUTE_ID="$SEND_ID"
+wait_until 90 "prior-leader symbolic reply reroute" \
+  message_delivered "$SOFT_DIR/inbox/leader" "$SOFT_REROUTE_ID"
+wait_until 120 "soft queue drain after manual handoff" all_messages_terminal "$SOFT_DIR"
 
 say "atomically injecting and quarantining a foreign-session payload"
 FOREIGN_SECRET="FOREIGN-BODY-MUST-NOT-LAND-$PPID-${RANDOM:-0}"
@@ -871,8 +894,8 @@ fi
 say "running pinned status and doctor on the promoted soft session"
 env HOME="$REAL_HOME" bash "$STATUS_SCRIPT" --session "$SOFT_CONFIG" \
   > "$LOG_DIR/soft-status.txt" 2>&1 || die "soft status failed"
-grep -qF 'leadership    : term=1 leader=codex-1' "$LOG_DIR/soft-status.txt" \
-  || die "soft status did not report promoted leadership"
+grep -qF 'leadership    : generation=1 leader=codex-1' "$LOG_DIR/soft-status.txt" \
+  || die "soft status did not report selected leadership"
 env HOME="$REAL_HOME" bash "$DOCTOR_SCRIPT" --session "$SOFT_CONFIG" \
   > "$LOG_DIR/soft-doctor.txt" 2>&1 || die "soft doctor found an issue"
 grep -qF 'doctor: healthy' "$LOG_DIR/soft-doctor.txt" \
@@ -904,5 +927,5 @@ if grep -qF '<!-- DUET:BEGIN' "$HARD_WORK/AGENTS.md" "$HARD_WORK/CLAUDE.md" \
 fi
 
 SUCCESS=1
-say "PASS: real fan-out/fan-in, hard/soft failover, DUET-END, A8 fences, and diagnostics"
+say "PASS: real fan-out/fan-in, dead/wedged manual handoff, DUET-END, A8 fences, and diagnostics"
 exit 0

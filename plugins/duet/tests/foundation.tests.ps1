@@ -60,6 +60,48 @@ try {
   }
   Check ((Get-DuetClaudeComposerMarker '❯ [Pastedtext#1+5lines]') -eq 'claudePastedtext15lines') "Claude compact collapsed-paste marker is recognized"
   Check ((Get-DuetClaudeComposerMarker '> [Pasted text #12 + 3 lines]') -eq 'claudePastedtext123lines') "Claude spaced collapsed-paste marker is recognized"
+  $savedMuxRc = $global:DUET_PSMUX_RC
+  $blankRow = & {
+    . $common
+    function Resolve-DuetPaneResolution { [pscustomobject]@{ Known = $true; Alive = $true; Target = 's:%1' } }
+    function Invoke-DuetPsmux { $global:DUET_PSMUX_RC = 0; return $null }
+    Invoke-DuetPaneRowCapture -Session s -ServerPid 1 -PaneId '%1' -PanePid 2 -Row 29
+  }
+  Check ($blankRow.Ok -and $blankRow.Alive -and $blankRow.Line -eq '') "exact psmux row capture treats rc=0/blank stdout as a successfully empty row"
+  $trimmedMarker = & {
+    . $common
+    function Invoke-DuetPaneCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history', 'context') } }
+    function Invoke-DuetPaneGeometry { [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = '29'; Height = '30' } }
+    function Invoke-DuetPaneRowCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Line = '' } }
+    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2
+  }
+  Check ($trimmedMarker.Ok -and $trimmedMarker.Alive -and $trimmedMarker.Marker -eq '') "trimmed trailing cursor row is positive evidence of an empty composer"
+  $exactMarker = & {
+    . $common
+    function Invoke-DuetPaneCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history') } }
+    function Invoke-DuetPaneGeometry { [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = '25'; Height = '30' } }
+    function Invoke-DuetPaneRowCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Line = '> [Pasted Content 2048 chars]' } }
+    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2
+  }
+  Check ($exactMarker.Ok -and $exactMarker.Marker -eq 'codexPastedContent2048chars') "exact cursor-row capture still detects a collapsed Codex marker"
+  $movingCursor = & {
+    . $common
+    $script:cursorReads = 0
+    function Invoke-DuetPaneCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history') } }
+    function Invoke-DuetPaneGeometry { $script:cursorReads++; [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = $(if ($script:cursorReads -eq 1) { '29' } else { '28' }); Height = '30' } }
+    function Invoke-DuetPaneRowCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Line = '' } }
+    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2
+  }
+  Check (-not $movingCursor.Ok -and $movingCursor.Alive) "cursor movement during an exact-row composer read remains UNKNOWN"
+  $outOfRangeCursor = & {
+    . $common
+    function Invoke-DuetPaneCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history') } }
+    function Invoke-DuetPaneGeometry { [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = '30'; Height = '30' } }
+    function Invoke-DuetPaneRowCapture { throw 'out-of-range geometry must not read a row' }
+    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2
+  }
+  Check (-not $outOfRangeCursor.Ok -and $outOfRangeCursor.Alive) "out-of-range cursor geometry remains UNKNOWN"
+  $global:DUET_PSMUX_RC = $savedMuxRc
   $encodedReady = ConvertTo-DuetPowerShellEncodedCommand "Set-Content -LiteralPath 'C:\odd path & `$cash\ready' -Value ok -NoNewline"
   $decodedReady = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encodedReady))
   Check ($decodedReady -eq "Set-Content -LiteralPath 'C:\odd path & `$cash\ready' -Value ok -NoNewline") "encoded PowerShell readiness command round-trips shell metacharacters"
@@ -193,16 +235,11 @@ Start-Sleep -Milliseconds $HoldMs
     CheckReturnsFalse { Test-DuetLoadedSession -Config $rcfg } "reparse-point (junction) session directory is rejected"
   } else { Skip "reparse rejection (junction creation unavailable)" }
 
-  # --- 8. Leader state / successor regression --------------------------------
+  # --- 8. Leader state / manual-leadership surface ----------------------------
   Write-DuetLeaderState -DuetDir $scratch -Term '0' -Leader 'claude' | Out-Null
   Check ((Read-DuetLeaderState -DuetDir $scratch) -and $global:DUET_CURRENT_LEADER -eq 'claude') "leader state round-trips"
-  $rr = Join-Path $scratch 'roster2.tsv'
-  Write-DuetAtomicMultiline -Path $rr -Value ("name`tharness`tpane_id`tpane_pid`trank`tspawned`nclaude`tclaude`t%1`t111`t0`t0`ncodex-1`tcodex`t%4`t222`t1`t1`nkimi-1`tkimi`t%7`t333`t2`t1") | Out-Null
-  function Test-DuetServerMatches { return $true }
-  function Test-DuetMemberAlive { param($RosterPath, $Name) return ($Name -ne 'codex-1') }
-  Check ((Select-DuetSuccessor -DuetDir $scratch -RosterPath $rr -Failed 'claude') -and $global:DUET_SUCCESSOR -eq 'kimi-1') "successor skips dead codex-1 -> kimi-1"
-  Set-DuetFailedLeader -DuetDir $scratch -Name 'kimi-1' -Term '1' -Reason 'TEST' | Out-Null
-  CheckReturnsFalse { Select-DuetSuccessor -DuetDir $scratch -RosterPath $rr -Failed 'claude' } "successor NONE when all excluded/dead"
+  Check (-not (Get-Command Select-DuetSuccessor -ErrorAction SilentlyContinue)) "automatic successor selection is absent"
+  Check (-not (Get-Command Write-DuetWatchdog -ErrorAction SilentlyContinue)) "watchdog mutation surface is absent"
 }
 finally {
   try { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue } catch { }

@@ -29,7 +29,7 @@ unrelated workdir.
 ## Role and topology
 
 Before assigning or accepting work, read `@DUET_DIR@/leader`. It records the
-current leadership term and leader name.
+current leadership generation and leader name.
 
 If it names you as leader, decompose the user's goal, assign workers disjoint
 file or subsystem scopes, and record ownership and progress in
@@ -42,14 +42,14 @@ scope. Send replies only to the symbolic recipient `leader`; workers never
 message one another. The symbolic route follows leadership changes at delivery
 time.
 
-If your pane was leader and another agent is promoted, stop assigning work
-immediately and continue as a worker. A recovered former leader must not resume
-old-term leadership or assignments.
+If your pane was leader and an operator hands leadership to another agent, stop
+assigning immediately and continue as a worker. A prior leader must not resume
+old-generation leadership or assignments on its own.
 
 ## Receiving and replying
 
 Duet messages arrive as ordinary prompts wrapped in a header and footer. The
-header identifies the session, sender, leadership term, and stable message ID.
+header identifies the session, sender, leadership generation, and stable message ID.
 Delivery is at-least-once: if an ID appears again, do not repeat its work, side
 effects, or a reply already sent for that ID. Mention a suppressed duplicate in
 the next otherwise-required report when useful.
@@ -62,14 +62,25 @@ Messages from the human at the keyboard have no duet header. The current leader
 handles them normally. A worker must not act as a second user-facing leader;
 route task-relevant findings to `leader` with the pinned command above.
 
-## Promotion and recovery
+## Manual handoff and recovery
 
-The delivery daemon may promote the next eligible live roster member after a
-leader failure. The new leader receives a promotion notice before ordinary
-traffic. On promotion, read `@DUET_DIR@/leader`,
-`@DUET_DIR@/transcript.md`, and `@DUET_DIR@/assignments.md`; establish the
-current term, completed message IDs, and outstanding scopes before continuing.
-Reconcile existing assignments rather than duplicating them.
+The delivery daemon never chooses a leader. The initiator remains leader until
+the human operator explicitly hands leadership to a named live member. Do not
+promote yourself, choose a target from roster rank, or infer a handoff from a
+dead or unresponsive pane.
+
+Pinned status distinguishes confirmed death from identity uncertainty. For a
+confirmed-dead leader it prints one ready-to-run handoff command per live
+target; for UNKNOWN it recommends none:
+
+    bash "@PLUGIN@/scripts/duet-status.sh" --session "@DUET_DIR@/duet.env"
+
+After an explicit handoff notice names you as leader, read
+`@DUET_DIR@/leader`, `@DUET_DIR@/transcript.md`, and
+`@DUET_DIR@/assignments.md`. Establish the current generation, completed
+message IDs, and outstanding scopes before continuing. Reconcile existing
+assignments rather than duplicating them. A prior leader stays a worker unless
+a later explicit handoff selects it again.
 
 The transcript records enqueue intent. A transcript-only entry is not proof
 that the prompt landed or that its recipient acted.

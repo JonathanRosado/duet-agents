@@ -2,20 +2,20 @@
 
 Run **Claude Code**, **Codex CLI**, and **Kimi CLI** as a visible, leader-led
 agent ensemble in tmux or psmux. The Claude that starts the session leads; up
-to four named workers collaborate in adjacent panes, with leader failover if
-the leader disappears or can no longer receive messages.
+to four named workers collaborate in adjacent panes. Leadership changes only
+when the human operator names a new leader.
 
 This repository is a Claude Code plugin marketplace. Installing the `duet`
 plugin adds `/duet:duet`, which creates the panes, durable briefs, message
 queues, delivery daemon, and session transcript.
 
 ```text
-                         leadership state
-                         {term, leader}
+                           leader record
+                     {generation, member}
                                 │
                  ┌──────────────▼──────────────┐
                  │  queue + delivery daemon   │
-                 │  watchdog + session fence  │
+                 │ generation/session fences  │
                  └──────┬──────────────┬──────┘
                         │              │
     you ──▶ Claude      ▼              ▼
@@ -29,7 +29,7 @@ simple duet discipline: one message, one reply, then wait.
 
 The queued n-agent protocol runs through Bash/tmux on macOS and Linux and
 through PowerShell/psmux on Windows. Both paths use the same roster, session
-fences, delivery states, and leader-failover rules.
+fences, delivery states, and operator-controlled leadership rules.
 
 ## Why queues instead of screen-scraping
 
@@ -48,16 +48,17 @@ The transport has a few important properties:
   therefore does not block the others. Urgent interrupts can supersede an
   undeliverable normal message.
 - **Fenced leadership.** Every payload carries a session ID, stable message ID,
-  and leadership term. Worker replies use the symbolic recipient `leader`,
-  which is resolved only when delivered. Messages from a stale leader term and
+  and leadership generation. Worker replies use the symbolic recipient `leader`,
+  which is resolved only when delivered. Messages from a stale leader generation and
   payloads from another session are quarantined.
-- **Ranked failover.** The daemon watches the current leader. A dead pane or
-  three consecutive verified delivery failures promotes the next eligible live
-  roster member. The failed incumbent is excluded from automatic succession,
-  and the new leader's promotion notice is delivered before ordinary traffic.
+- **Manual handoff.** The initiator leads until the operator runs
+  `duet-promote` with an explicit target. The daemon never chooses a leader.
+  A durable MANUAL intent, generation compare-and-swap, and uncertain-composer
+  guard keep the handoff ordered. A crashed daemon may finish only the exact
+  recorded target.
 - **Durable recovery.** The role-neutral protocol is anchored in `AGENTS.md` or
   `CLAUDE.md`; `transcript.md`, `assignments.md`, and the leadership state let a
-  promoted or context-compacted agent recover.
+  newly selected or context-compacted agent recover.
 - **At-least-once delivery.** A crash during an uncertain submit can result in
   the same stable message ID appearing more than once. Agents are instructed to
   suppress duplicate work by ID. Exactly-once delivery is not claimed.
@@ -280,12 +281,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
   `transcript.md`, `assignments.md`, and `leader` files before continuing.
 - If sends are refused because the daemon is down or the session is draining,
   inspect status/doctor rather than bypassing the queue.
-- If automatic succession is unsuitable, run the fenced promotion transaction
-  from the current leader pane:
+- Leadership never changes automatically. If the leader dies or wedges, run
+  status against the pinned session. A confirmed-dead leader produces one
+  complete command per confirmed-live target. UNKNOWN means identity could not
+  be proved, so status does not recommend a target.
+- After the human operator chooses a target, any surviving member may run the
+  fenced handoff. A shell outside the roster must supply the session explicitly:
 
   ```bash
-  DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
-    bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-promote.sh" --to codex-1
+  bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-promote.sh" --to codex-1 \
+    --session "/absolute/path/to/.duet/<session>/duet.env"
   ```
 
   ```powershell
@@ -294,22 +299,21 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
     -Session "C:\absolute\state\<session>\duet.env"
   ```
 
-  Directly editing `leader` is an emergency-only, unsafe last resort: it skips
-  the term compare-and-swap, failed-member exclusion, promotion-first ordering,
-  and notices. Prefer the platform's `duet-promote` script.
-
-  Promotion is a permanent handoff within that session: the former incumbent
-  becomes ineligible and `--force` is intentionally unsupported.
+  The handoff is blocked while a delivery may own a live composer. Let daemon
+  recovery finish, then retry. Directly editing `leader` skips the generation
+  compare-and-swap, composer fence, durable manual intent, and notices. A prior
+  leader remains a worker but can be selected again in a later handoff.
 
 Session artifacts persist under `$DUET_STATE_ROOT/<session>/` after teardown so
 the transcript remains available.
 
-## Upgrading from 0.1.x or Windows 0.2.0
+## Upgrading to 0.3.0
 
-Version 0.2.1 brings the queued n-agent schema to Windows. End any live legacy
-Windows or 0.1.x session, update the plugin through Claude's plugin manager,
-restart Claude so it loads the new plugin cache, and start a fresh ensemble.
-Existing session directories are audit records; they are not upgraded in place.
+Version 0.3.0 replaces automatic election with explicit human-controlled
+handoff on both platform paths. End every live 0.1.x or 0.2.x session before
+updating, restart Claude so it loads the new plugin cache, and start a fresh
+ensemble. Existing session directories remain audit records and are not
+upgraded in place.
 
 Compatibility notes:
 
@@ -318,11 +322,16 @@ Compatibility notes:
   Every message now goes through the queue and delivery daemon.
 - Worker names are suffixed, and worker replies should target `leader` rather
   than a concrete agent name.
-- Every agent-facing send, end, or promotion command now requires an explicit
+- Roster rank is display metadata only. There is no watchdog, automatic
+  successor, `NONE` leader state, or permanent failed-leader exclusion.
+- `duet-promote` requires an explicit target. Its MANUAL queue envelope records
+  the prior generation and leader so the daemon can finish that exact operator
+  choice after a crash without choosing a replacement.
+- Every agent-facing send, end, or handoff command requires an explicit
   session pin (`DUET_CONFIG`, `--session`, or `-Session`). Do not use the
   `current` pointer for agent routing. Human-only status/doctor calls may inspect
   `current`, but pinning them is safer when multiple sessions exist.
-- Do not use a cached 0.1.x `duet-send` against a current session.
+- Do not mix cached 0.1.x or 0.2.x scripts with a 0.3.0 session.
 
 ## Repository layout
 

@@ -1,7 +1,7 @@
 {
   "name": "duet",
-  "version": "0.2.1",
-  "description": "Run Claude, Codex, and Kimi as a visible tmux or psmux ensemble with queued delivery, session fencing, and leader failover.",
+  "version": "0.3.0",
+  "description": "Run Claude, Codex, and Kimi as a visible tmux or psmux ensemble with queued delivery, session fencing, and human-controlled leadership.",
   "author": {
     "name": "Jonathan Rosado",
     "url": "https://github.com/JonathanRosado"

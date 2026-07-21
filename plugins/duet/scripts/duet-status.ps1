@@ -55,21 +55,6 @@ $daemonState = if (Test-DuetDaemonAlive -DuetDir $DuetDir -SessionId $Sid) { 'al
 $backendState = if (Test-DuetServerMatches) { 'matched' } else { 'MISMATCH' }
 $fence = Get-DuetWorkdirFenceState -Config $cfg -DuetDir $DuetDir
 
-$watchdog = Join-Path $DuetDir 'watchdog'
-$watchdogSession = Get-DuetFirstLineValue -Path $watchdog -Key 'session'
-$watchdogTerm = Get-DuetFirstLineValue -Path $watchdog -Key 'term'
-$watchdogLeader = Get-DuetFirstLineValue -Path $watchdog -Key 'leader'
-$watchdogCount = Get-DuetFirstLineValue -Path $watchdog -Key 'count'
-foreach ($name in @('watchdogSession', 'watchdogTerm', 'watchdogLeader', 'watchdogCount')) {
-  if (-not (Get-Variable -Name $name -ValueOnly)) { Set-Variable -Name $name -Value '-' }
-}
-
-$noSuccessorPath = Join-Path $DuetDir 'no-successor'
-$noSuccessor = (Test-Path -LiteralPath $noSuccessorPath -PathType Leaf) -or $global:DUET_CURRENT_LEADER -eq 'NONE'
-$noTerm = if (Test-Path -LiteralPath $noSuccessorPath) { Get-DuetFirstLineValue -Path $noSuccessorPath -Key 'term' } else { '-' }
-$noFailed = if (Test-Path -LiteralPath $noSuccessorPath) { Get-DuetFirstLineValue -Path $noSuccessorPath -Key 'failed' } else { '-' }
-$noReason = if (Test-Path -LiteralPath $noSuccessorPath) { Get-DuetFirstLineValue -Path $noSuccessorPath -Key 'reason' } else { '-' }
-
 $promotionFiles = @()
 $promotionBox = Join-Path (Join-Path $DuetDir 'inbox') 'promotions'
 if (Test-Path -LiteralPath $promotionBox) {
@@ -89,26 +74,52 @@ Write-Output "workdir       : $($cfg['WORKDIR'])"
 Write-Output "workdir fence : $($fence.State) key=$($fence.Key)"
 Write-Output "psmux         : $backendState namespace=$($cfg['DUET_PSMUX_NAMESPACE']) session=$($cfg['DUET_PSMUX_SESSION']) backend=$($cfg['DUET_PSMUX_SERVER_PID'])"
 Write-Output "lifecycle     : $lifecycle"
-Write-Output "leadership    : term=$($global:DUET_CURRENT_TERM) leader=$($global:DUET_CURRENT_LEADER)"
+Write-Output "leadership    : generation=$($global:DUET_CURRENT_TERM) leader=$($global:DUET_CURRENT_LEADER) (manual handoff only)"
 Write-Output "daemon        : $daemonState pid=$daemonPid"
-Write-Output "watchdog      : session=$watchdogSession count=$watchdogCount term=$watchdogTerm leader=$watchdogLeader"
-$noLine = "no successor  : " + $(if ($noSuccessor) { 'yes' } else { 'no' })
-if ($noSuccessor) { $noLine += " term=$noTerm incumbent=$noFailed reason=$noReason" }
-Write-Output $noLine
-$queueLine = "queues        : total=$(Get-DuetPendingCount $DuetDir) symbolic-leader=$(Get-DuetInboxDepth $DuetDir 'leader') promotions=$($promotionFiles.Count)"
+$queueLine = "queues        : total=$(Get-DuetPendingCount $DuetDir) symbolic-leader=$(Get-DuetInboxDepth $DuetDir 'leader') handoffs=$($promotionFiles.Count)"
 if ($promotionFiles.Count -gt 0) { $queueLine += " first=$promotionFirst term=$promotionTerm target=$promotionTarget" }
 Write-Output $queueLine
 
 Write-Output ''
-Write-Output ('{0,-12} {1,-8} {2,4} {3,-8} {4,-11} {5,-6} {6,-8} {7,-12} {8,-5} {9,5}' -f 'NAME', 'HARNESS', 'RANK', 'ROLE', 'ELIGIBILITY', 'PANE', 'PID', 'ALIVE', 'READY', 'INBOX')
+Write-Output ('{0,-12} {1,-8} {2,4} {3,-8} {4,-6} {5,-8} {6,-12} {7,-5} {8,5}' -f 'NAME', 'HARNESS', 'RANK', 'ROLE', 'PANE', 'PID', 'STATE', 'READY', 'INBOX')
 foreach ($row in $rosterRows) {
   $res = Resolve-DuetPaneResolution -PaneId $row.pane_id -PanePid $row.pane_pid
-  $alive = if (-not $res.Known) { 'UNKNOWN' } elseif ($res.Alive) { 'yes' } else { 'no' }
+  $state = if (-not $res.Known) { 'UNKNOWN' } elseif ($res.Alive) { 'alive' } else { 'dead' }
   $role = if ($row.name -eq $global:DUET_CURRENT_LEADER) { 'leader' } else { 'worker' }
-  $eligibility = if (Test-Path -LiteralPath (Join-Path (Join-Path $DuetDir 'failed-leaders') $row.name)) { 'excluded' } elseif (-not ($res.Known -and $res.Alive)) { 'unavailable' } elseif ($role -eq 'leader') { 'incumbent' } else { 'eligible' }
   $ready = if (Test-Path -LiteralPath (Join-Path (Join-Path $DuetDir 'ready') $row.name)) { 'yes' } else { 'no' }
   $depth = Get-DuetInboxDepth -DuetDir $DuetDir -Queue $row.name
-  Write-Output ('{0,-12} {1,-8} {2,4} {3,-8} {4,-11} {5,-6} {6,-8} {7,-12} {8,-5} {9,5}' -f $row.name, $row.harness, $row.rank, $role, $eligibility, $row.pane_id, $row.pane_pid, $alive, $ready, $depth)
+  Write-Output ('{0,-12} {1,-8} {2,4} {3,-8} {4,-6} {5,-8} {6,-12} {7,-5} {8,5}' -f $row.name, $row.harness, $row.rank, $role, $row.pane_id, $row.pane_pid, $state, $ready, $depth)
+}
+
+$leaderRow = @($rosterRows | Where-Object { $_.name -eq $global:DUET_CURRENT_LEADER })
+if ($leaderRow.Count -ne 1) {
+  Write-Output ''
+  Write-Output 'leader state  : UNKNOWN (leader is absent from the roster); no handoff target is recommended.'
+}
+else {
+  $leaderResolution = Resolve-DuetPaneResolution -PaneId $leaderRow[0].pane_id -PanePid $leaderRow[0].pane_pid
+  Write-Output ''
+  if (-not $leaderResolution.Known) {
+    Write-Output 'leader state  : UNKNOWN (pane identity could not be resolved); no handoff target is recommended.'
+  }
+  elseif ($leaderResolution.Alive) {
+    Write-Output 'leader state  : alive; an operator may still hand off a wedged leader explicitly.'
+  }
+  else {
+    Write-Output 'leader unavailable: confirmed dead. Choose one live target and run exactly one command:'
+    $promoteScript = Join-Path $cfg['PLUGIN_DIR'] 'scripts\duet-promote.ps1'
+    $liveTargets = @()
+    foreach ($row in $rosterRows) {
+      if ($row.name -eq $global:DUET_CURRENT_LEADER) { continue }
+      $resolution = Resolve-DuetPaneResolution -PaneId $row.pane_id -PanePid $row.pane_pid
+      if ($resolution.Known -and $resolution.Alive) { $liveTargets += $row }
+    }
+    foreach ($row in $liveTargets) {
+      Write-Output ("  powershell.exe -NoProfile -ExecutionPolicy Bypass -File {0} -To {1} -Session {2}" -f `
+        (ConvertTo-DuetPsLiteral $promoteScript), (ConvertTo-DuetPsLiteral $row.name), (ConvertTo-DuetPsLiteral $cfgPath))
+    }
+    if ($liveTargets.Count -eq 0) { Write-Output '  (no live handoff target is currently confirmed)' }
+  }
 }
 
 exit 0

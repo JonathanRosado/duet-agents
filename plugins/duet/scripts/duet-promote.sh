@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Manually advance a pinned duet session through the same fenced promotion
-# transaction used by the delivery watchdog.
+# Hand leadership of a pinned duet session to one explicit live member.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,16 +7,18 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF_DIR/duet-common.sh"
 
 usage(){
-  echo "usage: duet-promote.sh [--to <roster-name>] [--session <id|dir|duet.env>]" >&2
+  echo "usage: duet-promote.sh --to <roster-name> [--session <id|dir|duet.env>]" >&2
 }
 
 session_arg=""
+session_arg_set=""
 requested=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --session)
       [ "$#" -ge 2 ] || { usage; exit 2; }
       session_arg="$2"
+      session_arg_set=1
       shift 2
       ;;
     --to)
@@ -27,12 +28,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --force)
       usage
-      echo "duet: --force is not supported; failed members remain ineligible." >&2
+      echo "duet: --force is not supported; resolve uncertain delivery, then retry." >&2
       exit 2
       ;;
     *) usage; echo "duet: unknown option '$1'" >&2; exit 2 ;;
   esac
 done
+[ -n "$requested" ] || { usage; echo "duet: --to is required for a manual handoff." >&2; exit 2; }
+[ -z "$session_arg_set" ] || [ -n "$session_arg" ] \
+  || { usage; echo "duet: --session may not be empty." >&2; exit 2; }
 
 caller_session_pin="${DUET_SESSION:-}"
 caller_self="${DUET_SELF:-}"
@@ -50,8 +54,8 @@ unset DUET_SESSION DUET_SESSION_ID DUET_INITIATOR DUET_INITIATOR_PANE DUET_WORKD
 . "$cfg" || { echo "duet: could not load pinned session: $cfg" >&2; exit 1; }
 DUET_CONFIG="$cfg"
 duet_validate_loaded_session "$caller_session_pin" "$cfg" || exit 7
-[ ! -f "$DUET_DIR/.ended" ] || { echo "duet: session has ended; refusing promotion." >&2; exit 1; }
-duet_daemon_alive || { echo "duet: delivery daemon is not alive; refusing promotion." >&2; exit 6; }
+[ ! -f "$DUET_DIR/.ended" ] || { echo "duet: session has ended; refusing handoff." >&2; exit 1; }
+duet_daemon_alive || { echo "duet: delivery daemon is not alive; refusing handoff." >&2; exit 6; }
 duet_read_leader_state || exit 1
 
 pane_name=""
@@ -73,24 +77,18 @@ if [ -z "$pane_name" ] && [ -n "$actual_session" ]; then
   echo "duet: caller belongs to '$actual_session', not pinned session '$DUET_SESSION_ID'; override refused." >&2
   exit 7
 fi
-if [ -z "$pane_name" ] && [ -z "${DUET_ALLOW_PROMOTE_OVERRIDE:-}" ]; then
-  echo "duet: manual promotion requires the current leader pane or DUET_ALLOW_PROMOTE_OVERRIDE=1 outside tmux." >&2
-  exit 7
-fi
-if [ -n "$pane_name" ] && [ "$pane_name" != "$DUET_CURRENT_LEADER" ]; then
-  echo "duet: only current leader '$DUET_CURRENT_LEADER' may promote; caller is '$pane_name'." >&2
+if [ -z "$pane_name" ] && [ -z "$session_arg_set" ]; then
+  echo "duet: an external shell must pin the target with --session." >&2
   exit 7
 fi
 
-if [ -n "$requested" ]; then
-  requested="$(duet_resolve_roster_name "$requested")" || {
-    echo "duet: unknown or ambiguous promotion target." >&2
-    exit 2
-  }
-fi
+requested="$(duet_resolve_roster_name "$requested")" || {
+  echo "duet: unknown or ambiguous handoff target." >&2
+  exit 2
+}
 
 duet_lock_acquire "$DUET_DIR/.delivery.lock" 200 || {
-  echo "duet: could not acquire the delivery/promotion fence." >&2
+  echo "duet: could not acquire the delivery/handoff fence." >&2
   exit 1
 }
 release_delivery(){ duet_lock_release "$DUET_DIR/.delivery.lock" 2>/dev/null || true; }
@@ -98,40 +96,34 @@ trap release_delivery EXIT
 trap 'exit 130' INT TERM
 
 [ ! -f "$DUET_DIR/.ended" ] && [ ! -f "$DUET_DIR/.draining" ] || {
-  echo "duet: session ended or began draining while promotion waited; refusing mutation." >&2
+  echo "duet: session ended or began draining while the handoff waited; refusing mutation." >&2
   exit 1
 }
 duet_daemon_alive || {
-  echo "duet: delivery daemon stopped while promotion waited; refusing mutation." >&2
+  echo "duet: delivery daemon stopped while the handoff waited; refusing mutation." >&2
   exit 6
 }
 duet_read_leader_state || exit 1
 expected_term="$DUET_CURRENT_TERM"
 expected_leader="$DUET_CURRENT_LEADER"
-if [ -n "$pane_name" ] && [ "$pane_name" != "$expected_leader" ]; then
-  echo "duet: leadership changed while waiting for the fence; retry from '$expected_leader'." >&2
-  exit 7
-fi
 if duet_promote_locked "$expected_term" "$expected_leader" \
-    "MANUAL:${pane_name:-admin}" "$requested"; then
+    "MANUAL:${pane_name:-operator}" "$requested"; then
   rc=0
 else
   rc=$?
 fi
 case "$rc" in
   0)
-    echo "duet: promoted term $DUET_PROMOTED_TERM leader $DUET_PROMOTED_LEADER; notice queued first."
-    ;;
-  10)
-    echo "duet: term advanced to $DUET_PROMOTED_TERM with no live eligible successor (leader NONE)." >&2
+    echo "duet: handed off generation $DUET_PROMOTED_TERM to $DUET_PROMOTED_LEADER; notice queued before the leader update."
     ;;
   11)
-    echo "duet: promotion deferred until an uncertain composer is resolved by the delivery daemon." >&2
+    echo "duet: handoff blocked by uncertain delivery. Let the delivery daemon finish recovery, then retry." >&2
     exit 5
     ;;
-  2) echo "duet: promotion lost the term compare-and-swap; retry." >&2; exit 4 ;;
-  3) echo "duet: requested successor is dead, excluded, or the incumbent." >&2; exit 4 ;;
-  *) echo "duet: promotion transaction failed." >&2; exit "$rc" ;;
+  2) echo "duet: handoff lost the generation compare-and-swap; retry." >&2; exit 4 ;;
+  3) echo "duet: target must be a live, noncurrent session member." >&2; exit 4 ;;
+  4) echo "duet: durable manual handoff intent could not be verified." >&2; exit 4 ;;
+  *) echo "duet: handoff transaction failed." >&2; exit "$rc" ;;
 esac
 
 release_delivery

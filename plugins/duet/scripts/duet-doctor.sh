@@ -57,83 +57,23 @@ duet_doctor_check_roster(){
     [ "$name" != "$DUET_CURRENT_LEADER" ] || current_leaders=$((current_leaders + 1))
 
     duet_diag_pane_state "$pane" "$recorded_pid"
-    if [ "$name" = "$DUET_CURRENT_LEADER" ]; then
-      [ "$DUET_DIAG_ALIVE" = yes ] \
-        || duet_doctor_issue "current leader $name is not alive with its recorded pane PID ($DUET_DIAG_ALIVE)"
-    elif [ "$DUET_DIAG_ALIVE" != yes ] \
-        && [ ! -f "$DUET_DIR/failed-leaders/$name" ]; then
-      duet_doctor_issue "eligible member $name is not alive with its recorded pane PID ($DUET_DIAG_ALIVE)"
+    if [ "$DUET_DIAG_LIVENESS" = UNKNOWN ]; then
+      duet_doctor_issue "member $name pane identity is UNKNOWN ($DUET_DIAG_ALIVE)"
+    elif [ "$DUET_DIAG_LIVENESS" = DEAD ]; then
+      if [ "$name" = "$DUET_CURRENT_LEADER" ]; then
+        duet_doctor_issue "leader $name is confirmed dead; an operator must choose a manual handoff target"
+      else
+        duet_doctor_issue "member $name is confirmed dead"
+      fi
     fi
-    if [ "$name" = "$DUET_CURRENT_LEADER" ] \
-        && [ -f "$DUET_DIR/failed-leaders/$name" ]; then
-      duet_doctor_issue "current leader $name is permanently excluded in failed-leaders/"
-    fi
-    if [ ! -f "$DUET_DIR/ready/$name" ] \
-        && [ ! -f "$DUET_DIR/failed-leaders/$name" ]; then
+    if [ ! -f "$DUET_DIR/ready/$name" ]; then
       duet_doctor_issue "readiness marker missing for $name"
     fi
   done < "$DUET_DIR/roster.tsv"
 
-  if [ "$DUET_CURRENT_LEADER" = NONE ]; then
-    duet_doctor_issue "leadership is in the no-live-successor state"
-  elif [ "$current_leaders" -ne 1 ]; then
+  if [ "$current_leaders" -ne 1 ]; then
     duet_doctor_issue "leader '$DUET_CURRENT_LEADER' is not represented exactly once in the roster"
   fi
-}
-
-duet_doctor_check_failed_leaders(){
-  local file name failed_term
-  [ -d "$DUET_DIR/failed-leaders" ] || return 0
-  for file in "$DUET_DIR"/failed-leaders/*; do
-    [ -f "$file" ] || continue
-    name="$(basename "$file")"
-    if ! duet_roster_has_name "$name"; then
-      duet_doctor_issue "failed-leader marker names nonmember '$name'"
-      continue
-    fi
-    failed_term="$(awk -F '\t' '$1 == "term" { print $2; exit }' "$file" 2>/dev/null)"
-    case "$failed_term" in
-      ''|*[!0-9]*) duet_doctor_issue "failed-leader marker for $name has invalid term" ;;
-    esac
-  done
-}
-
-duet_doctor_check_watchdog(){
-  duet_diag_read_watchdog
-  if [ "$DUET_DIAG_WATCHDOG_COUNT" = missing ]; then
-    [ -f "$DUET_DIR/.ended" ] \
-      || duet_doctor_issue "watchdog state is missing"
-    return
-  fi
-  [ "$DUET_DIAG_WATCHDOG_COUNT" != invalid ] \
-    || duet_doctor_issue "watchdog count is invalid"
-  [ "$DUET_DIAG_WATCHDOG_SESSION" = "$DUET_SESSION_ID" ] \
-    || duet_doctor_issue "watchdog session does not match $DUET_SESSION_ID"
-  [ "$DUET_DIAG_WATCHDOG_TERM" = "$DUET_CURRENT_TERM" ] \
-    || duet_doctor_issue "watchdog term does not match leadership term"
-  [ "$DUET_DIAG_WATCHDOG_LEADER" = "$DUET_CURRENT_LEADER" ] \
-    || duet_doctor_issue "watchdog leader does not match leadership state"
-}
-
-duet_doctor_check_no_successor(){
-  local file="$DUET_DIR/no-successor" record_session record_term
-  if [ "$DUET_CURRENT_LEADER" = NONE ]; then
-    if [ ! -f "$file" ]; then
-      duet_doctor_issue "leader is NONE but no-successor record is missing"
-      return
-    fi
-  elif [ -f "$file" ]; then
-    duet_doctor_issue "stale no-successor record exists while leader is $DUET_CURRENT_LEADER"
-    return
-  else
-    return
-  fi
-  record_session="$(awk -F '\t' '$1 == "session" { print $2; exit }' "$file" 2>/dev/null)"
-  record_term="$(awk -F '\t' '$1 == "term" { print $2; exit }' "$file" 2>/dev/null)"
-  [ "$record_session" = "$DUET_SESSION_ID" ] \
-    || duet_doctor_issue "no-successor record has a foreign session"
-  [ "$record_term" = "$DUET_CURRENT_TERM" ] \
-    || duet_doctor_issue "no-successor record term does not match leadership term"
 }
 
 duet_doctor_check_queues(){
@@ -171,15 +111,21 @@ duet_doctor_check_queues(){
       esac
       if [ "$queue" = promotions ]; then
         promotion_count=$((promotion_count + 1))
-        [ "$DUET_MESSAGE_TERM" = "$DUET_CURRENT_TERM" ] \
-          || duet_doctor_issue "pending promotion $(basename "$file") has stale/future term $DUET_MESSAGE_TERM"
-        [ "$DUET_MESSAGE_RECIPIENT" = "$DUET_CURRENT_LEADER" ] \
-          || duet_doctor_issue "pending promotion $(basename "$file") targets $DUET_MESSAGE_RECIPIENT, not current leader"
+        if [ "$DUET_MESSAGE_HANDOFF_MODE" != MANUAL ] \
+            || ! duet_roster_has_name "$DUET_MESSAGE_PRIOR_LEADER" \
+            || ! duet_roster_has_name "$DUET_MESSAGE_RECIPIENT"; then
+          duet_doctor_issue "pending handoff $(basename "$file") has an invalid manual intent"
+        elif ! { [ "$DUET_CURRENT_TERM" = "$DUET_MESSAGE_PRIOR_TERM" ] \
+                  && [ "$DUET_CURRENT_LEADER" = "$DUET_MESSAGE_PRIOR_LEADER" ]; } \
+            && ! { [ "$DUET_CURRENT_TERM" = "$DUET_MESSAGE_TERM" ] \
+                  && [ "$DUET_CURRENT_LEADER" = "$DUET_MESSAGE_RECIPIENT" ]; }; then
+          duet_doctor_issue "pending handoff $(basename "$file") is obsolete for the current leader generation"
+        fi
       fi
     done
   done
   [ "$promotion_count" -le 1 ] \
-    || duet_doctor_issue "$promotion_count simultaneous promotion obligations are active"
+    || duet_doctor_issue "$promotion_count simultaneous manual handoff obligations are active"
 }
 
 duet_doctor_check_workdir_fence(){
@@ -274,6 +220,7 @@ duet_doctor_main(){
   echo "=== duet doctor ==="
   duet_diag_print_summary
   duet_diag_print_roster
+  duet_diag_print_handoff_guidance
   echo
   echo "checks:"
 
@@ -284,9 +231,6 @@ duet_doctor_main(){
   fi
   duet_doctor_check_daemon
   duet_doctor_check_roster
-  duet_doctor_check_failed_leaders
-  duet_doctor_check_watchdog
-  duet_doctor_check_no_successor
   duet_doctor_check_queues
   duet_doctor_check_workdir_fence
 

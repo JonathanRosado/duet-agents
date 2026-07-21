@@ -265,7 +265,7 @@ trap 'exit 130' INT TERM
 
 mkdir -p "$DUET_DIR/ready"
 : > "$DUET_DIR/transcript.md"
-printf '# Duet assignments\n\nTerm 0 leader: claude\n' > "$DUET_DIR/assignments.md"
+printf '# Duet assignments\n\nGeneration 0 leader: claude\n' > "$DUET_DIR/assignments.md"
 printf 'ok\n' > "$DUET_DIR/ready/$INITIATOR_NAME"
 
 for name in "${worker_names[@]}"; do
@@ -295,7 +295,6 @@ if ! duet_publish_temp_file "$leader_tmp" "$DUET_DIR/leader"; then
   echo "duet: could not publish initial leadership state." >&2
   exit 7
 fi
-duet_watchdog_write 0 "$INITIATOR_NAME" 0
 
 render_brief(){
   local line
@@ -486,4 +485,4 @@ if [ "$failed" -ne 0 ]; then
   echo "duet: one or more workers did not confirm readiness; session left running for diagnosis." >&2
   exit 5
 fi
-echo "duet: all workers READY; leader=$INITIATOR_NAME term=0"
+echo "duet: all workers READY; leader=$INITIATOR_NAME generation=0"
