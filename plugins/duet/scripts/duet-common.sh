@@ -462,29 +462,73 @@ duet_daemon_process_matches(){
 
 duet_stop_daemon(){
   local dir="${1:-}" loops="${2:-30}" pid owner owner_pid i session_id
-  local config_path
+  local config_path pid_path lock_path
   [ -n "$dir" ] || return 0
   dir="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
   session_id="$(basename "$dir")"
   config_path="$dir/duet.env"
+  pid_path="$dir/daemon.pid"
+  lock_path="$dir/.daemon.lock"
 
-  pid="$(cat "$dir/daemon.pid" 2>/dev/null || true)"
-  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
-  kill -0 "$pid" 2>/dev/null || return 0
-  owner="$(duet_lock_owner_read "$dir/.daemon.lock")"
-  owner_pid="${owner%%$'\t'*}"
-  if [ "$owner_pid" != "$pid" ] \
-      || ! duet_daemon_process_matches "$pid" "$config_path" "$session_id"; then
-    echo "duet: daemon identity is inconsistent; refusing to signal pid $pid." >&2
-    return 1
+  pid="$(cat "$pid_path" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*)
+      if [ -e "$pid_path" ] || [ -L "$pid_path" ]; then
+        echo "duet: daemon state is incomplete; refusing unverified cleanup." >&2
+        return 1
+      fi
+      # The daemon removes its pid file immediately before releasing its lock.
+      # If end observes that gap, wait for the verified owner to finish rather
+      # than reporting a stale-lock failure.
+      for i in $(seq 1 "$loops"); do
+        if [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+          return 0
+        fi
+        sleep 0.1
+      done
+      echo "duet: daemon exited without completing lock cleanup." >&2
+      return 1
+      ;;
+  esac
+  # duet-end publishes .ended before calling here. Give the daemon one short
+  # poll window to take that orderly path; signaling while its EXIT trap is
+  # already removing daemon.pid can otherwise interrupt lock cleanup.
+  if [ -f "$dir/.ended" ]; then
+    for i in 1 2 3 4 5; do
+      if ! kill -0 "$pid" 2>/dev/null \
+          && [ ! -e "$pid_path" ] && [ ! -L "$pid_path" ] \
+          && [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+        return 0
+      fi
+      sleep 0.1
+    done
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    owner="$(duet_lock_owner_read "$lock_path")"
+    owner_pid="${owner%%$'\t'*}"
+    if [ "$owner_pid" != "$pid" ] \
+        || ! duet_daemon_process_matches "$pid" "$config_path" "$session_id"; then
+      echo "duet: daemon identity is inconsistent; refusing to signal pid $pid." >&2
+      return 1
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
   fi
 
-  kill -TERM "$pid" 2>/dev/null || true
+  # Cleanup removes daemon.pid just before releasing .daemon.lock. Wait for
+  # both artifacts as well as process exit so end cannot race that tiny gap.
   for i in $(seq 1 "$loops"); do
-    kill -0 "$pid" 2>/dev/null || return 0
+    if ! kill -0 "$pid" 2>/dev/null \
+        && [ ! -e "$pid_path" ] && [ ! -L "$pid_path" ] \
+        && [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+      return 0
+    fi
     sleep 0.1
   done
-  echo "duet: delivery daemon $pid did not exit after TERM." >&2
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "duet: delivery daemon $pid did not exit after TERM." >&2
+  else
+    echo "duet: delivery daemon $pid exited without completing cleanup." >&2
+  fi
   return 1
 }
 
@@ -506,8 +550,13 @@ duet_kill_spawned_panes(){
       actual_pid="$(_duet_tmux display-message -p -t "$legacy_pane" '#{pane_pid}' 2>/dev/null || true)"
       if [ "$actual_pid" = "$legacy_pid" ] \
           && ! _duet_tmux kill-pane -t "$legacy_pane" 2>/dev/null; then
-        echo "duet: failed to stop spawned legacy pane $legacy_pane." >&2
-        return 1
+        # The process may exit between the identity check and kill-pane. A
+        # missing/recycled pane means the recorded victim is already gone.
+        actual_pid="$(_duet_tmux display-message -p -t "$legacy_pane" '#{pane_pid}' 2>/dev/null || true)"
+        if [ "$actual_pid" = "$legacy_pid" ]; then
+          echo "duet: failed to stop spawned legacy pane $legacy_pane." >&2
+          return 1
+        fi
       fi
     fi
     return 0
@@ -537,8 +586,13 @@ duet_kill_spawned_panes(){
     actual_pid="$(_duet_tmux display-message -p -t "$victim_pane" '#{pane_pid}' 2>/dev/null || true)"
     if [ "$actual_pid" = "$victim_pid" ] \
         && ! _duet_tmux kill-pane -t "$victim_pane" 2>/dev/null; then
-      echo "duet: failed to stop spawned pane $victim_pane." >&2
-      failed=1
+      # send-keys may have made the pane exit after the identity check. Only a
+      # still-matching tuple is a teardown failure; absence or reuse is safe.
+      actual_pid="$(_duet_tmux display-message -p -t "$victim_pane" '#{pane_pid}' 2>/dev/null || true)"
+      if [ "$actual_pid" = "$victim_pid" ]; then
+        echo "duet: failed to stop spawned pane $victim_pane." >&2
+        failed=1
+      fi
     fi
   done
   [ -z "$failed" ]

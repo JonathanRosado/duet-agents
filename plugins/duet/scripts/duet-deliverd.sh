@@ -306,11 +306,19 @@ duet_deliverd_pass(){
 
 duet_deliverd_cleanup(){
   local exit_status="${1:-0}"
-  local daemon_pid="${DUET_DAEMON_PID:-${BASHPID:-$$}}" recorded
+  local daemon_pid="${DUET_DAEMON_PID:-${BASHPID:-$$}}" recorded lock_owner
+  # Once cleanup starts, a late teardown signal must not split the pid-file
+  # removal from lock release.
+  trap '' INT TERM
   recorded="$(cat "${DUET_DIR:-}/daemon.pid" 2>/dev/null || true)"
   [ "$recorded" != "$daemon_pid" ] || rm -f "$DUET_DIR/daemon.pid"
-  [ -z "${DUET_DIR:-}" ] \
-    || duet_lock_release "$DUET_DIR/.daemon.lock" 2>/dev/null || true
+  if [ -n "${DUET_DIR:-}" ] \
+      && ! duet_lock_release "$DUET_DIR/.daemon.lock" 2>/dev/null; then
+    lock_owner="$(duet_lock_owner_read "$DUET_DIR/.daemon.lock")"
+    duet_deliverd_log \
+      "daemon lock cleanup failed owner=$lock_owner token=${DUET_LOCK_TOKEN:-unset}" \
+      2>/dev/null || true
+  fi
   if [ -n "${DUET_DAEMON_ACTIVE:-}" ] \
       && [ -z "${DUET_DAEMON_ORDERLY_STOP:-}" ] \
       && [ -n "${DUET_DIR:-}" ] && [ ! -f "$DUET_DIR/.ended" ] \

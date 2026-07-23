@@ -150,6 +150,47 @@ assert_no_ownership_artifacts(){
   [ -z "$found" ] || die "session-ownership artifact created: $found"
 }
 
+test_pane_exit_during_teardown(){
+  local roster="$ROOT/teardown-race.tsv"
+  local gone="$ROOT/teardown-race.gone"
+  printf 'name\tharness\tpane_id\tpane_pid\trank\tspawned\n' > "$roster"
+  printf 'codex-1\tcodex\t%%9\t4242\t0\t1\n' >> "$roster"
+
+  (
+    # shellcheck disable=SC1090
+    . "$COMMON"
+    _duet_tmux(){
+      case "$1" in
+        display-message) [ ! -f "$gone" ] && printf '4242\n' ;;
+        send-keys) return 0 ;;
+        kill-pane) : > "$gone"; return 1 ;;
+        *) return 1 ;;
+      esac
+    }
+    duet_kill_spawned_panes "$roster" '%0'
+  ) || die "pane exit racing kill-pane was reported as teardown failure"
+
+  rm -f "$gone"
+  if (
+    # shellcheck disable=SC1090
+    . "$COMMON"
+    _duet_tmux(){
+      case "$1" in
+        display-message) printf '4242\n' ;;
+        send-keys) return 0 ;;
+        kill-pane) return 1 ;;
+        *) return 1 ;;
+      esac
+    }
+    duet_kill_spawned_panes "$roster" '%0'
+  ) > /dev/null 2> "$ROOT/teardown-stuck.err"; then
+    die "still-live pane was accepted after kill-pane failed"
+  fi
+  grep -q 'failed to stop spawned pane %9' "$ROOT/teardown-stuck.err" \
+    || die "still-live pane failure was not surfaced"
+  printf 'PASS teardown tolerates exit race but rejects a still-live victim\n'
+}
+
 command -v tmux >/dev/null 2>&1 || {
   printf 'SKIP: tmux is not installed\n'
   exit 0
@@ -165,6 +206,7 @@ fi
 
 mkdir -p "$STATE_ROOT" "$REPO" "$ROOT/worktrees" "$FAKEBIN" \
   "$ACCEPT_A" "$ACCEPT_B"
+test_pane_exit_during_teardown
 for harness in claude codex kimi; do
   ln -s "$FIXTURE" "$FAKEBIN/$harness"
 done
