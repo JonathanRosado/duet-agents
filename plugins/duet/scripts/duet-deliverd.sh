@@ -193,6 +193,10 @@ duet_process_one(){
   else
     rc=$?
   fi
+  if [ -n "${DUET_SEND_COLLAPSED:-}" ]; then
+    duet_deliverd_log \
+      "observed $target_harness collapsed composer for $DUET_MESSAGE_ID -> $DUET_TARGET_NAME"
+  fi
 
   case "$rc" in
     0)

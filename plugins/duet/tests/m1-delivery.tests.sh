@@ -340,7 +340,7 @@ test_ambiguous_delivery_stops_loudly(){
 }
 
 test_concurrent_fifo_and_dedupe(){
-  local box pids="" pid i expected actual first duplicate
+  local box pids="" pid i expected actual bodies expected_bodies first duplicate
   create_state concurrent
   FAKE_LOG="$DUET_DIR/fake.log"
   : > "$FAKE_LOG"
@@ -368,23 +368,34 @@ test_concurrent_fifo_and_dedupe(){
 
   expected="$DUET_DIR/expected.ids"
   actual="$DUET_DIR/actual.ids"
+  bodies="$DUET_DIR/enqueued.bodies"
+  expected_bodies="$DUET_DIR/expected.bodies"
   : > "$expected"
+  : > "$bodies"
   for i in "$box"/N-*.msg; do
     [ -f "$i" ] || continue
     duet_read_message "$i" || {
       fail "invalid concurrent envelope $i"
       continue
     }
-    printf '%s\n' "$DUET_MESSAGE_ID" >> "$expected"
+    printf '%s\t%s\n' "$DUET_MESSAGE_ID" "$DUET_MESSAGE_BODY" >> "$expected"
+    printf '%s\n' "$DUET_MESSAGE_BODY" >> "$bodies"
   done
+  : > "$expected_bodies"
+  for i in $(seq 1 50); do printf 'concurrent-%s\n' "$i"; done \
+    | LC_ALL=C sort > "$expected_bodies"
+  LC_ALL=C sort "$bodies" > "$bodies.sorted"
+  cmp -s "$expected_bodies" "$bodies.sorted" \
+    || fail "concurrent enqueue bodies were lost, duplicated, or corrupted"
   for i in $(seq 1 50); do
     duet_deliverd_pass || {
       fail "FIFO pass $i failed"
       break
     }
   done
-  awk -F '\t' '{ print $1 }' "$FAKE_LOG" > "$actual"
-  cmp -s "$expected" "$actual" || fail "delivery order differs from queue order"
+  awk -F '\t' '{ print $1 "\t" $3 }' "$FAKE_LOG" > "$actual"
+  cmp -s "$expected" "$actual" \
+    || fail "delivery order or body fidelity differs from the queue"
   assert_eq 50 "$(delivered_count "$box")" "all 50 delivered"
   assert_eq 0 "$(active_count "$box")" "queue completed"
 
