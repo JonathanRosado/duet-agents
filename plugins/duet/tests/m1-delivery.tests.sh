@@ -416,6 +416,72 @@ test_failed_head_is_fair_and_fifo(){
   assert_no_file "$codex_box/N-0000000001.msg.tries" "no durable attempts"
 }
 
+test_persistent_stall_blocks_only_recipient(){
+  local codex_box kimi_box pass status_file
+  local DUET_NOT_LANDED_LIMIT=3
+  create_state bounded-stall
+  FAKE_LOG="$DUET_DIR/fake.log"
+  : > "$FAKE_LOG"
+  FAKE_STALLED_TARGET=codex-1
+  FAKE_AMBIGUOUS_TARGET=""
+  enqueue_one codex-1 normal-head
+  enqueue_one codex-1 normal-successor
+  for pass in $(seq 1 7); do enqueue_one kimi-1 "healthy-peer-$pass"; done
+  codex_box="$DUET_DIR/inbox/codex-1"
+  kimi_box="$DUET_DIR/inbox/kimi-1"
+
+  # Two failures accrue on the normal head.
+  duet_deliverd_pass || fail "bounded-stall pass 1 failed"
+  duet_deliverd_pass || fail "bounded-stall pass 2 failed"
+  assert_no_file "$DUET_DIR/blocked/codex-1" \
+    "recipient blocked before configured bound"
+
+  # A high-priority head change starts a fresh window: its first failure must
+  # not inherit the normal head's two failures.
+  duet_enqueue_message codex-1 claude codex-1 INTERRUPT interrupt-head \
+    || fail "could not enqueue interrupt head"
+  duet_deliverd_pass || fail "bounded-stall interrupt failure pass failed"
+  assert_no_file "$DUET_DIR/blocked/codex-1" \
+    "head change did not reset consecutive failures"
+
+  # The same interrupt head now succeeds, which resets its recipient counter.
+  FAKE_STALLED_TARGET=""
+  duet_deliverd_pass || fail "bounded-stall interrupt success pass failed"
+  assert_eq 1 "$(delivered_count "$codex_box")" \
+    "interrupt head did not deliver"
+
+  # Returning to the old normal head is another head change. It gets a full
+  # three fresh attempts before that recipient alone becomes blocked.
+  FAKE_STALLED_TARGET=codex-1
+  duet_deliverd_pass || fail "bounded-stall fresh pass 1 failed"
+  duet_deliverd_pass || fail "bounded-stall fresh pass 2 failed"
+  assert_no_file "$DUET_DIR/blocked/codex-1" \
+    "successful delivery did not reset consecutive failures"
+  duet_deliverd_pass || fail "bounded-stall terminal pass failed"
+
+  assert_file "$DUET_DIR/blocked/codex-1" "wedged recipient block marker"
+  assert_contains "$DUET_DIR/blocked/codex-1" \
+    "composer wedged: 3 consecutive delivery attempts" \
+    "wedged recipient reason"
+  assert_contains "$DUET_DIR/deliverd.log" \
+    "BLOCKED recipient codex-1: composer wedged: 3 consecutive delivery attempts" \
+    "wedged recipient was not surfaced in daemon log"
+  status_file="$DUET_DIR/status.out"
+  if ! /bin/bash -c '. "$1"; duet_diag_print_roster' \
+      _ "$PLUGIN_DIR/scripts/duet-status.sh" > "$status_file"; then
+    fail "status could not render the blocked recipient"
+  elif ! awk '$1 == "codex-1" && $6 == "blocked" { found=1 }
+      END { exit !found }' "$status_file"; then
+    fail "status did not surface codex-1 as blocked"
+  fi
+  assert_no_file "$DUET_DIR/.unhealthy" \
+    "persistent stall marked whole session unhealthy"
+  assert_eq 2 "$(active_count "$codex_box")" \
+    "blocked recipient did not retain its head and successor"
+  assert_eq 7 "$(delivered_count "$kimi_box")" \
+    "healthy peer did not advance during every stalled pass"
+}
+
 test_ambiguous_delivery_blocks_only_recipient(){
   create_state ambiguous
   FAKE_LOG="$DUET_DIR/fake.log"
@@ -514,6 +580,8 @@ run_case 'verified send pastes once and retries Enter only' \
   test_verified_send_fsm
 run_case 'failed head preserves FIFO without blocking peers' \
   test_failed_head_is_fair_and_fifo
+run_case 'persistent pre-landing stall blocks only its recipient' \
+  test_persistent_stall_blocks_only_recipient
 run_case 'post-paste ambiguity blocks only its recipient' \
   test_ambiguous_delivery_blocks_only_recipient
 run_case '50 concurrent enqueues preserve FIFO and dedupe IDs' \

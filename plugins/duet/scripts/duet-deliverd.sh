@@ -10,6 +10,13 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SELF_DIR/duet-common.sh"
 
+# Daemon-lifetime only: v4 never persists delivery retry state or recovers a
+# crashed daemon. Arrays keep exact roster names without lossy shell-name
+# canonicalization (for example, `peer-1` and `peer_1` remain distinct).
+DUET_NOT_LANDED_NAMES=()
+DUET_NOT_LANDED_HEADS=()
+DUET_NOT_LANDED_COUNTS=()
+
 duet_deliverd_log(){
   printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" \
     >> "${DUET_DIR:?}/deliverd.log"
@@ -134,9 +141,59 @@ duet_block_recipient(){
   printf 'duet: recipient %s blocked: %s\n' "$name" "$reason" >&2
 }
 
+duet_not_landed_slot(){
+  local name="${1:?recipient required}" i
+  DUET_NOT_LANDED_SLOT=""
+  for i in ${DUET_NOT_LANDED_NAMES[@]+"${!DUET_NOT_LANDED_NAMES[@]}"}; do
+    if [ "${DUET_NOT_LANDED_NAMES[$i]}" = "$name" ]; then
+      DUET_NOT_LANDED_SLOT="$i"
+      return 0
+    fi
+  done
+  DUET_NOT_LANDED_SLOT="${#DUET_NOT_LANDED_NAMES[@]}"
+  DUET_NOT_LANDED_NAMES[$DUET_NOT_LANDED_SLOT]="$name"
+  DUET_NOT_LANDED_HEADS[$DUET_NOT_LANDED_SLOT]=""
+  DUET_NOT_LANDED_COUNTS[$DUET_NOT_LANDED_SLOT]=0
+}
+
+# A different physical queue head starts a fresh consecutive-failure window.
+duet_not_landed_observe_head(){
+  local name="${1:?recipient required}" head="${2:?head required}" slot
+  duet_not_landed_slot "$name"
+  slot="$DUET_NOT_LANDED_SLOT"
+  if [ "${DUET_NOT_LANDED_HEADS[$slot]}" != "$head" ]; then
+    DUET_NOT_LANDED_HEADS[$slot]="$head"
+    DUET_NOT_LANDED_COUNTS[$slot]=0
+  fi
+}
+
+duet_not_landed_reset(){
+  local name="${1:?recipient required}" slot
+  duet_not_landed_slot "$name"
+  slot="$DUET_NOT_LANDED_SLOT"
+  DUET_NOT_LANDED_COUNTS[$slot]=0
+}
+
+duet_not_landed_increment(){
+  local name="${1:?recipient required}" slot count
+  local configured="${DUET_NOT_LANDED_LIMIT:-30}"
+  if ! duet_decimal_d10 "$configured" || [ "$DUET_DECIMAL_VALUE" = 0 ]; then
+    configured=30
+  else
+    configured="$DUET_DECIMAL_VALUE"
+  fi
+  duet_not_landed_slot "$name"
+  slot="$DUET_NOT_LANDED_SLOT"
+  count=$(( ${DUET_NOT_LANDED_COUNTS[$slot]:-0} + 1 ))
+  DUET_NOT_LANDED_COUNTS[$slot]="$count"
+  DUET_NOT_LANDED_COUNT="$count"
+  DUET_NOT_LANDED_BOUND="$configured"
+}
+
 # Process at most one head from one physical queue. A definitely-not-landed
-# head remains in place and stalls only this queue. A post-paste ambiguity
-# blocks only this recipient and is never retried or repasted.
+# head is retried for a bounded number of passes before blocking only this
+# recipient. A post-paste ambiguity blocks immediately and is never retried or
+# repasted.
 duet_process_one(){
   local box="${1:?queue directory required}" exact_file="${2:-}"
   local file queue payload interrupt="" target_harness rc id_prefix id_sequence reason
@@ -154,6 +211,7 @@ duet_process_one(){
   fi
 
   queue="$(basename "$box")"
+  duet_not_landed_observe_head "$queue" "$file"
   if ! duet_message_sequence "$file"; then
     reason="invalid message filename in inbox/$queue"
     duet_move_rejected "$file" "$reason" || {
@@ -252,10 +310,21 @@ duet_process_one(){
         duet_mark_unhealthy "could not archive delivered message $DUET_MESSAGE_ID"
         return 1
       }
+      duet_not_landed_reset "$DUET_TARGET_NAME"
       duet_deliverd_log "delivered $DUET_MESSAGE_ID -> $DUET_TARGET_NAME"
       ;;
     "$DUET_SEND_NOT_LANDED")
-      duet_deliverd_log "stalled $DUET_MESSAGE_ID -> $DUET_TARGET_NAME before landing"
+      duet_not_landed_increment "$DUET_TARGET_NAME"
+      if [ "$DUET_NOT_LANDED_COUNT" -ge "$DUET_NOT_LANDED_BOUND" ]; then
+        reason="composer wedged: $DUET_NOT_LANDED_COUNT consecutive delivery attempts for $DUET_MESSAGE_ID did not land"
+        duet_block_recipient "$DUET_TARGET_NAME" "$reason" || {
+          duet_deliverd_log \
+            "could not persist recipient block after $reason"
+        }
+      else
+        duet_deliverd_log \
+          "stalled $DUET_MESSAGE_ID -> $DUET_TARGET_NAME before landing ($DUET_NOT_LANDED_COUNT/$DUET_NOT_LANDED_BOUND)"
+      fi
       ;;
     "$DUET_SEND_DEAD")
       reason="died while delivering $DUET_MESSAGE_ID"
