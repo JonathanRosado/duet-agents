@@ -7,7 +7,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF_DIR/duet-common.sh"
 
 usage(){
-  echo "usage: duet-send.sh <exact-roster-name|all> [--interrupt] [--from <name>] [--session <id|dir|duet.env>]" >&2
+  echo "usage: DUET_CONFIG=/absolute/session/duet.env duet-send.sh <exact-roster-name|all> [--interrupt] [--from <name>]" >&2
 }
 
 recipient="${1:-}"
@@ -15,7 +15,6 @@ recipient="${1:-}"
 [ -n "$recipient" ] || { usage; exit 2; }
 interrupt=""
 from=""
-session_arg=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --interrupt) interrupt=1; shift ;;
@@ -24,30 +23,24 @@ while [ "$#" -gt 0 ]; do
       from="$2"
       shift 2
       ;;
-    --session)
-      [ "$#" -ge 2 ] || { usage; exit 2; }
-      session_arg="$2"
-      shift 2
-      ;;
     *) usage; echo "duet: unknown option '$1'" >&2; exit 2 ;;
   esac
 done
 
-caller_session_pin="${DUET_SESSION:-}"
 caller_self="${DUET_SELF:-}"
 duet_capture_caller_identity || {
   echo "duet: caller is not an identifiable tmux pane." >&2
   exit 7
 }
 
-duet_resolve_config "$session_arg" 0 || exit 1
+duet_resolve_config "" 1 || exit 1
 cfg="$DUET_RESOLVED_CONFIG"
 unset DUET_DIR WORKDIR PLUGIN_DIR DUET_TMUX_SOCKET DUET_TMUX_SERVER_PID
-unset DUET_SESSION DUET_SESSION_ID DUET_INITIATOR DUET_INITIATOR_PANE DUET_WORKDIR_KEY
+unset DUET_SESSION DUET_SESSION_ID DUET_INITIATOR DUET_INITIATOR_PANE
 # shellcheck disable=SC1090
 . "$cfg"
 DUET_CONFIG="$cfg"
-duet_validate_loaded_session "$caller_session_pin" "$cfg" || exit 7
+duet_validate_loaded_session "" "$cfg" || exit 7
 [ ! -f "$DUET_DIR/.ended" ] || {
   echo "duet: session has ended; refusing to enqueue." >&2
   exit 1
@@ -79,6 +72,14 @@ if [ "$recipient" != all ] && ! duet_roster_has_name "$recipient"; then
   echo "duet: recipient '$recipient' is not an exact roster name." >&2
   exit 2
 fi
+if [ "$recipient" != all ] && ! duet_roster_member_alive "$recipient"; then
+  echo "duet: recipient '$recipient' is not live; message was not queued." >&2
+  exit 8
+fi
+if [ "$recipient" != all ] && [ -f "$DUET_DIR/blocked/$recipient" ]; then
+  echo "duet: recipient '$recipient' is blocked after ambiguous delivery; message was not queued." >&2
+  exit 8
+fi
 
 body_with_sentinel="$(cat; printf '.')"
 body="${body_with_sentinel%.}"
@@ -102,6 +103,7 @@ while IFS=$'\t' read -r name _harness _pane _pid _rank _spawned; do
   [ "$name" != name ] || continue
   [ "$name" != "$sender" ] || continue
   duet_roster_member_alive "$name" || continue
+  [ ! -f "$DUET_DIR/blocked/$name" ] || continue
   enqueue_one "$name" all
   fanout=$((fanout + 1))
 done < "$DUET_DIR/roster.tsv"

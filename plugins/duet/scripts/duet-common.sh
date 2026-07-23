@@ -18,89 +18,48 @@ _duet_tmux(){
   fi
 }
 
-# Resolve an explicitly pinned session to its config file. Agent-facing
-# commands pass allow_current=0; human diagnostics may opt into the ambient
-# current symlink with allow_current=1.
+# Resolve exactly one absolute config. Runtime commands require DUET_CONFIG;
+# read-only diagnostics may instead pass the same absolute path explicitly.
+# Session IDs, directories, `current`, and newest-session scans are never
+# routing inputs.
 duet_resolve_config(){
-  local session_arg="${1:-}" allow_current="${2:-0}"
-  local state_root="${DUET_STATE_ROOT:-}" cfg="" cfg_dir
-  local env_cfg="${DUET_CONFIG:-}" env_dir requested_dir canonical_root
-  local require_under_root=""
+  local session_arg="${1:-}" require_env="${2:-1}"
+  local cfg="" cfg_dir canonical
   DUET_RESOLVED_CONFIG=""
 
-  if [ -n "$session_arg" ]; then
-    case "$session_arg" in
-      */duet.env) cfg="$session_arg" ;;
-      duet.env) cfg="$session_arg" ;;
-      */*) cfg="${session_arg%/}/duet.env" ;;
-      *)
-        if [ -z "$state_root" ]; then
-          [ -n "${HOME:-}" ] || {
-            echo "duet: HOME or DUET_STATE_ROOT is required to resolve session id '$session_arg'." >&2
-            return 1
-          }
-          state_root="$HOME/.duet"
-        fi
-        cfg="$state_root/$session_arg/duet.env"
-        require_under_root=1
-        ;;
-    esac
-    if [ -n "$env_cfg" ]; then
-      [ -f "$env_cfg" ] && [ ! -L "$env_cfg" ] \
-        && [ -f "$cfg" ] && [ ! -L "$cfg" ] || {
-        echo "duet: DUET_CONFIG and --session do not resolve to the same existing session." >&2
-        return 1
-      }
-      env_dir="$(cd "$(dirname "$env_cfg")" 2>/dev/null && pwd -P)" || return 1
-      requested_dir="$(cd "$(dirname "$cfg")" 2>/dev/null && pwd -P)" || return 1
-      [ "$env_dir/$(basename "$env_cfg")" = "$requested_dir/$(basename "$cfg")" ] || {
-        echo "duet: DUET_CONFIG and --session disagree; refusing ambiguous routing." >&2
-        return 1
-      }
+  if [ "$require_env" = 1 ]; then
+    cfg="${DUET_CONFIG:-}"
+    [ -n "$cfg" ] || {
+      echo "duet: DUET_CONFIG must name an absolute duet.env." >&2
+      return 1
+    }
+    if [ -n "$session_arg" ] && [ "$session_arg" != "$cfg" ]; then
+      echo "duet: --session disagrees with DUET_CONFIG." >&2
+      return 1
     fi
-  elif [ -n "$env_cfg" ]; then
-    cfg="$env_cfg"
-  elif [ -n "${DUET_SESSION:-}" ]; then
-    if [ -z "$state_root" ]; then
-      [ -n "${HOME:-}" ] || {
-        echo "duet: HOME or DUET_STATE_ROOT is required to resolve DUET_SESSION." >&2
-        return 1
-      }
-      state_root="$HOME/.duet"
-    fi
-    cfg="$state_root/$DUET_SESSION/duet.env"
-    require_under_root=1
-  elif [ "$allow_current" = 1 ]; then
-    if [ -z "$state_root" ]; then
-      [ -n "${HOME:-}" ] || {
-        echo "duet: HOME or DUET_STATE_ROOT is required to resolve current." >&2
-        return 1
-      }
-      state_root="$HOME/.duet"
-    fi
-    cfg="$state_root/current/duet.env"
-    require_under_root=1
   else
-    echo "duet: no session was pinned; set DUET_CONFIG/DUET_SESSION or pass --session." >&2
-    return 1
+    cfg="$session_arg"
+    [ -n "$cfg" ] || {
+      echo "duet: an explicit absolute --session duet.env is required." >&2
+      return 1
+    }
   fi
 
+  case "$cfg" in
+    /*/duet.env) : ;;
+    *) echo "duet: config must be an absolute path ending in /duet.env." >&2; return 1 ;;
+  esac
   [ -f "$cfg" ] && [ ! -L "$cfg" ] || {
     echo "duet: pinned session config does not exist: $cfg" >&2
     return 1
   }
   cfg_dir="$(cd "$(dirname "$cfg")" 2>/dev/null && pwd -P)" || return 1
-  if [ -n "$require_under_root" ]; then
-    canonical_root="$(cd "$state_root" 2>/dev/null && pwd -P)" || return 1
-    case "$cfg_dir" in
-      "$canonical_root"/*) : ;;
-      *)
-        echo "duet: resolved session escapes DUET_STATE_ROOT; refusing it." >&2
-        return 1
-        ;;
-    esac
-  fi
-  DUET_RESOLVED_CONFIG="$cfg_dir/$(basename "$cfg")"
+  canonical="$cfg_dir/duet.env"
+  [ "$cfg" = "$canonical" ] || {
+    echo "duet: config path must be canonical: $canonical" >&2
+    return 1
+  }
+  DUET_RESOLVED_CONFIG="$canonical"
 }
 
 # Validate the identity fields after a generated duet.env has been sourced.
@@ -195,21 +154,6 @@ duet_caller_roster_name(){
   roster_pid="${entry#*|}"
   [ "$roster_pid" = "$DUET_CALLER_PANE_PID" ] || return 1
   DUET_CALLER_NAME="${entry%%|*}"
-}
-
-duet_workdir_key(){
-  local workdir="${1:?workdir required}" canonical
-  canonical="$(cd "$workdir" 2>/dev/null && pwd -P)" || return 1
-  if command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$canonical" | shasum -a 256 | awk '{ print $1 }'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    printf '%s' "$canonical" | sha256sum | awk '{ print $1 }'
-  elif command -v openssl >/dev/null 2>&1; then
-    printf '%s' "$canonical" | openssl dgst -sha256 | awk '{ print $NF }'
-  else
-    echo "duet: no SHA-256 implementation is available for the workdir registry." >&2
-    return 1
-  fi
 }
 
 duet_publish_temp_file(){
@@ -357,7 +301,7 @@ _duet_alive(){
 #   DUET_SEND_DEAD                pane disappeared before a verified landing
 #   DUET_SEND_NOT_LANDED          no paste occurred; caller may retry later
 #   DUET_SEND_LANDED_UNVERIFIED   paste may have landed, but submission is
-#                                 ambiguous; the session must stop
+#                                 ambiguous; that recipient must stop
 duet_send_verified(){
   local pane="${1:-}" payload="${2:-}" interrupt="${3:-}" harness="${4:-}"
   local probe buffer i e marker_before marker_now landing_kind="" landing_token=""
@@ -519,67 +463,24 @@ duet_daemon_process_matches(){
 duet_stop_daemon(){
   local dir="${1:-}" loops="${2:-30}" pid owner owner_pid i session_id
   local config_path
-  local pid_live="" owner_live="" identity_valid=""
   [ -n "$dir" ] || return 0
   dir="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
   session_id="$(basename "$dir")"
   config_path="$dir/duet.env"
 
-  # daemon.pid is published just after the lifetime lock is acquired and
-  # removed just before that lock is released. Wait for those short windows to
-  # converge. A dead/stale pid file never proves the daemon is stopped while a
-  # different live process still owns this session's lock.
-  for i in $(seq 1 "$loops"); do
-    pid="$(cat "$dir/daemon.pid" 2>/dev/null || true)"
-    owner="$(duet_lock_owner_read "$dir/.daemon.lock")"
-    owner_pid="${owner%%$'\t'*}"
-    pid_live=""
-    owner_live=""
-    case "$pid" in
-      ''|*[!0-9]*) : ;;
-      *) kill -0 "$pid" 2>/dev/null && pid_live=1 ;;
-    esac
-    case "$owner_pid" in
-      ''|*[!0-9]*) : ;;
-      *) kill -0 "$owner_pid" 2>/dev/null && owner_live=1 ;;
-    esac
-
-    if [ -n "$owner_live" ]; then
-      if [ -n "$pid_live" ] && [ "$pid" = "$owner_pid" ]; then
-        identity_valid=1
-        break
-      fi
-      sleep 0.1
-      continue
-    fi
-    if [ -n "$pid_live" ]; then
-      echo "duet: daemon.pid does not own this session's live daemon lock; refusing to signal it." >&2
-      return 1
-    fi
-    return 0
-  done
-  if [ -z "$identity_valid" ]; then
-    echo "duet: daemon.pid does not own this session's live daemon lock; refusing to signal it." >&2
-    return 1
-  fi
-
-  for i in $(seq 1 "$loops"); do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 0.1
-  done
+  pid="$(cat "$dir/daemon.pid" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 0
   owner="$(duet_lock_owner_read "$dir/.daemon.lock")"
   owner_pid="${owner%%$'\t'*}"
-  if [ "$owner_pid" != "$pid" ]; then
-    echo "duet: daemon lock ownership changed; refusing to signal pid $pid." >&2
+  if [ "$owner_pid" != "$pid" ] \
+      || ! duet_daemon_process_matches "$pid" "$config_path" "$session_id"; then
+    echo "duet: daemon identity is inconsistent; refusing to signal pid $pid." >&2
     return 1
   fi
-  if duet_daemon_process_matches "$pid" "$config_path" "$session_id"; then
-    kill -TERM "$pid" 2>/dev/null || true
-  else
-    echo "duet: daemon pid $pid does not identify session $dir; refusing to signal it." >&2
-    return 1
-  fi
-  for i in $(seq 1 20); do
+
+  kill -TERM "$pid" 2>/dev/null || true
+  for i in $(seq 1 "$loops"); do
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.1
   done
@@ -605,7 +506,7 @@ duet_kill_spawned_panes(){
       actual_pid="$(_duet_tmux display-message -p -t "$legacy_pane" '#{pane_pid}' 2>/dev/null || true)"
       if [ "$actual_pid" = "$legacy_pid" ] \
           && ! _duet_tmux kill-pane -t "$legacy_pane" 2>/dev/null; then
-        echo "duet: failed to reap spawned legacy pane $legacy_pane." >&2
+        echo "duet: failed to stop spawned legacy pane $legacy_pane." >&2
         return 1
       fi
     fi
@@ -636,53 +537,11 @@ duet_kill_spawned_panes(){
     actual_pid="$(_duet_tmux display-message -p -t "$victim_pane" '#{pane_pid}' 2>/dev/null || true)"
     if [ "$actual_pid" = "$victim_pid" ] \
         && ! _duet_tmux kill-pane -t "$victim_pane" 2>/dev/null; then
-      echo "duet: failed to reap spawned pane $victim_pane." >&2
+      echo "duet: failed to stop spawned pane $victim_pane." >&2
       failed=1
     fi
   done
   [ -z "$failed" ]
-}
-
-# Reap a previous session without ever killing the pane performing the re-init.
-# args: duet_dir workdir tmux_socket exempt_pane [legacy_codex_pane]
-#       [server_pid] [legacy_codex_pid]
-duet_reap_session(){
-  local dir="${1:-}" workdir="${2:-}" socket="${3:-}" exempt="${4:-}"
-  local legacy_pane="${5:-}" expected_server_pid="${6:-}" actual_server_pid
-  local legacy_pid="${7:-}"
-  local saved_socket="${DUET_TMUX_SOCKET:-}"
-  [ -n "$dir" ] || return 0
-  if { [ -e "$dir/roster.tsv" ] || [ -L "$dir/roster.tsv" ]; } \
-      && ! duet_validate_roster "$dir/roster.tsv"; then
-    echo "duet: invalid previous-session roster; refusing reap before lifecycle mutation." >&2
-    return 1
-  fi
-
-  if [ -d "$dir" ]; then
-    duet_lock_acquire "$dir/.admission.lock" 200 || return 1
-    if ! : > "$dir/.ended" 2>/dev/null; then
-      duet_lock_release "$dir/.admission.lock" 2>/dev/null || true
-      return 1
-    fi
-    duet_lock_release "$dir/.admission.lock" || return 1
-  fi
-  duet_stop_daemon "$dir" 20 || return 1
-  duet_strip_session_anchors "$workdir" || return 1
-
-  DUET_TMUX_SOCKET="$socket"
-  if [ -n "$expected_server_pid" ]; then
-    actual_server_pid="$(_duet_tmux display-message -p '#{pid}' 2>/dev/null || true)"
-    if [ "$actual_server_pid" != "$expected_server_pid" ]; then
-      echo "duet: previous tmux server identity changed; refusing to reap its recorded panes." >&2
-      DUET_TMUX_SOCKET="$saved_socket"
-      return 0
-    fi
-  fi
-  if ! duet_kill_spawned_panes "$dir/roster.tsv" "$exempt" "$legacy_pane" "$legacy_pid"; then
-    DUET_TMUX_SOCKET="$saved_socket"
-    return 1
-  fi
-  DUET_TMUX_SOCKET="$saved_socket"
 }
 
 # Validate the immutable session roster before using any row as an identity,
@@ -818,113 +677,25 @@ duet_daemon_alive(){
 
 duet_lock_owner_read(){
   local lock="${1:?lock path required}"
-  if [ -d "$lock" ]; then
-    cat "$lock/owner" 2>/dev/null || true
-  else
-    cat "$lock" 2>/dev/null || true
-  fi
+  [ -d "$lock" ] || return 0
+  cat "$lock/owner" 2>/dev/null || true
 }
 
-# Serialize stale-lock recovery separately from ordinary ownership. macOS's
-# shlock uses link(2) and PID validation; the mkdir fallback stays fail-closed
-# if its tiny reaper critical section itself crashes.
-duet_reaper_acquire(){
-  local marker="${1:?lock path required}.reaper" owner_pid="${BASHPID:-$$}"
-  local attempts="${2:-40}" i
-  for i in $(seq 1 "$attempts"); do
-    if command -v shlock >/dev/null 2>&1; then
-      shlock -f "$marker" -p "$owner_pid" 2>/dev/null && return 0
-    else
-      mkdir "$marker" 2>/dev/null && return 0
-    fi
-    sleep 0.05
-  done
-  return 1
-}
-
-duet_reaper_release(){
-  local marker="${1:?lock path required}.reaper" owner_pid="${BASHPID:-$$}"
-  local held
-  if [ -d "$marker" ]; then
-    rmdir "$marker" 2>/dev/null
-    return
-  fi
-  held="$(cat "$marker" 2>/dev/null || true)"
-  [ "$held" = "$owner_pid" ] || return 1
-  rm -f "$marker" 2>/dev/null
-}
-
-# Portable atomic lock: populate an owner inside a private mkdir, then publish
-# that already-written inode at the canonical path with link(2). Stale recovery
-# is separately serialized and re-reads the owner inside that fence, preventing
-# both ownerless publication and stale-owner ABA races.
+# Small in-process serialization primitive. A process crash may leave the
+# directory behind; v4 deliberately does not recover that session.
 duet_lock_acquire(){
   local lock="${1:?lock path required}" attempts="${2:-200}"
-  local owner_pid="${BASHPID:-$$}" owner="$DUET_LOCK_TOKEN"
-  local held held_pid stale target target_name claim i
-  claim="${lock}.claim-${owner_pid}-${RANDOM:-0}-${RANDOM:-0}"
-  if ! mkdir "$claim" 2>/dev/null; then
-    claim="${lock}.claim-${owner_pid}-${RANDOM:-0}-${RANDOM:-0}-${RANDOM:-0}"
-    mkdir "$claim" 2>/dev/null || return 1
-  fi
-  if ! printf '%s\t%s\n' "$owner_pid" "$owner" > "$claim/owner"; then
-    rm -f "$claim/owner" 2>/dev/null || true
-    rmdir "$claim" 2>/dev/null || true
-    return 1
-  fi
-
+  local owner_pid="${BASHPID:-$$}" i
   for i in $(seq 1 "$attempts"); do
-    # New locks are regular hard links. Avoid ln's existing-directory behavior
-    # while a pre-0.2 directory lock is being drained/recovered.
-    if [ ! -d "$lock" ] && ln "$claim/owner" "$lock" 2>/dev/null; then
-      rm -f "$claim/owner" 2>/dev/null || true
-      rmdir "$claim" 2>/dev/null || true
-      return 0
-    fi
-
-    held="$(duet_lock_owner_read "$lock")"
-    held_pid="${held%%$'\t'*}"
-    if [ -n "$held_pid" ] && ! kill -0 "$held_pid" 2>/dev/null; then
-      if duet_reaper_acquire "$lock" 40; then
-        held="$(duet_lock_owner_read "$lock")"
-        held_pid="${held%%$'\t'*}"
-        if [ -n "$held_pid" ] && ! kill -0 "$held_pid" 2>/dev/null; then
-          stale="${lock}.stale-${owner_pid}-${RANDOM:-0}"
-          if [ -d "$lock" ]; then
-            if [ ! -e "$stale" ] && [ ! -L "$stale" ] \
-                && mv "$lock" "$stale" 2>/dev/null; then
-              if [ -L "$stale" ]; then
-                target="$(readlink "$stale" 2>/dev/null || true)"
-                rm -f "$stale" 2>/dev/null || true
-                target_name="$(basename "$lock")"
-                # A pre-0.2 lock could be a symlink to its private sibling
-                # claim. Treat the link text as hostile: only an unqualified
-                # generated sibling name may be cleaned up. Never follow an
-                # absolute target or a relative path containing '/'.
-                case "$target" in
-                  */*) : ;;
-                  "$target_name".claim-*)
-                    rm -f "$(dirname "$lock")/$target/owner" 2>/dev/null || true
-                    rmdir "$(dirname "$lock")/$target" 2>/dev/null || true
-                    ;;
-                esac
-              else
-                rm -f "$stale/owner" 2>/dev/null || true
-                rmdir "$stale" 2>/dev/null || true
-              fi
-            fi
-          else
-            rm -f "$lock" 2>/dev/null || true
-          fi
-        fi
-        duet_reaper_release "$lock" || true
-        continue
+    if mkdir "$lock" 2>/dev/null; then
+      if printf '%s\t%s\n' "$owner_pid" "$DUET_LOCK_TOKEN" > "$lock/owner"; then
+        return 0
       fi
+      rmdir "$lock" 2>/dev/null || true
+      return 1
     fi
     sleep 0.05
   done
-  rm -f "$claim/owner" 2>/dev/null || true
-  rmdir "$claim" 2>/dev/null || true
   echo "duet: timed out acquiring lock $lock" >&2
   return 1
 }
@@ -933,12 +704,8 @@ duet_lock_release(){
   local lock="${1:?lock path required}" owner="$DUET_LOCK_TOKEN" held
   held="$(duet_lock_owner_read "$lock")"
   [ "${held#*$'\t'}" = "$owner" ] || return 1
-  if [ -d "$lock" ]; then
-    rm -f "$lock/owner" 2>/dev/null || return 1
-    rmdir "$lock" 2>/dev/null || return 1
-  else
-    rm -f "$lock" 2>/dev/null || return 1
-  fi
+  rm -f "$lock/owner" 2>/dev/null || return 1
+  rmdir "$lock" 2>/dev/null
 }
 
 duet_next_sequence(){
@@ -964,8 +731,7 @@ duet_next_sequence(){
   # A manually rolled-back but syntactically valid counter must not reuse a
   # stable ID that already exists in either the active root or a terminal
   # archive. Sidecars count too: they prove that sequence was once allocated.
-  for sequence_dir in "$box" "$box/delivered" "$box/failed" \
-      "$box/quarantine" "$box/superseded"; do
+  for sequence_dir in "$box" "$box/delivered" "$box/rejected"; do
     for existing in "$sequence_dir/N-$DUET_SEQUENCE.msg"* \
         "$sequence_dir/I-$DUET_SEQUENCE.msg"*; do
       [ ! -e "$existing" ] || {
@@ -1005,7 +771,7 @@ duet_append_transcript(){
 duet_enqueue_message(){
   local queue="${1:?queue required}" sender="${2:?sender required}"
   local recipient="${3:?recipient required}" mode="${4:?mode required}" body="${5-}"
-  local box lock admission tmp prefix final id encoded
+  local box lock tmp prefix final id encoded
   local enqueue_lock_attempts="${DUET_ENQUEUE_LOCK_ATTEMPTS:-1200}"
   case "$queue" in ''|*[!A-Za-z0-9_-]*) echo "duet: invalid queue '$queue'" >&2; return 1;; esac
   case "$mode" in NORMAL) prefix=N;; INTERRUPT) prefix=I;; *) echo "duet: invalid mode '$mode'" >&2; return 1;; esac
@@ -1022,39 +788,36 @@ duet_enqueue_message(){
     || { echo "duet: sender '$sender' is not a roster member" >&2; return 1; }
   case "$enqueue_lock_attempts" in ''|*[!0-9]*) enqueue_lock_attempts=1200;; esac
 
-  box="${DUET_DIR:?}/inbox/$queue"
-  mkdir -p "$box/delivered" "$box/failed" "$box/quarantine" "$box/superseded" || return 1
-  admission="$DUET_DIR/.admission.lock"
-  duet_lock_acquire "$admission" "$enqueue_lock_attempts" || return 1
-  if [ -f "$DUET_DIR/.ended" ] || [ -f "$DUET_DIR/.draining" ]; then
-    duet_lock_release "$admission" || true
-    echo "duet: session is draining or ended; message was not queued." >&2
+  if [ -f "${DUET_DIR:?}/.ended" ]; then
+    echo "duet: session has ended; message was not queued." >&2
     return 1
   fi
   if ! duet_daemon_alive; then
-    duet_lock_release "$admission" || true
     echo "duet: delivery daemon is not alive; message was not queued." >&2
     return 1
   fi
+  box="$DUET_DIR/inbox/$queue"
+  mkdir -p "$box/delivered" "$box/rejected" || return 1
   lock="$box/.enqueue.lock"
-  duet_lock_acquire "$lock" "$enqueue_lock_attempts" \
-    || { duet_lock_release "$admission" || true; return 1; }
+  duet_lock_acquire "$lock" "$enqueue_lock_attempts" || return 1
+  if [ -f "$DUET_DIR/.ended" ]; then
+    duet_lock_release "$lock" || true
+    echo "duet: session has ended; message was not queued." >&2
+    return 1
+  fi
   if ! duet_next_sequence "$box"; then
     duet_lock_release "$lock" || true
-    duet_lock_release "$admission" || true
     return 1
   fi
 
   id="m-${DUET_SESSION_ID:?}-${queue}-${DUET_SEQUENCE}"
   tmp="$(mktemp "$box/.message.XXXXXX")" || {
     duet_lock_release "$lock" || true
-    duet_lock_release "$admission" || true
     return 1
   }
   if ! encoded="$(printf '%s' "$body" | base64 | tr -d '\r\n')"; then
     rm -f "$tmp"
     duet_lock_release "$lock" || true
-    duet_lock_release "$admission" || true
     return 1
   fi
   if ! {
@@ -1068,25 +831,21 @@ duet_enqueue_message(){
   } > "$tmp"; then
     rm -f "$tmp"
     duet_lock_release "$lock" || true
-    duet_lock_release "$admission" || true
     return 1
   fi
 
   if ! duet_append_transcript "$id" "$sender" "$recipient" "$mode" "$body"; then
     rm -f "$tmp"
     duet_lock_release "$lock" || true
-    duet_lock_release "$admission" || true
     return 1
   fi
   final="$box/${prefix}-${DUET_SEQUENCE}.msg"
   if [ -e "$final" ] || ! mv "$tmp" "$final"; then
     rm -f "$tmp"
     duet_lock_release "$lock" || true
-    duet_lock_release "$admission" || true
     return 1
   fi
   duet_lock_release "$lock" || true
-  duet_lock_release "$admission" || true
   DUET_ENQUEUED_ID="$id"
   DUET_ENQUEUED_FILE="$final"
 }
@@ -1156,8 +915,6 @@ _duet_message_field(){
     }
   ' "$1"
 }
-
-_duet_message_decimal_valid(){ duet_decimal_d10 "$@"; }
 
 duet_read_message(){
   local file="${1:?message file required}" encoded decoded decoded_file decode_rc
@@ -1229,10 +986,4 @@ duet_pending_count(){
     done
   done
   printf '%s' "$count"
-}
-
-# M2 keeps the M3 drain API, but delivery no longer manufactures secondary
-# notification obligations.
-duet_notice_obligation_count(){
-  printf '0'
 }

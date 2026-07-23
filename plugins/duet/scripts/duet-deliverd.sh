@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # One live delivery daemon for one pinned session.
 #
-# Delivery state is intentionally in-process only. A daemon or pane failure,
-# or any ambiguity after paste, invalidates the session instead of attempting
-# crash recovery.
+# Delivery state is intentionally in-process only. A daemon failure invalidates
+# the session. A dead peer, bad envelope, or post-paste ambiguity is isolated
+# to its recipient so the remaining mesh keeps moving.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,8 +41,8 @@ duet_message_sequence(){
   printf -v DUET_MESSAGE_SEQUENCE '%010d' "$DUET_DECIMAL_VALUE"
 }
 
-# Interrupts are urgent, but FIFO is preserved within each mode. No message is
-# superseded: after the interrupt, older normal work remains queued.
+# Interrupts are urgent, but FIFO is preserved within each mode. After an
+# interrupt, older normal work remains queued.
 duet_queue_next(){
   local box="${1:?queue directory required}" prefix file best sequence
   DUET_NEXT_MESSAGE=""
@@ -91,13 +91,55 @@ duet_move_delivered(){
   DUET_TERMINAL_FILE="$destination"
 }
 
+duet_move_rejected(){
+  local file="${1:?message file required}" reason="${2:?reason required}"
+  local rejected destination reason_tmp
+  rejected="$(dirname "$file")/rejected"
+  mkdir -p "$rejected" || return 1
+  destination="$rejected/$(basename "$file")"
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    destination="$destination.duplicate-${BASHPID:-$$}-${RANDOM:-0}"
+  fi
+  mv "$file" "$destination" || return 1
+  reason_tmp="$(mktemp "$rejected/.reason.XXXXXX")" || {
+    duet_deliverd_log "REJECTED $(basename "$file"): $reason (reason sidecar unavailable)"
+    return 0
+  }
+  if ! printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$reason" \
+      > "$reason_tmp" \
+      || ! duet_publish_temp_file "$reason_tmp" "$destination.reason"; then
+    rm -f "$reason_tmp" 2>/dev/null || true
+    duet_deliverd_log "REJECTED $(basename "$file"): $reason (reason sidecar unavailable)"
+    return 0
+  fi
+  duet_deliverd_log "REJECTED $(basename "$file"): $reason"
+  printf 'duet: rejected %s: %s\n' "$(basename "$file")" "$reason" >&2
+}
+
+duet_mark_recipient_dead(){
+  local name="${1:?recipient required}" reason="${2:?reason required}"
+  mkdir -p "${DUET_DIR:?}/dead" || return 1
+  duet_atomic_write "$DUET_DIR/dead/$name" \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')	$reason" || return 1
+  duet_deliverd_log "DEAD recipient $name: $reason"
+  printf 'duet: recipient %s is dead: %s\n' "$name" "$reason" >&2
+}
+
+duet_block_recipient(){
+  local name="${1:?recipient required}" reason="${2:?reason required}"
+  mkdir -p "${DUET_DIR:?}/blocked" || return 1
+  duet_atomic_write "$DUET_DIR/blocked/$name" \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')	$reason" || return 1
+  duet_deliverd_log "BLOCKED recipient $name: $reason"
+  printf 'duet: recipient %s blocked: %s\n' "$name" "$reason" >&2
+}
+
 # Process at most one head from one physical queue. A definitely-not-landed
-# head remains in place and stalls only this queue. Every post-paste ambiguity
-# is fatal for the whole session because safely restarting would require the
-# durable recovery protocol v4 deliberately rejects.
+# head remains in place and stalls only this queue. A post-paste ambiguity
+# blocks only this recipient and is never retried or repasted.
 duet_process_one(){
   local box="${1:?queue directory required}" exact_file="${2:-}"
-  local file queue payload interrupt="" target_harness rc
+  local file queue payload interrupt="" target_harness rc id_prefix id_sequence reason
   DUET_PROCESS_ATTEMPTED=""
   DUET_PROCESS_TARGET_NAME=""
   DUET_PROCESS_TARGET_PANE=""
@@ -113,16 +155,25 @@ duet_process_one(){
 
   queue="$(basename "$box")"
   if ! duet_message_sequence "$file"; then
-    duet_mark_unhealthy "invalid message filename in inbox/$queue: $(basename "$file")"
-    return 1
+    reason="invalid message filename in inbox/$queue"
+    duet_move_rejected "$file" "$reason" || {
+      duet_block_recipient "$queue" "could not reject $(basename "$file")" || true
+    }
+    return 0
   fi
   if ! duet_read_message "$file"; then
-    duet_mark_unhealthy "invalid message envelope in inbox/$queue: $(basename "$file")"
-    return 1
+    reason="invalid message envelope in inbox/$queue"
+    duet_move_rejected "$file" "$reason" || {
+      duet_block_recipient "$queue" "could not reject $(basename "$file")" || true
+    }
+    return 0
   fi
   if [ "$DUET_MESSAGE_SESSION" != "${DUET_SESSION_ID:?}" ]; then
-    duet_mark_unhealthy "message $DUET_MESSAGE_ID names session $DUET_MESSAGE_SESSION"
-    return 1
+    duet_move_rejected "$file" \
+      "message $DUET_MESSAGE_ID names session $DUET_MESSAGE_SESSION" || {
+        duet_block_recipient "$queue" "could not reject foreign message" || true
+      }
+    return 0
   fi
 
   if ! duet_roster_has_name "$queue"; then
@@ -130,14 +181,32 @@ duet_process_one(){
     return 1
   fi
   if ! duet_roster_has_name "$DUET_MESSAGE_SENDER"; then
-    duet_mark_unhealthy "message $DUET_MESSAGE_ID names nonmember sender $DUET_MESSAGE_SENDER"
-    return 1
+    duet_move_rejected "$file" \
+      "message $DUET_MESSAGE_ID names nonmember sender $DUET_MESSAGE_SENDER" || {
+        duet_block_recipient "$queue" "could not reject nonmember message" || true
+      }
+    return 0
   fi
   DUET_TARGET_NAME="$queue"
   if [ "$DUET_MESSAGE_RECIPIENT" != "$queue" ] \
       && [ "$DUET_MESSAGE_RECIPIENT" != all ]; then
-    duet_mark_unhealthy "message $DUET_MESSAGE_ID redirects inbox/$queue"
-    return 1
+    duet_move_rejected "$file" \
+      "message $DUET_MESSAGE_ID redirects inbox/$queue" || {
+        duet_block_recipient "$queue" "could not reject redirected message" || true
+      }
+    return 0
+  fi
+  id_prefix="m-${DUET_SESSION_ID}-${queue}-"
+  case "$DUET_MESSAGE_ID" in "$id_prefix"*) id_sequence="${DUET_MESSAGE_ID#"$id_prefix"}" ;; *)
+    id_sequence=""
+  esac
+  if [ "${#id_sequence}" -ne 10 ] \
+      || ! duet_decimal_d10 "$id_sequence" 1; then
+    duet_move_rejected "$file" \
+      "message id $DUET_MESSAGE_ID is invalid for inbox/$queue" || {
+        duet_block_recipient "$queue" "could not reject mismatched message id" || true
+      }
+    return 0
   fi
 
   if duet_message_id_delivered "$box" "$DUET_MESSAGE_ID"; then
@@ -155,8 +224,12 @@ duet_process_one(){
   DUET_PROCESS_TARGET_PANE="$DUET_TARGET_PANE"
   if [ -z "$DUET_TARGET_PANE" ] || [ -z "$target_harness" ] \
       || ! duet_roster_member_alive "$DUET_TARGET_NAME"; then
-    duet_mark_unhealthy "recipient $DUET_TARGET_NAME is dead or has invalid roster identity"
-    return 1
+    reason="pane is absent or no longer matches its roster identity"
+    duet_mark_recipient_dead "$DUET_TARGET_NAME" "$reason" || true
+    duet_move_rejected "$file" "recipient $DUET_TARGET_NAME is dead" || {
+      duet_block_recipient "$queue" "could not reject message for dead recipient" || true
+    }
+    return 0
   fi
 
   payload="$(duet_build_payload)"
@@ -185,16 +258,27 @@ duet_process_one(){
       duet_deliverd_log "stalled $DUET_MESSAGE_ID -> $DUET_TARGET_NAME before landing"
       ;;
     "$DUET_SEND_DEAD")
-      duet_mark_unhealthy "recipient $DUET_TARGET_NAME died while delivering $DUET_MESSAGE_ID"
-      return 1
+      reason="died while delivering $DUET_MESSAGE_ID"
+      duet_mark_recipient_dead "$DUET_TARGET_NAME" "$reason" || true
+      duet_move_rejected "$file" "recipient $DUET_TARGET_NAME $reason" || {
+        duet_block_recipient "$queue" "could not reject message for dead recipient" || true
+      }
       ;;
     "$DUET_SEND_LANDED_UNVERIFIED")
-      duet_mark_unhealthy "delivery-ambiguous after paste for $DUET_MESSAGE_ID -> $DUET_TARGET_NAME"
-      return 1
+      duet_block_recipient "$DUET_TARGET_NAME" \
+        "delivery-ambiguous after paste for $DUET_MESSAGE_ID" || {
+          duet_mark_unhealthy \
+            "could not fence ambiguous delivery for $DUET_MESSAGE_ID -> $DUET_TARGET_NAME"
+          return 1
+        }
       ;;
     *)
-      duet_mark_unhealthy "unexpected verifier outcome $rc for $DUET_MESSAGE_ID"
-      return 1
+      duet_block_recipient "$DUET_TARGET_NAME" \
+        "unexpected verifier outcome $rc for $DUET_MESSAGE_ID" || {
+          duet_mark_unhealthy \
+            "could not fence unexpected outcome $rc for $DUET_MESSAGE_ID"
+          return 1
+        }
       ;;
   esac
 }
@@ -210,6 +294,7 @@ duet_deliverd_pass(){
 
   while IFS=$'\t' read -r name _; do
     [ -n "$name" ] || continue
+    [ ! -f "$DUET_DIR/blocked/$name" ] || continue
     box="$DUET_DIR/inbox/$name"
     [ -d "$box" ] || continue
     duet_queue_next "$box" || continue
@@ -236,7 +321,7 @@ duet_deliverd_cleanup(){
 }
 
 duet_deliverd_main(){
-  local session_arg="" session_id_arg="" inherited_session="${DUET_SESSION:-}" cfg
+  local session_arg="" session_id_arg="" cfg
   local env_server_pid actual_server_pid pid_tmp poll
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -260,20 +345,16 @@ duet_deliverd_main(){
     esac
   done
 
-  duet_resolve_config "$session_arg" 0 || return 1
+  duet_resolve_config "$session_arg" 1 || return 1
   cfg="$DUET_RESOLVED_CONFIG"
-  if [ "$session_arg" != "$cfg" ]; then
-    exec bash "$SELF_DIR/duet-deliverd.sh" \
-      --session "$cfg" --session-id "$session_id_arg"
-  fi
   unset DUET_DIR WORKDIR PLUGIN_DIR DUET_TMUX_SOCKET DUET_TMUX_SERVER_PID
-  unset DUET_SESSION DUET_SESSION_ID DUET_WORKDIR_KEY DUET_INITIATOR DUET_INITIATOR_PANE
+  unset DUET_SESSION DUET_SESSION_ID DUET_INITIATOR DUET_INITIATOR_PANE
   # shellcheck disable=SC1090
   . "$cfg" || {
     echo "duet: daemon could not load pinned config: $cfg" >&2
     return 1
   }
-  duet_validate_loaded_session "$inherited_session" "$cfg" || return 1
+  duet_validate_loaded_session "" "$cfg" || return 1
   [ "$session_id_arg" = "$DUET_SESSION_ID" ] || {
     echo "duet: daemon command identity does not match pinned session $DUET_SESSION_ID." >&2
     return 1
