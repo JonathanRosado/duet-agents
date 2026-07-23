@@ -5,10 +5,6 @@
 DUET_SEND_DEAD=20
 DUET_SEND_NOT_LANDED=21
 DUET_SEND_LANDED_UNVERIFIED=22
-# A positively identified Codex collapsed-paste marker remained in the active
-# composer after the bounded Enter retries.  The caller must durably enter the
-# clear/retry state before sending recovery keys; it must not paste again yet.
-DUET_SEND_COMPOSER_REFUSED=23
 DUET_LOCK_TOKEN="${BASHPID:-$$}-${RANDOM:-0}-${RANDOM:-0}"
 
 # Always address the tmux server recorded for the session when one is known.
@@ -306,24 +302,29 @@ _duet_tail_strip(){
     | LC_ALL=C tr -cd '[:alnum:]'
 }
 
-# Claude and Codex can collapse a long bracketed paste instead of rendering the
-# payload bytes. Return a harness-prefixed normalized token while that marker
-# still owns the active composer. Claude adds a nearby expansion hint; Codex's
-# "[Pasted Content N chars]" must be read from the cursor row so an identical
-# marker in accepted history is never mistaken for unsent input.
+# Claude, Codex, and Kimi can collapse a long bracketed paste instead of
+# rendering the payload bytes. Return a harness-prefixed normalized token only
+# while that harness's marker owns the active composer. Codex and Kimi markers
+# are cursor-row scoped so an identical marker in accepted history cannot be
+# mistaken for unsent input.
 _duet_paste_marker(){
-  local pane="${1:?pane required}" marker cursor row line
-  marker="$(_duet_tmux capture-pane -p -t "$pane" 2>/dev/null \
-    | tail -n 6 \
-    | awk '
-        tolower($0) ~ /pasted text #[0-9]+/ { line=$0 }
-        tolower($0) ~ /paste again to expand/ { composer=1 }
-        END { if (composer) print line }
-      ' \
-    | LC_ALL=C tr -cd '[:alnum:]')"
-  if [ -n "$marker" ]; then
-    printf 'claude%s' "$marker"
-    return 0
+  local pane="${1:?pane required}" harness="${2:-}"
+  local marker cursor row line
+
+  if [ -z "$harness" ] || [ "$harness" = claude ]; then
+    marker="$(_duet_tmux capture-pane -p -t "$pane" 2>/dev/null \
+      | tail -n 6 \
+      | awk '
+          tolower($0) ~ /pasted text #[0-9]+/ { line=$0 }
+          tolower($0) ~ /paste again to expand/ { composer=1 }
+          END { if (composer) print line }
+        ' \
+      | LC_ALL=C tr -cd '[:alnum:]')"
+    if [ -n "$marker" ]; then
+      printf 'claude%s' "$marker"
+      return 0
+    fi
+    [ -z "$harness" ] || return 0
   fi
 
   cursor="$(_duet_tmux display-message -p -t "$pane" '#{cursor_y}' 2>/dev/null || true)"
@@ -331,9 +332,22 @@ _duet_paste_marker(){
   row=$((cursor + 1))
   line="$(_duet_tmux capture-pane -p -t "$pane" 2>/dev/null \
     | awk -v row="$row" 'NR == row { print; exit }')"
-  if printf '%s\n' "$line" | grep -qiE '\[Pasted Content [0-9]+ chars\]'; then
+
+  if { [ -z "$harness" ] || [ "$harness" = codex ]; } \
+      && printf '%s\n' "$line" | grep -qiE '\[Pasted Content [0-9]+ chars\]'; then
     marker="$(LC_ALL=C printf '%s' "$line" | LC_ALL=C tr -cd '[:alnum:]')"
     [ -z "$marker" ] || printf 'codex%s' "$marker"
+    return 0
+  fi
+
+  if { [ -z "$harness" ] || [ "$harness" = kimi ]; } \
+      && printf '%s\n' "$line" \
+        | grep -qiE '\[paste #[0-9]+ \+[0-9]+ lines\]'; then
+    marker="$(printf '%s\n' "$line" \
+      | grep -ioE '\[paste #[0-9]+ \+[0-9]+ lines\]' \
+      | head -n 1 \
+      | LC_ALL=C tr -cd '[:alnum:]')"
+    [ -z "$marker" ] || printf 'kimi%s' "$marker"
   fi
 }
 
@@ -353,6 +367,14 @@ _duet_codex_marker_owned(){
     | grep -qE '^(PastedContent[0-9]+chars)+$'
 }
 
+_duet_marker_owned(){
+  local harness="${1:-}" current="${2:-}" token="${3:-}"
+  [ -n "$current" ] && [ -n "$token" ] || return 1
+  [ "$current" = "$token" ] && return 0
+  [ "$harness" = codex ] \
+    && _duet_codex_marker_owned "$current" "$token"
+}
+
 duet_tmux_server_matches(){
   local expected="${DUET_TMUX_SERVER_PID:-}" actual
   [ -n "$expected" ] || return 0
@@ -369,50 +391,38 @@ _duet_alive(){
 # duet_send_verified <pane> <payload> <interrupt-flag> [harness]
 #
 # A successful return means the payload was observed in the composer and then
-# observed leaving it after Enter. Non-zero outcomes are deliberately distinct:
-#   DUET_SEND_DEAD                pane disappeared
-#   DUET_SEND_NOT_LANDED          paste was not observed; caller may repaste
-#   DUET_SEND_LANDED_UNVERIFIED   paste landed, but submission is uncertain;
-#                                 caller must never paste the payload again
-#   DUET_SEND_COMPOSER_REFUSED    an owned Codex collapsed marker remained
-#                                 after Enter; persist clear/retry before keys
+# observed leaving it after Enter. The entire READY -> LANDED -> SUBMITTED state
+# machine is bounded and in-process:
+#   DUET_SEND_DEAD                pane disappeared before a verified landing
+#   DUET_SEND_NOT_LANDED          no paste occurred; caller may retry later
+#   DUET_SEND_LANDED_UNVERIFIED   paste may have landed, but submission is
+#                                 ambiguous; the session must stop
 duet_send_verified(){
   local pane="${1:-}" payload="${2:-}" interrupt="${3:-}" harness="${4:-}"
   local probe buffer i e marker_before marker_now landing_kind="" landing_token=""
-  local busy_snapshot="" interrupt_key=Escape
-  DUET_SEND_ENTER_TOKEN=""
+  local landing_checks="${DUET_LANDING_CHECKS:-20}"
+  local submit_attempts="${DUET_SUBMIT_ATTEMPTS:-3}"
+  local submit_checks="${DUET_SUBMIT_CHECKS:-12}"
+  local landing_sleep="${DUET_LANDING_SLEEP:-0.1}"
+  local submit_sleep="${DUET_SUBMIT_SLEEP:-0.2}"
   DUET_SEND_COLLAPSED=""
   DUET_SEND_LANDING_OBSERVED=""
+  DUET_SEND_SUBMITTED=""
+
+  case "$landing_checks" in ''|*[!0-9]*) landing_checks=20;; esac
+  case "$submit_attempts" in ''|*[!0-9]*) submit_attempts=3;; esac
+  case "$submit_checks" in ''|*[!0-9]*) submit_checks=12;; esac
 
   if ! _duet_alive "$pane"; then
     echo "duet: target pane $pane is gone; not sending." >&2
     return "$DUET_SEND_DEAD"
   fi
 
-  # Claude reserves one C-c as a hard interrupt: while busy it cancels the
-  # current operation, and while idle it only clears input (a second C-c would
-  # exit). Use it unconditionally because narrow panes can hide every visual
-  # busy marker. Codex and Kimi use Escape only when visibly busy.
+  # Interrupt is deliberately a live adapter action, not a durable
+  # supersession protocol. All supported TUIs accept Escape as cancellation.
   if [ -n "$interrupt" ]; then
-    if [ "$harness" = claude ]; then
-      _duet_tmux send-keys -t "$pane" C-c
-      # Let Claude finish cancelling before the urgent payload is pasted. The
-      # bounded wait also covers a Ctrl-C delivered during a UI redraw.
-      for i in $(seq 1 20); do
-        sleep 0.1
-        busy_snapshot="$(_duet_tmux capture-pane -p -t "$pane" 2>/dev/null | tail -n 12)"
-        printf '%s\n' "$busy_snapshot" \
-          | grep -qiE 'esc to interrupt|running [0-9]+ shell command|\([0-9]+s[^)]*(tokens|thinking)' \
-          || break
-      done
-    else
-      busy_snapshot="$(_duet_tmux capture-pane -p -t "$pane" 2>/dev/null | tail -n 6)"
-      if printf '%s\n' "$busy_snapshot" \
-           | grep -qiE 'esc to interrupt|esc to cancel|ctrl\+c to|working|thinking|generating|running|streaming'; then
-        _duet_tmux send-keys -t "$pane" "$interrupt_key"
-        sleep 0.4
-      fi
-    fi
+    _duet_tmux send-keys -t "$pane" Escape
+    sleep 0.4
   fi
 
   probe="$(_duet_probe "$payload")"
@@ -420,9 +430,9 @@ duet_send_verified(){
     echo "duet: refusing to send an empty/unprobeable payload to $pane" >&2
     return "$DUET_SEND_NOT_LANDED"
   }
-  marker_before="$(_duet_paste_marker "$pane")"
+  marker_before="$(_duet_paste_marker "$pane" "$harness")"
   if [ -n "$marker_before" ]; then
-    echo "duet: target pane $pane already has a collapsed composer; not pasting." >&2
+    echo "duet: target pane $pane already has a $harness paste marker; not pasting." >&2
     return "$DUET_SEND_NOT_LANDED"
   fi
 
@@ -444,19 +454,18 @@ duet_send_verified(){
   fi
   duet_tmux_server_matches || return "$DUET_SEND_LANDED_UNVERIFIED"
 
-  for i in $(seq 1 20); do
-    sleep 0.1
+  for i in $(seq 1 "$landing_checks"); do
+    sleep "$landing_sleep"
     if _duet_present "$(_duet_tail_strip "$pane" 12)" "$probe"; then
       landing_kind=probe
       landing_token="$probe"
       DUET_SEND_LANDING_OBSERVED=probe
       break
     fi
-    marker_now="$(_duet_paste_marker "$pane")"
+    marker_now="$(_duet_paste_marker "$pane" "$harness")"
     if [ -n "$marker_now" ] && [ "$marker_now" != "$marker_before" ]; then
       landing_kind=marker
       landing_token="$marker_now"
-      DUET_SEND_ENTER_TOKEN="$marker_now"
       DUET_SEND_COLLAPSED=1
       DUET_SEND_LANDING_OBSERVED=marker
       break
@@ -469,28 +478,34 @@ duet_send_verified(){
 
   # Once landing has been observed, only retry Enter. Re-pasting here could
   # duplicate an already accepted task.
-  for e in 1 2 3; do
+  for e in $(seq 1 "$submit_attempts"); do
     _duet_tmux send-keys -t "$pane" Enter
-    for i in $(seq 1 12); do
-      sleep 0.2
+    for i in $(seq 1 "$submit_checks"); do
+      sleep "$submit_sleep"
       if ! _duet_alive "$pane"; then
+        echo "duet: target pane $pane disappeared after payload landing; submission is ambiguous." >&2
         return "$DUET_SEND_LANDED_UNVERIFIED"
       fi
       case "$landing_kind" in
         probe)
-          _duet_present "$(_duet_tail_strip "$pane" 4)" "$landing_token" || return 0
+          if ! _duet_present "$(_duet_tail_strip "$pane" 4)" "$landing_token"; then
+            DUET_SEND_SUBMITTED=1
+            return 0
+          fi
           ;;
         marker)
-          marker_now="$(_duet_paste_marker "$pane")"
-          [ -n "$marker_now" ] || return 0
+          marker_now="$(_duet_paste_marker "$pane" "$harness")"
+          if [ -z "$marker_now" ]; then
+            DUET_SEND_SUBMITTED=1
+            return 0
+          fi
           if [ "$harness" = codex ] \
               && _duet_codex_marker_owned "$marker_now" "$landing_token"; then
             # A second placeholder can appear after the first sample.  Grow
             # the exact capability rather than mistaking that redraw for a
             # successful submission.
             landing_token="$marker_now"
-            DUET_SEND_ENTER_TOKEN="$marker_now"
-          elif [ "$marker_now" != "$landing_token" ]; then
+          elif ! _duet_marker_owned "$harness" "$marker_now" "$landing_token"; then
             echo "duet: collapsed composer changed ownership in pane $pane" >&2
             return "$DUET_SEND_LANDED_UNVERIFIED"
           fi
@@ -499,126 +514,7 @@ duet_send_verified(){
     done
   done
 
-  if [ "$harness" = codex ] && [ "$landing_kind" = marker ] \
-      && _duet_codex_marker_owned "$(_duet_paste_marker "$pane")" "$landing_token"; then
-    echo "duet: Codex composer retained an owned collapsed paste after Enter." >&2
-    return "$DUET_SEND_COMPOSER_REFUSED"
-  fi
   echo "duet: payload landed in pane $pane but submission is unverified." >&2
-  return "$DUET_SEND_LANDED_UNVERIFIED"
-}
-
-# Enter-only continuation for a payload that may already occupy the composer.
-# It never pastes. DUET_SEND_COMPOSER_CLEAR distinguishes an unverifiable but
-# absent payload from one whose probe/marker still visibly owns the composer.
-duet_send_enter_only(){
-  local pane="${1:-}" payload="${2:-}" marker_token="${3:-}" harness="${4:-}"
-  local probe i e kind marker_now
-  DUET_SEND_COMPOSER_CLEAR=""
-  DUET_SEND_LANDING_OBSERVED=""
-  DUET_SEND_ENTER_TOKEN=""
-  _duet_alive "$pane" || return "$DUET_SEND_DEAD"
-  probe="$(_duet_probe "$payload")"
-  [ -n "$probe" ] || return "$DUET_SEND_LANDED_UNVERIFIED"
-  if _duet_present "$(_duet_tail_strip "$pane" 12)" "$probe"; then
-    kind=probe
-    DUET_SEND_LANDING_OBSERVED=probe
-  else
-    marker_now="$(_duet_paste_marker "$pane")"
-  fi
-  if [ -z "${kind:-}" ] && [ -n "$marker_token" ] \
-      && { [ "$marker_now" = "$marker_token" ] \
-           || { [ "$harness" = codex ] \
-                && _duet_codex_marker_owned "$marker_now" "$marker_token"; }; }; then
-    kind=marker
-    DUET_SEND_LANDING_OBSERVED=marker
-    marker_token="$marker_now"
-    DUET_SEND_ENTER_TOKEN="$marker_now"
-  elif [ -z "${kind:-}" ]; then
-    # Submission remains unverifiable, but the uncertain payload no longer
-    # owns the composer. This distinction lets the daemon release a promotion
-    # fence without ever repasting the message.
-    DUET_SEND_COMPOSER_CLEAR=1
-    return "$DUET_SEND_LANDED_UNVERIFIED"
-  fi
-  for e in 1 2 3; do
-    _duet_tmux send-keys -t "$pane" Enter
-    for i in $(seq 1 12); do
-      sleep 0.2
-      _duet_alive "$pane" || return "$DUET_SEND_DEAD"
-      case "$kind" in
-        probe)
-          if ! _duet_present "$(_duet_tail_strip "$pane" 4)" "$probe"; then
-            DUET_SEND_COMPOSER_CLEAR=1
-            return 0
-          fi
-          ;;
-        marker)
-          marker_now="$(_duet_paste_marker "$pane")"
-          if [ -z "$marker_now" ]; then
-            DUET_SEND_COMPOSER_CLEAR=1
-            return 0
-          fi
-          if [ "$harness" = codex ] \
-              && _duet_codex_marker_owned "$marker_now" "$marker_token"; then
-            marker_token="$marker_now"
-            DUET_SEND_ENTER_TOKEN="$marker_now"
-          elif [ "$marker_now" != "$marker_token" ]; then
-            return "$DUET_SEND_LANDED_UNVERIFIED"
-          fi
-          ;;
-      esac
-    done
-  done
-  if [ "$harness" = codex ] && [ "$kind" = marker ] \
-      && _duet_codex_marker_owned "$(_duet_paste_marker "$pane")" "$marker_token"; then
-    return "$DUET_SEND_COMPOSER_REFUSED"
-  fi
-  return "$DUET_SEND_LANDED_UNVERIFIED"
-}
-
-# Clear a composer only when the durable Codex marker capability still owns
-# the cursor row.  Escape then Ctrl-U is the recovery sequence observed against
-# the Codex TUI.  A missing marker is also a successful clear (the daemon may
-# have crashed after the keys); a foreign/changed marker is never touched.
-duet_clear_refused_composer(){
-  local pane="${1:-}" marker_token="${2:-}" marker_now i
-  DUET_SEND_COMPOSER_CLEAR=""
-  _duet_alive "$pane" || return "$DUET_SEND_DEAD"
-  printf '%s\n' "$marker_token" \
-    | grep -qE '^codex(PastedContent[0-9]+chars)+$' \
-    || return "$DUET_SEND_LANDED_UNVERIFIED"
-  marker_now="$(_duet_paste_marker "$pane")"
-  if [ -z "$marker_now" ]; then
-    DUET_SEND_COMPOSER_CLEAR=1
-    return 0
-  fi
-  _duet_codex_marker_owned "$marker_now" "$marker_token" \
-    || return "$DUET_SEND_LANDED_UNVERIFIED"
-
-  _duet_tmux send-keys -t "$pane" Escape
-  sleep 0.1
-  # Escape can itself submit, clear, or redraw the composer. Re-establish the
-  # exact ownership capability before sending the destructive Ctrl-U key.
-  marker_now="$(_duet_paste_marker "$pane")"
-  if [ -z "$marker_now" ]; then
-    DUET_SEND_COMPOSER_CLEAR=1
-    return 0
-  fi
-  _duet_codex_marker_owned "$marker_now" "$marker_token" \
-    || return "$DUET_SEND_LANDED_UNVERIFIED"
-  _duet_tmux send-keys -t "$pane" C-u
-  for i in $(seq 1 20); do
-    sleep 0.1
-    _duet_alive "$pane" || return "$DUET_SEND_DEAD"
-    marker_now="$(_duet_paste_marker "$pane")"
-    if [ -z "$marker_now" ]; then
-      DUET_SEND_COMPOSER_CLEAR=1
-      return 0
-    fi
-    _duet_codex_marker_owned "$marker_now" "$marker_token" \
-      || return "$DUET_SEND_LANDED_UNVERIFIED"
-  done
   return "$DUET_SEND_LANDED_UNVERIFIED"
 }
 
