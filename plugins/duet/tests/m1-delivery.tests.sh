@@ -256,11 +256,10 @@ create_state(){
   DUET_TMUX_SOCKET="$TMUX_SOCKET"
   DUET_TMUX_SERVER_PID="$TMUX_SERVER_PID"
   mkdir -p "$DUET_DIR" "$WORKDIR"
-  for queue in claude codex-1 kimi-1 leader promotions; do
+  for queue in claude codex-1 kimi-1; do
     mkdir -p "$DUET_DIR/inbox/$queue/delivered"
   done
   : > "$DUET_DIR/transcript.md"
-  printf 'term\t0\nleader\tclaude\n' > "$DUET_DIR/leader"
   {
     printf 'name\tharness\tpane_id\tpane_pid\trank\tspawned\n'
     printf 'claude\tclaude\t%s\t%s\t0\t0\n' "$PANE_ONE" "$PANE_ONE_PID"
@@ -273,8 +272,7 @@ create_state(){
 
 enqueue_one(){
   local recipient="$1" body="$2"
-  duet_enqueue_message "$recipient" claude "$recipient" 0 NORMAL \
-    LEADER claude "$body"
+  duet_enqueue_message "$recipient" claude "$recipient" NORMAL "$body"
 }
 
 active_count(){
@@ -356,7 +354,7 @@ test_concurrent_fifo_and_dedupe(){
       /bin/bash -c '
         . "$1"
         duet_daemon_alive(){ return 0; }
-        duet_enqueue_message kimi-1 claude kimi-1 0 NORMAL LEADER claude "$2"
+        duet_enqueue_message kimi-1 claude kimi-1 NORMAL "$2"
       ' _ "$COMMON" "concurrent-$i" \
       > "$DUET_DIR/enqueue-$i.out" 2> "$DUET_DIR/enqueue-$i.err" &
     pids="$pids $!"

@@ -161,11 +161,17 @@ active_message_count(){
 all_messages_terminal(){ [ "$(active_message_count)" -eq 0 ]; }
 
 send_from(){
-  local sender="$1" recipient="$2" body="$3" output
+  local sender="$1" recipient="$2" body="$3" interrupt="${4:-}"
+  local output sender_pane
   output="$LOG_DIR/send-$recipient-$RANDOM.txt"
+  sender_pane="$(awk -F '\t' -v name="$sender" \
+    '$1 == name { print $3; exit }' "$DUET_DIR/roster.tsv")"
+  [ -n "$sender_pane" ] || die "sender $sender is absent from roster"
   if ! printf '%s' "$body" | env HOME="$REAL_HOME" \
-      DUET_CONFIG="$CONFIG" DUET_ALLOW_FROM_OVERRIDE=1 \
+      TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$sender_pane" \
+      DUET_SELF="$sender" DUET_CONFIG="$CONFIG" \
       bash "$SEND_SCRIPT" "$recipient" --from "$sender" --session "$CONFIG" \
+        ${interrupt:+--interrupt} \
       > "$output" 2>&1; then
     cat "$output" >&2
     die "could not enqueue $sender -> $recipient"
@@ -173,7 +179,53 @@ send_from(){
   SEND_ID="$(sed -n 's/^duet: queued \([^ ]*\) for .*/\1/p' "$output" \
     | tail -n 1)"
   [ -n "$SEND_ID" ] || die "could not parse queued message ID"
+  SEND_OUTPUT="$output"
   cat "$output"
+}
+
+delivered_count(){
+  local box="$1" file count=0
+  for file in "$box"/delivered/N-*.msg "$box"/delivered/I-*.msg; do
+    [ -f "$file" ] || continue
+    count=$((count + 1))
+  done
+  printf '%s' "$count"
+}
+
+message_file_by_body(){
+  local box="$1" sender="$2" body="$3" file
+  for file in "$box"/delivered/N-*.msg "$box"/delivered/I-*.msg; do
+    [ -f "$file" ] || continue
+    if (
+      # shellcheck disable=SC1090
+      . "$COMMON"
+      duet_read_message "$file" \
+        && [ "$DUET_MESSAGE_SENDER" = "$sender" ] \
+        && [ "$DUET_MESSAGE_BODY" = "$body" ]
+    ); then
+      printf '%s' "$file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+claude_has_sleep_90(){
+  local candidate current parent
+  for candidate in $(pgrep -f '(^|[ /])sleep 90($| )' 2>/dev/null || true); do
+    current="$candidate"
+    while [ "$current" -gt 1 ] 2>/dev/null; do
+      parent="$(ps -p "$current" -o ppid= 2>/dev/null | tr -d ' ' || true)"
+      [ "$parent" = "$CLAUDE_PID" ] && return 0
+      case "$parent" in ''|*[!0-9]*) break ;; esac
+      current="$parent"
+    done
+  done
+  return 1
+}
+
+claude_sleep_cancelled(){
+  ! claude_has_sleep_90
 }
 
 for required in tmux claude codex kimi git base64 awk sed grep mktemp; do
@@ -208,6 +260,7 @@ tmux_smoke -f /dev/null new-session -d -s "$TMUX_SESSION" \
   -c "$WORKDIR" "$CLAUDE_COMMAND" \
   || die "could not start isolated Claude pane"
 CLAUDE_PANE="$(tmux_smoke display-message -p -t "$TMUX_SESSION" '#{pane_id}')"
+CLAUDE_PID="$(tmux_smoke display-message -p -t "$CLAUDE_PANE" '#{pane_pid}')"
 SOCKET="$(tmux_smoke display-message -p '#{socket_path}')"
 SERVER_PID="$(tmux_smoke display-message -p '#{pid}')"
 wait_until 75 "Claude boot or trust screen" \
@@ -226,7 +279,7 @@ if ! run_timed 360 "$LOG_DIR/init.log" run_in_workdir "$WORKDIR" env \
     DUET_CODEX_REASONING_EFFORT=low \
     DUET_KIMI_MODEL=kimi-code/kimi-for-coding \
     DUET_BOOT_TIMEOUT=90 DUET_READY_TIMEOUT=240 \
-    bash "$INIT_SCRIPT" codex kimi; then
+    bash "$INIT_SCRIPT" --initiator claude codex kimi; then
   sed 's/^/[init] /' "$LOG_DIR/init.log" >&2 2>/dev/null || true
   die "duet-init failed"
 fi
@@ -247,16 +300,16 @@ KIMI_PANE="$(awk -F '\t' '$1 == "kimi-1" { print $3; exit }' \
 say "proving live Codex -> Claude delivery"
 FANIN_TOKEN="M1-CODEX-CLAUDE-$PPID-${RANDOM:-0}"
 printf -v CODEX_BODY \
-  'M1 live delivery gate. Send exactly this one-line body to leader using the pinned duet command in AGENTS.md, then wait: %s' \
+  'M1 live delivery gate. Send exactly this one-line body to the exact recipient claude using the pinned duet command in AGENTS.md, then wait: %s' \
   "$FANIN_TOKEN"
 send_from claude codex-1 "$CODEX_BODY"
 CODEX_TASK_ID="$SEND_ID"
 wait_until 90 "Codex task delivery" \
   message_delivered "$DUET_DIR/inbox/codex-1" "$CODEX_TASK_ID"
 wait_until 180 "Codex reply delivery to Claude" \
-  message_body_delivered "$DUET_DIR/inbox/leader" codex-1 \
+  message_body_delivered "$DUET_DIR/inbox/claude" codex-1 \
     "$FANIN_TOKEN"$'\n'
-grep -qF "delivered m-$SESSION_ID-leader-" \
+grep -qF "delivered m-$SESSION_ID-claude-" \
   "$DUET_DIR/deliverd.log" \
   || die "Codex reply did not traverse the live Claude delivery path"
 say "PASS live Codex -> Claude id=$CODEX_TASK_ID"
@@ -299,6 +352,100 @@ message_delivered "$DUET_DIR/inbox/kimi-1" "$KIMI_TASK_ID" \
 [ ! -f "$DUET_DIR/.unhealthy" ] || die "Kimi delivery marked session unhealthy"
 say "PASS Kimi collapsed marker detected, Enter submitted, marker cleared, accepted-history token present, queue complete id=$KIMI_TASK_ID elapsed=${KIMI_ELAPSED}s"
 
+say "proving any-to-any mesh in both directions"
+CODEX_KIMI_TOKEN="M2-CODEX-KIMI-$PPID-${RANDOM:-0}"
+CODEX_KIMI_BODY="Mesh gate $CODEX_KIMI_TOKEN. Do not run tools or send a duet message; acknowledge internally and wait."
+send_from codex-1 kimi-1 "$CODEX_KIMI_BODY"
+CODEX_KIMI_ID="$SEND_ID"
+wait_until 45 "Codex to Kimi queue completion" \
+  message_body_delivered "$DUET_DIR/inbox/kimi-1" codex-1 "$CODEX_KIMI_BODY"
+wait_until 30 "Codex to Kimi accepted history" \
+  pane_has "$KIMI_PANE" "$CODEX_KIMI_TOKEN"
+
+KIMI_CODEX_TOKEN="M2-KIMI-CODEX-$PPID-${RANDOM:-0}"
+KIMI_CODEX_BODY="Mesh gate $KIMI_CODEX_TOKEN. Do not run tools or send a duet message; acknowledge internally and wait."
+send_from kimi-1 codex-1 "$KIMI_CODEX_BODY"
+wait_until 45 "Kimi to Codex queue completion" \
+  message_body_delivered "$DUET_DIR/inbox/codex-1" kimi-1 "$KIMI_CODEX_BODY"
+wait_until 30 "Kimi to Codex accepted history" \
+  pane_has "$CODEX_PANE" "$KIMI_CODEX_TOKEN"
+
+CODEX_CLAUDE_TOKEN="M2-CODEX-CLAUDE-$PPID-${RANDOM:-0}"
+CODEX_CLAUDE_BODY="Mesh gate $CODEX_CLAUDE_TOKEN. Do not run tools or send a duet message; acknowledge internally and wait."
+send_from codex-1 claude "$CODEX_CLAUDE_BODY"
+wait_until 45 "Codex to Claude queue completion" \
+  message_body_delivered "$DUET_DIR/inbox/claude" codex-1 "$CODEX_CLAUDE_BODY"
+wait_until 30 "Codex to Claude accepted history" \
+  pane_has "$CLAUDE_PANE" "$CODEX_CLAUDE_TOKEN"
+
+CODEX_KIMI_FILE="$(message_file_by_body "$DUET_DIR/inbox/kimi-1" \
+  codex-1 "$CODEX_KIMI_BODY")"
+[ -n "$CODEX_KIMI_FILE" ] || die "could not locate Codex to Kimi envelope"
+MESH_HEADER="$(
+  (
+    # shellcheck disable=SC1090
+    . "$COMMON"
+    duet_read_message "$CODEX_KIMI_FILE" || exit 1
+    duet_build_payload | sed -n '1p'
+  )
+)"
+[ "$MESH_HEADER" = "[DUET session=$SESSION_ID id=$CODEX_KIMI_ID from=codex-1 to=kimi-1]" ] \
+  || die "unexpected M2 payload header: $MESH_HEADER"
+say "PASS direct mesh codex-1->kimi-1, kimi-1->codex-1, codex-1->claude with exact from/to"
+
+say "proving broadcast fanout excludes its sender"
+BROADCAST_TOKEN="M2-BROADCAST-$PPID-${RANDOM:-0}"
+BROADCAST_BODY="Broadcast gate $BROADCAST_TOKEN. Do not run tools or send a duet message; acknowledge internally and wait."
+CODEX_DELIVERED_BEFORE="$(delivered_count "$DUET_DIR/inbox/codex-1")"
+send_from codex-1 all "$BROADCAST_BODY"
+wait_until 45 "broadcast to Claude" \
+  message_body_delivered "$DUET_DIR/inbox/claude" codex-1 "$BROADCAST_BODY"
+wait_until 45 "broadcast to Kimi" \
+  message_body_delivered "$DUET_DIR/inbox/kimi-1" codex-1 "$BROADCAST_BODY"
+wait_until 30 "broadcast Claude accepted history" \
+  pane_has "$CLAUDE_PANE" "$BROADCAST_TOKEN"
+wait_until 30 "broadcast Kimi accepted history" \
+  pane_has "$KIMI_PANE" "$BROADCAST_TOKEN"
+[ "$(delivered_count "$DUET_DIR/inbox/codex-1")" = "$CODEX_DELIVERED_BEFORE" ] \
+  || die "broadcast unexpectedly enqueued to its sender"
+if pane_has "$CODEX_PANE" "$BROADCAST_TOKEN"; then
+  die "broadcast token appeared in sender pane"
+fi
+say "PASS all reached Claude+Kimi and excluded codex-1"
+
+say "proving busy Claude interrupt cancellation"
+BUSY_TOKEN="M2-BUSY-$PPID-${RANDOM:-0}"
+BUSY_BODY="Busy interrupt gate $BUSY_TOKEN. Use the Bash tool now to run exactly: sleep 90. Do not answer until that command finishes."
+send_from codex-1 claude "$BUSY_BODY"
+wait_until 45 "busy task queue completion" \
+  message_body_delivered "$DUET_DIR/inbox/claude" codex-1 "$BUSY_BODY"
+wait_until 45 "Claude descendant sleep 90" claude_has_sleep_90
+INTERRUPT_TOKEN="M2-INTERRUPT-$PPID-${RANDOM:-0}"
+INTERRUPT_BODY="Urgent interrupt gate $INTERRUPT_TOKEN. The prior sleep must be cancelled. Do not run tools; acknowledge and wait."
+INTERRUPT_AT="$(date +%s)"
+send_from kimi-1 claude "$INTERRUPT_BODY" interrupt
+INTERRUPT_ID="$SEND_ID"
+wait_until 30 "interrupt queue completion" \
+  message_body_delivered "$DUET_DIR/inbox/claude" kimi-1 "$INTERRUPT_BODY"
+wait_until 20 "Claude sleep cancellation" claude_sleep_cancelled
+INTERRUPT_ELAPSED=$(( $(date +%s) - INTERRUPT_AT ))
+[ ! -f "$DUET_DIR/.unhealthy" ] || die "busy interrupt made session unhealthy"
+say "PASS busy Claude cancelled and urgent message landed id=$INTERRUPT_ID elapsed=${INTERRUPT_ELAPSED}s"
+
+say "proving stable-ID duplicate suppression at recipient"
+DUPLICATE_ID="$(awk -F '\t' '$1 == "id" { print $2; exit }' "$CODEX_KIMI_FILE")"
+KIMI_COUNTER="$(cat "$DUET_DIR/inbox/kimi-1/.counter")"
+printf -v DUPLICATE_SEQUENCE '%010d' "$((KIMI_COUNTER + 1))"
+DUPLICATE_FILE="$DUET_DIR/inbox/kimi-1/N-$DUPLICATE_SEQUENCE.msg"
+cp "$CODEX_KIMI_FILE" "$DUPLICATE_FILE" || die "could not stage duplicate envelope"
+wait_until 30 "duplicate archive" \
+  test -f "$DUET_DIR/inbox/kimi-1/delivered/$(basename "$DUPLICATE_FILE")"
+grep -qF "suppressed duplicate $DUPLICATE_ID -> kimi-1" \
+  "$DUET_DIR/deliverd.log" || die "recipient did not log duplicate suppression"
+[ "$(grep -cF "delivered $DUPLICATE_ID -> kimi-1" "$DUET_DIR/deliverd.log")" -eq 1 ] \
+  || die "duplicate stable ID was injected more than once"
+say "PASS duplicate id=$DUPLICATE_ID suppressed without reinjection"
+
 wait_until 60 "queue drain" all_messages_terminal
 say "ending isolated session"
 if ! run_timed 120 "$LOG_DIR/end.log" env HOME="$REAL_HOME" \
@@ -310,5 +457,5 @@ fi
 
 SUCCESS=1
 TOTAL_ELAPSED=$(( $(date +%s) - STARTED_AT ))
-say "PASS real Claude+Codex+Kimi M1 gate (${TOTAL_ELAPSED}s)"
+say "PASS real Claude+Codex+Kimi M1+M2 gate (${TOTAL_ELAPSED}s)"
 exit 0
