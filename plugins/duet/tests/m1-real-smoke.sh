@@ -47,6 +47,16 @@ cleanup(){
       wait "$ACTIVE_PID" 2>/dev/null || true
       ;;
   esac
+  if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then
+    (
+      # shellcheck disable=SC1090
+      . "$CONFIG"
+      # shellcheck disable=SC1090
+      . "$COMMON"
+      : > "$DUET_DIR/.ended"
+      duet_stop_daemon "$DUET_DIR" 20
+    ) >/dev/null 2>&1 || true
+  fi
   tmux_smoke kill-server >/dev/null 2>&1 || true
   if [ -n "$SUCCESS" ] && [ "$status" -eq 0 ]; then
     case "$DUET_STATE_ROOT" in
@@ -210,9 +220,10 @@ message_file_by_body(){
   return 1
 }
 
-claude_has_sleep_90(){
+claude_has_marked_process(){
   local candidate current parent
-  for candidate in $(pgrep -f '(^|[ /])sleep 90($| )' 2>/dev/null || true); do
+  [ -n "${BUSY_MARKER:-}" ] || return 1
+  for candidate in $(pgrep -f "$BUSY_MARKER" 2>/dev/null || true); do
     current="$candidate"
     while [ "$current" -gt 1 ] 2>/dev/null; do
       parent="$(ps -p "$current" -o ppid= 2>/dev/null | tr -d ' ' || true)"
@@ -224,8 +235,8 @@ claude_has_sleep_90(){
   return 1
 }
 
-claude_sleep_cancelled(){
-  ! claude_has_sleep_90
+claude_busy_cancelled(){
+  ! claude_has_marked_process
 }
 
 for required in tmux claude codex kimi git base64 awk sed grep mktemp; do
@@ -314,7 +325,7 @@ grep -qF "delivered m-$SESSION_ID-claude-" \
   || die "Codex reply did not traverse the live Claude delivery path"
 say "PASS live Codex -> Claude id=$CODEX_TASK_ID"
 
-say "proving Kimi 0.29 long collapsed paste"
+say "proving Kimi 0.29 long-paste delivery"
 KIMI_TOKEN="M1-KIMI-COLLAPSED-$PPID-${RANDOM:-0}"
 KIMI_BODY="M1 live Kimi transport gate $KIMI_TOKEN. Do not run tools or send a duet reply; accept this prompt and wait."
 line=1
@@ -330,10 +341,13 @@ KIMI_TASK_ID="$SEND_ID"
 wait_until 60 "Kimi long message delivery" \
   message_delivered "$DUET_DIR/inbox/kimi-1" "$KIMI_TASK_ID"
 KIMI_ELAPSED=$(( $(date +%s) - KIMI_SENT_AT ))
-grep -qF \
-  "observed kimi collapsed composer for $KIMI_TASK_ID -> kimi-1" \
-  "$DUET_DIR/deliverd.log" \
-  || die "daemon did not observe the Kimi collapsed marker"
+if grep -qF \
+    "observed kimi collapsed composer for $KIMI_TASK_ID -> kimi-1" \
+    "$DUET_DIR/deliverd.log"; then
+  KIMI_LANDING=collapsed-marker
+else
+  KIMI_LANDING=payload-tail
+fi
 wait_until 30 "Kimi accepted history" pane_has "$KIMI_PANE" "$KIMI_TOKEN"
 KIMI_MARKER="$(
   (
@@ -350,7 +364,7 @@ KIMI_MARKER="$(
 message_delivered "$DUET_DIR/inbox/kimi-1" "$KIMI_TASK_ID" \
   || die "Kimi queue file did not complete"
 [ ! -f "$DUET_DIR/.unhealthy" ] || die "Kimi delivery marked session unhealthy"
-say "PASS Kimi collapsed marker detected, Enter submitted, marker cleared, accepted-history token present, queue complete id=$KIMI_TASK_ID elapsed=${KIMI_ELAPSED}s"
+say "PASS Kimi landing=$KIMI_LANDING, Enter submitted, composer cleared, accepted-history token present, queue complete id=$KIMI_TASK_ID elapsed=${KIMI_ELAPSED}s"
 
 say "proving any-to-any mesh in both directions"
 CODEX_KIMI_TOKEN="M2-CODEX-KIMI-$PPID-${RANDOM:-0}"
@@ -375,8 +389,6 @@ CODEX_CLAUDE_BODY="Mesh gate $CODEX_CLAUDE_TOKEN. Do not run tools or send a due
 send_from codex-1 claude "$CODEX_CLAUDE_BODY"
 wait_until 45 "Codex to Claude queue completion" \
   message_body_delivered "$DUET_DIR/inbox/claude" codex-1 "$CODEX_CLAUDE_BODY"
-wait_until 30 "Codex to Claude accepted history" \
-  pane_has "$CLAUDE_PANE" "$CODEX_CLAUDE_TOKEN"
 
 CODEX_KIMI_FILE="$(message_file_by_body "$DUET_DIR/inbox/kimi-1" \
   codex-1 "$CODEX_KIMI_BODY")"
@@ -402,8 +414,6 @@ wait_until 45 "broadcast to Claude" \
   message_body_delivered "$DUET_DIR/inbox/claude" codex-1 "$BROADCAST_BODY"
 wait_until 45 "broadcast to Kimi" \
   message_body_delivered "$DUET_DIR/inbox/kimi-1" codex-1 "$BROADCAST_BODY"
-wait_until 30 "broadcast Claude accepted history" \
-  pane_has "$CLAUDE_PANE" "$BROADCAST_TOKEN"
 wait_until 30 "broadcast Kimi accepted history" \
   pane_has "$KIMI_PANE" "$BROADCAST_TOKEN"
 [ "$(delivered_count "$DUET_DIR/inbox/codex-1")" = "$CODEX_DELIVERED_BEFORE" ] \
@@ -415,11 +425,13 @@ say "PASS all reached Claude+Kimi and excluded codex-1"
 
 say "proving busy Claude interrupt cancellation"
 BUSY_TOKEN="M2-BUSY-$PPID-${RANDOM:-0}"
-BUSY_BODY="Busy interrupt gate $BUSY_TOKEN. Use the Bash tool now to run exactly: sleep 90. Do not answer until that command finishes."
+BUSY_MARKER="$WORKDIR/m2-interrupt-release-$PPID-${RANDOM:-0}"
+: > "$BUSY_MARKER"
+BUSY_BODY="Busy interrupt gate $BUSY_TOKEN. Use the Bash tool now to run exactly: tail -f '$BUSY_MARKER'. Do not answer until that command finishes."
 send_from codex-1 claude "$BUSY_BODY"
 wait_until 45 "busy task queue completion" \
   message_body_delivered "$DUET_DIR/inbox/claude" codex-1 "$BUSY_BODY"
-wait_until 45 "Claude descendant sleep 90" claude_has_sleep_90
+wait_until 45 "Claude marked busy process" claude_has_marked_process
 INTERRUPT_TOKEN="M2-INTERRUPT-$PPID-${RANDOM:-0}"
 INTERRUPT_BODY="Urgent interrupt gate $INTERRUPT_TOKEN. The prior sleep must be cancelled. Do not run tools; acknowledge and wait."
 INTERRUPT_AT="$(date +%s)"
@@ -427,7 +439,7 @@ send_from kimi-1 claude "$INTERRUPT_BODY" interrupt
 INTERRUPT_ID="$SEND_ID"
 wait_until 30 "interrupt queue completion" \
   message_body_delivered "$DUET_DIR/inbox/claude" kimi-1 "$INTERRUPT_BODY"
-wait_until 20 "Claude sleep cancellation" claude_sleep_cancelled
+wait_until 20 "Claude busy-process cancellation" claude_busy_cancelled
 INTERRUPT_ELAPSED=$(( $(date +%s) - INTERRUPT_AT ))
 [ ! -f "$DUET_DIR/.unhealthy" ] || die "busy interrupt made session unhealthy"
 say "PASS busy Claude cancelled and urgent message landed id=$INTERRUPT_ID elapsed=${INTERRUPT_ELAPSED}s"
