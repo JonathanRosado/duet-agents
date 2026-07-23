@@ -180,7 +180,7 @@ send_from(){
   if ! printf '%s' "$body" | env HOME="$REAL_HOME" \
       TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$sender_pane" \
       DUET_SELF="$sender" DUET_CONFIG="$CONFIG" \
-      bash "$SEND_SCRIPT" "$recipient" --from "$sender" --session "$CONFIG" \
+      bash "$SEND_SCRIPT" "$recipient" --from "$sender" \
         ${interrupt:+--interrupt} \
       > "$output" 2>&1; then
     cat "$output" >&2
@@ -285,6 +285,7 @@ say "launching Codex and Kimi workers through duet-init"
 if ! run_timed 360 "$LOG_DIR/init.log" run_in_workdir "$WORKDIR" env \
     HOME="$REAL_HOME" CODEX_HOME="$SMOKE_CODEX_HOME" \
     TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$CLAUDE_PANE" \
+    DUET_SELF=claude \
     DUET_STATE_ROOT="$DUET_STATE_ROOT" \
     DUET_CLAUDE_MODEL=haiku \
     DUET_CODEX_REASONING_EFFORT=low \
@@ -296,7 +297,7 @@ if ! run_timed 360 "$LOG_DIR/init.log" run_in_workdir "$WORKDIR" env \
 fi
 cat "$LOG_DIR/init.log"
 
-DUET_DIR="$(readlink "$DUET_STATE_ROOT/current" 2>/dev/null || true)"
+DUET_DIR="$(sed -n 's/^duet: session //p' "$LOG_DIR/init.log" | tail -n 1)"
 case "$DUET_DIR" in "$DUET_STATE_ROOT"/*) :;; *) die "invalid session path";; esac
 SESSION_ID="$(basename "$DUET_DIR")"
 CONFIG="$DUET_DIR/duet.env"
@@ -461,7 +462,9 @@ say "PASS duplicate id=$DUPLICATE_ID suppressed without reinjection"
 wait_until 60 "queue drain" all_messages_terminal
 say "ending isolated session"
 if ! run_timed 120 "$LOG_DIR/end.log" env HOME="$REAL_HOME" \
-    bash "$END_SCRIPT" --session "$CONFIG"; then
+    TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$CLAUDE_PANE" \
+    DUET_SELF=claude DUET_CONFIG="$CONFIG" \
+    bash "$END_SCRIPT"; then
   sed 's/^/[end] /' "$LOG_DIR/end.log" >&2 2>/dev/null || true
   die "duet-end failed"
 fi

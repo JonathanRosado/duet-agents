@@ -318,21 +318,23 @@ test_failed_head_is_fair_and_fifo(){
   assert_no_file "$codex_box/N-0000000001.msg.tries" "no durable attempts"
 }
 
-test_ambiguous_delivery_stops_loudly(){
+test_ambiguous_delivery_blocks_only_recipient(){
   create_state ambiguous
   FAKE_LOG="$DUET_DIR/fake.log"
   : > "$FAKE_LOG"
   FAKE_STALLED_TARGET=""
   FAKE_AMBIGUOUS_TARGET=kimi-1
   enqueue_one kimi-1 ambiguous-body
-  if duet_deliverd_pass; then
-    fail "ambiguous pass unexpectedly succeeded"
-  fi
-  assert_file "$DUET_DIR/.unhealthy" "unhealthy marker"
-  assert_contains "$DUET_DIR/.unhealthy" delivery-ambiguous \
+  enqueue_one codex-1 healthy-peer-body
+  duet_deliverd_pass || fail "ambiguous pass stopped the whole daemon"
+  assert_no_file "$DUET_DIR/.unhealthy" "no session-wide unhealthy marker"
+  assert_file "$DUET_DIR/blocked/kimi-1" "recipient block marker"
+  assert_contains "$DUET_DIR/blocked/kimi-1" delivery-ambiguous \
     "loud ambiguity reason"
   assert_eq 1 "$(active_count "$DUET_DIR/inbox/kimi-1")" \
     "ambiguous message remains for diagnosis"
+  assert_eq 1 "$(delivered_count "$DUET_DIR/inbox/codex-1")" \
+    "healthy peer advances despite another recipient's ambiguity"
   assert_no_file "$DUET_DIR/inbox/kimi-1/N-0000000001.msg.phase" \
     "no ENTER_ONLY recovery state"
 }
@@ -414,8 +416,8 @@ run_case 'verified send pastes once and retries Enter only' \
   test_verified_send_fsm
 run_case 'failed head preserves FIFO without blocking peers' \
   test_failed_head_is_fair_and_fifo
-run_case 'post-paste ambiguity marks session unhealthy' \
-  test_ambiguous_delivery_stops_loudly
+run_case 'post-paste ambiguity blocks only its recipient' \
+  test_ambiguous_delivery_blocks_only_recipient
 run_case '50 concurrent enqueues preserve FIFO and dedupe IDs' \
   test_concurrent_fifo_and_dedupe
 

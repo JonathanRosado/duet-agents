@@ -95,7 +95,6 @@ SERVER_PID="$(command tmux -L "$TMUX_LABEL" display-message -p '#{pid}')"
   printf 'DUET_TMUX_SERVER_PID=%q\n' "$SERVER_PID"
   printf 'DUET_SESSION=%q\n' m2-session
   printf 'DUET_SESSION_ID=%q\n' m2-session
-  printf 'DUET_WORKDIR_KEY=%q\n' test-key
   printf 'DUET_INITIATOR=%q\n' claude
   printf 'DUET_INITIATOR_PANE=%q\n' "$CLAUDE_PANE"
 } > "$CONFIG"
