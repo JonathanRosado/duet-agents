@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real Claude/Codex/Kimi gate for the v4 M1 delivery core.
+# Canonical real Claude/Codex/Kimi end-to-end smoke for duet v4.
 # Owns tmux server "duetv4smoke" and temporary state/work roots only.
 set -u
 set -o pipefail
@@ -33,8 +33,8 @@ STARTED_AT="$(date +%s)"
 unset DUET_CONFIG DUET_SESSION DUET_SESSION_ID DUET_SELF TMUX TMUX_PANE
 unset CODEX_PANE CODEX_PANE_PID
 
-say(){ printf '[m1-live] %s\n' "$*"; }
-die(){ printf '[m1-live] FAIL: %s\n' "$*" >&2; exit 1; }
+say(){ printf '[v4-real] %s\n' "$*"; }
+die(){ printf '[v4-real] FAIL: %s\n' "$*" >&2; exit 1; }
 tmux_smoke(){ command tmux -L "$TMUX_LABEL" "$@"; }
 
 cleanup(){
@@ -61,14 +61,14 @@ cleanup(){
   if [ -n "$SUCCESS" ] && [ "$status" -eq 0 ]; then
     case "$DUET_STATE_ROOT" in
       "$TMP_BASE"/duetv4-state.*) rm -rf -- "$DUET_STATE_ROOT" ;;
-      *) printf '[m1-live] refused unsafe state cleanup: %s\n' "$DUET_STATE_ROOT" >&2 ;;
+      *) printf '[v4-real] refused unsafe state cleanup: %s\n' "$DUET_STATE_ROOT" >&2 ;;
     esac
     case "$WORKDIR" in
       "$TMP_BASE"/duetv4-work.*) rm -rf -- "$WORKDIR" ;;
-      *) printf '[m1-live] refused unsafe work cleanup: %s\n' "$WORKDIR" >&2 ;;
+      *) printf '[v4-real] refused unsafe work cleanup: %s\n' "$WORKDIR" >&2 ;;
     esac
   else
-    printf '[m1-live] diagnostics retained: %s and %s\n' \
+    printf '[v4-real] diagnostics retained: %s and %s\n' \
       "$DUET_STATE_ROOT" "$WORKDIR" >&2
   fi
   exit "$status"
@@ -168,7 +168,7 @@ active_message_count(){
   printf '%s' "$count"
 }
 
-all_messages_terminal(){ [ "$(active_message_count)" -eq 0 ]; }
+all_messages_complete(){ [ "$(active_message_count)" -eq 0 ]; }
 
 send_from(){
   local sender="$1" recipient="$2" body="$3" interrupt="${4:-}"
@@ -459,7 +459,7 @@ grep -qF "suppressed duplicate $DUPLICATE_ID -> kimi-1" \
   || die "duplicate stable ID was injected more than once"
 say "PASS duplicate id=$DUPLICATE_ID suppressed without reinjection"
 
-wait_until 60 "queue drain" all_messages_terminal
+wait_until 60 "queue completion" all_messages_complete
 say "ending isolated session"
 if ! run_timed 120 "$LOG_DIR/end.log" env HOME="$REAL_HOME" \
     TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$CLAUDE_PANE" \
@@ -472,5 +472,5 @@ fi
 
 SUCCESS=1
 TOTAL_ELAPSED=$(( $(date +%s) - STARTED_AT ))
-say "PASS real Claude+Codex+Kimi M1+M2 gate (${TOTAL_ELAPSED}s)"
+say "PASS canonical real Claude+Codex+Kimi v4 gate (${TOTAL_ELAPSED}s)"
 exit 0
