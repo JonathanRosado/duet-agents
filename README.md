@@ -85,6 +85,21 @@ claude plugin install duet@duet-agents
 Or `/plugin marketplace add JonathanRosado/duet-agents` then
 `/plugin install duet@duet-agents` from inside Claude Code.
 
+## Updating
+
+Move an existing install to the latest release, then **restart Claude Code** to
+apply it:
+
+```bash
+claude plugin update duet@duet-agents
+```
+
+If the marketplace source needs an explicit refresh first, run
+`claude plugin marketplace update duet-agents`. A running duet session is
+version-pinned — its script paths are baked into `duet.env` at launch, so an
+update never hot-upgrades a live session; it applies to the next `/duet:duet`
+after the restart.
+
 ## Use
 
 Start Claude inside tmux, then choose the worker roster:
