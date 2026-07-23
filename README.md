@@ -44,13 +44,18 @@ The transport's properties:
 - **At-least-once + dedup.** Every payload carries a session ID and a stable
   message ID. A recipient suppresses a repeated ID; agents are told to ignore a
   duplicate. Exactly-once is not claimed.
-- **Terminal states.** Every message ends as *delivered*, or its recipient is
-  surfaced as **dead** (pane gone), **blocked** (a wedged composer, after a
-  bounded number of non-landing attempts), or **rejected** (a malformed
-  envelope) — never silent limbo. A single peer's failure never sinks the mesh.
+- **Terminal states.** In a live session, a message is archived *delivered* (or
+  *rejected* — its envelope is malformed and it is moved to `rejected/` with a
+  reason), or its recipient is surfaced as **dead** (pane gone) or **blocked**
+  (fenced after a wedged composer, an ambiguous submit, or repeated non-landing)
+  and its queued head is no longer attempted — never silent limbo. A single
+  peer's failure is recipient-scoped and never sinks the mesh. (The documented
+  exceptions are a send racing an immediate `end`, and a discarded crashed
+  session — see **Ending** and **No recovery**.)
 - **Harness-aware submission.** Bracketed paste plus cursor-row composer-marker
   detection for Claude, Codex, and Kimi; after a paste is seen to land, the
-  daemon only retries Enter and never repastes (so a task is never duplicated).
+  daemon only retries Enter and never repastes — closing the known transport
+  duplication path (delivery still being at-least-once overall).
 - **No recovery.** A crashed or wedged session is discarded, not repaired. There
   is no leadership takeover and no restart replay — just re-init.
 
@@ -66,8 +71,9 @@ The transcript is a human-readable activity log, not proof of delivery.
   [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) (`kimi`), or another
   `claude` process
 
-A session has one initiating Claude plus one to four workers — a hard cap of
-five agents.
+A session has one initiator plus one to four workers — a hard cap of five
+agents. Through `/duet:duet` the initiator is the Claude that runs it; the Bash
+runtime itself can be initiated by any supported harness.
 
 ## Install
 
@@ -99,10 +105,11 @@ instance names (`codex-1`, `kimi-1`, `claude-1`); the bare name `claude` is the
 initiator. Repeating a harness launches multiple instances.
 
 Any agent addresses any other by exact roster name, or `all` to broadcast to
-every other live member (never itself). The agent that received the task
-coordinates by convention — decompose the goal, hand peers scoped tasks,
-integrate their replies — but peers may also talk to each other directly.
-`assignments.md` in the session dir is an optional shared scratchpad.
+every other live, **deliverable** member (itself, and any dead or blocked peer,
+are skipped). The agent that received the task coordinates by convention —
+decompose the goal, hand peers scoped tasks, integrate their replies — but peers
+may also talk to each other directly. `assignments.md` in the session dir is an
+optional shared scratchpad.
 
 Ending is immediate and has no drain: it stops the daemon and kills the other
 spawned panes (the caller's own pane survives). Because there is no drain, make
@@ -111,8 +118,10 @@ you end the session.
 
 ## Pin every session operation
 
-There is no `current` pointer. Every command must pin the exact session with the
-absolute config injected at launch as `DUET_CONFIG`, or `--session` on Bash:
+There is no `current` pointer. Every command targets one explicit session.
+**Mutation commands (`send`, `end`) read `DUET_CONFIG`; diagnostics (`status`,
+`doctor`) take an explicit `--session <duet.env>`.** Both are the absolute config
+injected at launch.
 
 ```bash
 DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
@@ -120,15 +129,15 @@ DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
 ...message...
 DUET_EOF
 
-DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
-  bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-status.sh"
+bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-status.sh" \
+  --session "/absolute/path/to/.duet/<session>/duet.env"
 ```
 
-Duet cross-checks the sender's tmux pane, `DUET_SELF`, roster membership, and
-session ID, and refuses cross-session sends. **Multiple sessions can run
-concurrently in one repository — put each in its own git worktree** (distinct
-`AGENTS.md`/`CLAUDE.md` anchor files). Set `DUET_STATE_ROOT` before init to place
-session state somewhere other than the default `$HOME/.duet`.
+Duet cross-checks the sender's tmux pane, `DUET_SELF` (when the pane has it),
+roster membership, and session ID, and refuses cross-session sends. **Multiple
+sessions can run concurrently in one repository — put each in its own git
+worktree** (distinct `AGENTS.md`/`CLAUDE.md` anchor files). Set `DUET_STATE_ROOT`
+before init to place session state somewhere other than the default `$HOME/.duet`.
 
 ## Model and permission overrides
 
@@ -171,28 +180,28 @@ Register the harness name and instance counter in init.
 
 ## Troubleshooting
 
-Always pin the session:
+Diagnostics take an explicit `--session`:
 
 ```bash
-DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
-  bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-status.sh"
-DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
-  bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-doctor.sh"
+bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-status.sh" --session "/absolute/path/to/.duet/<session>/duet.env"
+bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-doctor.sh"  --session "/absolute/path/to/.duet/<session>/duet.env"
 ```
 
 Status shows the pinned session id, daemon liveness, each roster pane / harness /
 readiness, per-recipient queue depth, and any **dead** or **blocked** recipients.
 
-- **A peer stops receiving.** Check status. `dead` = its pane is gone (re-init to
-  replace it). `blocked` = its composer stayed occupied for `DUET_NOT_LANDED_LIMIT`
-  consecutive attempts (default 30 ≈ a few seconds); clear that pane's composer
-  (focus it, press **Escape**) and re-send. `rejected/` under the session dir
-  holds malformed messages with a reason sidecar.
-- **`queued` but nothing arrives.** The daemon may be down (`duet-status`) — sends
-  are refused when it is not alive. Do not blindly re-send: a landed paste may
-  already be accepted.
-- **Do not `end` while a send is in flight.** Ending is immediate and unfenced, so
-  a send racing teardown can be accepted into a stopped session and stranded.
+- **A peer stops receiving.** Check status. `dead` = its pane is gone. `blocked`
+  = the daemon has terminally fenced that recipient (a wedged composer after
+  `DUET_NOT_LANDED_LIMIT` attempts, default 30 ≈ a few seconds; an ambiguous
+  submit; or a rejected head). A blocked recipient is **not** auto-recovered —
+  the daemon skips it and new sends to it are refused; **re-init** if you need
+  it. The exact reason is in `<session>/blocked/<name>` and `deliverd.log`;
+  malformed messages are archived under `<session>/rejected/` with a reason.
+- **`queued` but nothing arrives.** The daemon may be down (`duet-status`) —
+  sends are refused when it is not alive. Do not blindly re-send: a landed paste
+  may already be accepted.
+- **Do not `end` while a send is in flight.** Ending is immediate and unfenced,
+  so a send racing teardown can be accepted into a stopped session and stranded.
   Confirm needed deliveries first, then end.
 - **A wedged session** is discarded, not recovered. Re-init a fresh ensemble;
   session artifacts remain under `$DUET_STATE_ROOT/<session>/` as an audit record.
@@ -203,18 +212,19 @@ readiness, per-recipient queue depth, and any **dead** or **blocked** recipients
 .claude-plugin/marketplace.json
 plugins/duet/
 ├── .claude-plugin/plugin.json
-├── briefs/ENSEMBLE_BRIEF.md          # mesh brief (Bash path)
-├── briefs/ENSEMBLE_BRIEF.win.md      # previous protocol; updated with Windows parity
-├── harnesses/{claude,codex,kimi}.{sh,ps1}
+├── briefs/
+│   ├── ENSEMBLE_BRIEF.md             # v4 mesh brief (Bash path)
+│   └── ENSEMBLE_BRIEF.win.md         # previous protocol; pending Windows parity
+├── harnesses/{claude,codex,kimi}.sh  # + matching .ps1 (previous protocol; pending parity)
 ├── skills/duet/SKILL.md
 ├── scripts/
 │   ├── duet-common.sh                # shared library + harness-aware verified send
 │   ├── duet-init.sh                  # roster, brief render, launch, daemon
-│   ├── duet-send.sh                  # enqueue: name | all
+│   ├── duet-send.sh                  # enqueue: <name> | all
 │   ├── duet-deliverd.sh              # per-recipient FIFO delivery daemon
 │   ├── duet-end.sh                   # immediate teardown
-│   └── duet-status.sh / duet-doctor.sh
-│   └── (matching *.ps1 — previous protocol until Windows parity)
+│   ├── duet-status.sh
+│   └── duet-doctor.sh                # (matching *.ps1 remain on the previous protocol)
 └── tests/
     └── run-bash-tests.sh             # m1-delivery · m2-mesh · m3-lifecycle · v4-real-smoke
 ```

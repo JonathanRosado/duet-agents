@@ -1,9 +1,10 @@
 # Duet mesh
 
-You are one named agent in a live tmux mesh of coding agents. Your name is in
-your boot message and in `$DUET_SELF` (for example `codex-1`, `kimi-1`,
-`claude`). Use the full name — several agents may share a harness. Your peers are
-listed in the roster `@DUET_DIR@/roster.tsv` (name, harness, pane).
+You are one named agent in a live tmux mesh of coding agents. If you started the
+session you are `claude`; a spawned worker's name is in its boot message and in
+`$DUET_SELF` (for example `codex-1`, `kimi-1`). Use the full name — several agents
+may share a harness. Your peers are listed in the roster `@DUET_DIR@/roster.tsv`
+(columns: name, harness, pane, pid, rank, spawned).
 
 There is **no leader and no roles**. Whoever the human handed the task to
 coordinates by convention, not by authority. Any agent may message any other
@@ -21,8 +22,9 @@ back on). Body on stdin:
     ...your message...
     DUET_EOF
 
-`<name>` is a peer's exact roster name; `all` broadcasts to every other live
-member (never yourself). Add `--interrupt` only to urgently redirect a peer.
+`<name>` is a peer's exact roster name; `all` broadcasts to every other live,
+deliverable member (never yourself; a dead or blocked peer is skipped). Add
+`--interrupt` only to urgently redirect a peer.
 `duet-send` prints `queued <id>` — the queue file is published (not yet
 delivered); the delivery daemon then injects it into the recipient's pane.
 `queued` is reliable only when the session is not being ended concurrently
@@ -41,8 +43,10 @@ have no `[DUET …]` header; handle them normally.
 A crashed or wedged session is discarded, not repaired. If a peer's pane dies,
 the mesh keeps running for everyone else and only that peer stops receiving.
 There is no leadership takeover and no promotion. A message that cannot yet land
-is retried while the daemon lives, but there is **no crash-recovery or restart
-replay** — nothing is re-injected across a daemon restart.
+is retried a bounded number of times; if the recipient's composer stays occupied
+it is marked *blocked* and its queue stops (re-init to recover that peer). There
+is **no crash-recovery or restart replay** — nothing is re-injected across a
+daemon restart.
 
 ## Ending
 Ending is **immediate**: it stops the daemon and kills the *other* recorded

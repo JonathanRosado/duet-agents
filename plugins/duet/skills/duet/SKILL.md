@@ -57,7 +57,8 @@ other directly — you are not a required relay.
 
 ## 3. Send and receive
 Send to one peer by its exact roster name, or `all` to broadcast (fans out to
-every other live member, never yourself). Body on stdin:
+every other live, deliverable member — never yourself; dead or blocked peers are
+skipped). Body on stdin:
 
     DUET_CONFIG="/absolute/session/directory/duet.env" \
       bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex-1 <<'DUET_EOF'
@@ -75,9 +76,11 @@ a reply you already sent. Reply to the exact `from`; reply once to what you
 receive and then wait for the next message (do not send a peer a second message
 before it has replied, and do not spam). Human messages have no `[DUET …]` header.
 
-Every message reaches a **terminal state**: delivered, or its recipient is
-surfaced as dead / blocked (a wedged composer) / rejected (a bad envelope) —
-never silent limbo. If a peer seems unresponsive, check `duet-status.sh`.
+In a live session every message is archived *delivered* (or *rejected*, if its
+envelope is malformed), or its recipient is surfaced as **dead** or **blocked**
+and its queued head is no longer attempted — never silent limbo. A blocked
+recipient is terminal (re-init to recover it). If a peer seems unresponsive,
+check `duet-status.sh`.
 
 ## 4. Diagnostics
 Always pass the explicit session:
