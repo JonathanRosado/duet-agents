@@ -209,34 +209,30 @@ _duet_tail_strip(){
 
 # Claude, Codex, and Kimi can collapse a long bracketed paste instead of
 # rendering the payload bytes. Return a harness-prefixed normalized token only
-# while that harness's marker owns the active composer. Codex and Kimi markers
-# are cursor-row scoped so an identical marker in accepted history cannot be
-# mistaken for unsent input.
+# while that harness's marker owns the active cursor row, so an identical
+# marker in accepted history cannot be mistaken for unsent input.
 _duet_paste_marker(){
   local pane="${1:?pane required}" harness="${2:-}"
-  local marker cursor row line
-
-  if [ -z "$harness" ] || [ "$harness" = claude ]; then
-    marker="$(_duet_tmux capture-pane -p -t "$pane" 2>/dev/null \
-      | tail -n 6 \
-      | awk '
-          tolower($0) ~ /pasted text #[0-9]+/ { line=$0 }
-          tolower($0) ~ /paste again to expand/ { composer=1 }
-          END { if (composer) print line }
-        ' \
-      | LC_ALL=C tr -cd '[:alnum:]')"
-    if [ -n "$marker" ]; then
-      printf 'claude%s' "$marker"
-      return 0
-    fi
-    [ -z "$harness" ] || return 0
-  fi
+  local marker cursor cursor_after row line
 
   cursor="$(_duet_tmux display-message -p -t "$pane" '#{cursor_y}' 2>/dev/null || true)"
   case "$cursor" in ''|*[!0-9]*) return 0;; esac
   row=$((cursor + 1))
   line="$(_duet_tmux capture-pane -p -t "$pane" 2>/dev/null \
     | awk -v row="$row" 'NR == row { print; exit }')"
+  cursor_after="$(_duet_tmux display-message -p -t "$pane" '#{cursor_y}' 2>/dev/null || true)"
+  [ "$cursor_after" = "$cursor" ] || return 0
+
+  if { [ -z "$harness" ] || [ "$harness" = claude ]; } \
+      && printf '%s\n' "$line" \
+        | grep -qiE '\[Pasted[[:space:]]+text[[:space:]]*#[0-9]+([[:space:]]*\+[[:space:]]*[0-9]+[[:space:]]+lines?)?[[:space:]]*\]'; then
+    marker="$(printf '%s\n' "$line" \
+      | grep -ioE '\[Pasted[[:space:]]+text[[:space:]]*#[0-9]+([[:space:]]*\+[[:space:]]*[0-9]+[[:space:]]+lines?)?[[:space:]]*\]' \
+      | head -n 1 \
+      | LC_ALL=C tr -cd '[:alnum:]')"
+    [ -z "$marker" ] || printf 'claude%s' "$marker"
+    return 0
+  fi
 
   if { [ -z "$harness" ] || [ "$harness" = codex ]; } \
       && printf '%s\n' "$line" | grep -qiE '\[Pasted Content [0-9]+ chars\]'; then

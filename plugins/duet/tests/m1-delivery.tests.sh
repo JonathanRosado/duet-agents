@@ -98,7 +98,80 @@ eval "$(
     | sed '1s/^duet_send_verified[[:space:]]*()/duet_send_verified_production()/'
 )"
 
-test_kimi_marker_cursor_scope(){
+test_marker_cursor_scope(){
+  if ! (
+    local token
+    _duet_tmux(){
+      case "$1" in
+        display-message) printf '2\n' ;;
+        capture-pane)
+          printf '%s\n' \
+            'history [Pasted text #2 +9 lines]' \
+            'ordinary history' \
+            '[Pasted text #7 +74 lines]' \
+            'paste again to expand'
+          ;;
+      esac
+    }
+    token="$(_duet_paste_marker '%1' claude)"
+    [ "$token" = claudePastedtext774lines ]
+  ); then
+    fail "active-row Claude marker was not normalized exactly"
+  fi
+  if ! (
+    local token
+    _duet_tmux(){
+      case "$1" in
+        display-message) printf '2\n' ;;
+        capture-pane)
+          printf '%s\n' \
+            'history [Pasted text #2 +9 lines]' \
+            'paste again to expand' \
+            'empty active composer'
+          ;;
+      esac
+    }
+    token="$(_duet_paste_marker '%1' claude)"
+    [ -z "$token" ]
+  ); then
+    fail "Claude marker in history was mistaken for the active composer"
+  fi
+  if ! (
+    local token
+    _duet_tmux(){
+      case "$1" in
+        display-message) printf '2\n' ;;
+        capture-pane)
+          printf '%s\n' \
+            'history [Pasted Content 12 chars]' \
+            'ordinary history' \
+            '[Pasted Content 987 chars]'
+          ;;
+      esac
+    }
+    token="$(_duet_paste_marker '%1' codex)"
+    [ "$token" = codexPastedContent987chars ]
+  ); then
+    fail "active-row Codex marker was not normalized exactly"
+  fi
+  if ! (
+    local token
+    _duet_tmux(){
+      case "$1" in
+        display-message) printf '2\n' ;;
+        capture-pane)
+          printf '%s\n' \
+            'history [Pasted Content 12 chars]' \
+            '[Pasted Content 987 chars]' \
+            'empty active composer'
+          ;;
+      esac
+    }
+    token="$(_duet_paste_marker '%1' codex)"
+    [ -z "$token" ]
+  ); then
+    fail "Codex marker in history was mistaken for the active composer"
+  fi
   if ! (
     local token
     _duet_tmux(){
@@ -134,6 +207,31 @@ test_kimi_marker_cursor_scope(){
     [ -z "$token" ]
   ); then
     fail "Kimi marker in history was mistaken for the active composer"
+  fi
+  if ! (
+    local cursor_reads="$TEST_ROOT/marker-cursor-reads" token
+    printf '0\n' > "$cursor_reads"
+    _duet_tmux(){
+      local reads
+      case "$1" in
+        display-message)
+          reads="$(cat "$cursor_reads")"
+          printf '%s\n' "$((reads + 1))" > "$cursor_reads"
+          if [ "$reads" -eq 0 ]; then printf '2\n'; else printf '3\n'; fi
+          ;;
+        capture-pane)
+          printf '%s\n' \
+            'ordinary history' \
+            'ordinary history' \
+            '[paste #7 +74 lines]' \
+            'new active row'
+          ;;
+      esac
+    }
+    token="$(_duet_paste_marker '%1' kimi)"
+    [ -z "$token" ]
+  ); then
+    fail "marker was accepted across a cursor-row redraw"
   fi
 }
 
@@ -410,8 +508,8 @@ test_concurrent_fifo_and_dedupe(){
     "duplicate suppression logged"
 }
 
-run_case 'Kimi marker is exact and cursor-row scoped' \
-  test_kimi_marker_cursor_scope
+run_case 'paste markers are exact and cursor-row scoped' \
+  test_marker_cursor_scope
 run_case 'verified send pastes once and retries Enter only' \
   test_verified_send_fsm
 run_case 'failed head preserves FIFO without blocking peers' \
