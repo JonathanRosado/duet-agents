@@ -91,26 +91,6 @@ duet_move_delivered(){
   DUET_TERMINAL_FILE="$destination"
 }
 
-duet_queue_target(){
-  local queue="${1:?queue required}"
-  DUET_QUEUE_TARGET=""
-  case "$queue" in
-    leader)
-      # Temporary M1 compatibility for the legacy hub sender. M2 removes this
-      # alias and its leader state completely.
-      duet_read_leader_state || return 1
-      DUET_QUEUE_TARGET="$DUET_CURRENT_LEADER"
-      ;;
-    promotions)
-      return 2
-      ;;
-    *)
-      duet_roster_has_name "$queue" || return 1
-      DUET_QUEUE_TARGET="$queue"
-      ;;
-  esac
-}
-
 # Process at most one head from one physical queue. A definitely-not-landed
 # head remains in place and stalls only this queue. Every post-paste ambiguity
 # is fatal for the whole session because safely restarting would require the
@@ -145,25 +125,20 @@ duet_process_one(){
     return 1
   fi
 
-  if ! duet_queue_target "$queue"; then
-    duet_mark_unhealthy "queue inbox/$queue has no unique live-session recipient"
+  if ! duet_roster_has_name "$queue"; then
+    duet_mark_unhealthy "queue inbox/$queue is not a roster recipient"
     return 1
   fi
-  DUET_TARGET_NAME="$DUET_QUEUE_TARGET"
-  case "$queue" in
-    leader)
-      [ "$DUET_MESSAGE_RECIPIENT" = leader ] || {
-        duet_mark_unhealthy "message $DUET_MESSAGE_ID redirects the leader queue"
-        return 1
-      }
-      ;;
-    *)
-      [ "$DUET_MESSAGE_RECIPIENT" = "$queue" ] || {
-        duet_mark_unhealthy "message $DUET_MESSAGE_ID redirects inbox/$queue"
-        return 1
-      }
-      ;;
-  esac
+  if ! duet_roster_has_name "$DUET_MESSAGE_SENDER"; then
+    duet_mark_unhealthy "message $DUET_MESSAGE_ID names nonmember sender $DUET_MESSAGE_SENDER"
+    return 1
+  fi
+  DUET_TARGET_NAME="$queue"
+  if [ "$DUET_MESSAGE_RECIPIENT" != "$queue" ] \
+      && [ "$DUET_MESSAGE_RECIPIENT" != all ]; then
+    duet_mark_unhealthy "message $DUET_MESSAGE_ID redirects inbox/$queue"
+    return 1
+  fi
 
   if duet_message_id_delivered "$box" "$DUET_MESSAGE_ID"; then
     duet_deliverd_log "suppressed duplicate $DUET_MESSAGE_ID -> $DUET_TARGET_NAME"
@@ -226,10 +201,8 @@ duet_process_one(){
 
 # Every roster member gets at most one bounded head attempt per pass. Since a
 # pre-landing stall returns success, the pass continues to every other member.
-# The symbolic leader queue is transitional M1 compatibility and is attempted
-# only when that physical recipient did not already receive a named attempt.
 duet_deliverd_pass(){
-  local name box target seen="|"
+  local name box
   if ! duet_validate_roster "${DUET_DIR:?}/roster.tsv"; then
     duet_mark_unhealthy "roster validation failed"
     return 1
@@ -243,23 +216,7 @@ duet_deliverd_pass(){
     if ! duet_process_one "$box" "$DUET_NEXT_MESSAGE"; then
       return 1
     fi
-    seen="$seen$name|"
   done < <(awk -F '\t' 'NR > 1 { print $1 "\t" $2 }' "$DUET_DIR/roster.tsv")
-
-  box="$DUET_DIR/inbox/leader"
-  if [ -d "$box" ] && duet_queue_next "$box"; then
-    duet_queue_target leader || {
-      duet_mark_unhealthy "legacy leader queue cannot resolve a recipient"
-      return 1
-    }
-    target="$DUET_QUEUE_TARGET"
-    case "$seen" in
-      *"|$target|"*) : ;;
-      *)
-        duet_process_one "$box" "$DUET_NEXT_MESSAGE" || return 1
-        ;;
-    esac
-  fi
 }
 
 duet_deliverd_cleanup(){

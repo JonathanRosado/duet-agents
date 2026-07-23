@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start an n-agent duet ensemble from the initiating Claude tmux pane.
+# Start an n-agent duet ensemble from the invoking harness's tmux pane.
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,7 +8,7 @@ PLUGIN_DIR="$(cd "$SELF_DIR/.." && pwd)"
 . "$SELF_DIR/duet-common.sh"
 
 usage(){
-  echo "usage: duet-init.sh [codex|kimi|claude ...]  (1-4 workers; default: codex)" >&2
+  echo "usage: duet-init.sh [--initiator claude|codex|kimi] [--initiator-name <name>] [codex|kimi|claude ...]  (1-4 peers; default: codex)" >&2
 }
 
 load_adapter(){
@@ -34,15 +34,60 @@ load_adapter(){
 }
 command -v tmux >/dev/null 2>&1 || { echo "duet: tmux not found on PATH" >&2; exit 3; }
 
-[ "$#" -gt 0 ] || set -- codex
-[ "$#" -ge 1 ] && [ "$#" -le 4 ] || { usage; exit 2; }
-
 WORKDIR="$(pwd -P)"
-INITIATOR_NAME=claude
 INITIATOR_PANE="${TMUX_PANE:?duet: initiating pane has no TMUX_PANE}"
 DUET_TMUX_SOCKET="$(tmux display-message -p -t "$INITIATOR_PANE" '#{socket_path}')"
 WINDOW_ID="$(_duet_tmux display-message -p -t "$INITIATOR_PANE" '#{window_id}')"
 DUET_TMUX_SERVER_PID="$(_duet_tmux display-message -p '#{pid}')"
+
+initiator_harness="${DUET_INITIATOR_HARNESS:-}"
+initiator_name_arg="${DUET_INITIATOR_NAME:-}"
+workers=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --initiator)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      initiator_harness="$2"
+      shift 2
+      ;;
+    --initiator-name)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      initiator_name_arg="$2"
+      shift 2
+      ;;
+    --) shift; workers+=("$@"); break ;;
+    -*) usage; echo "duet: unknown option '$1'" >&2; exit 2 ;;
+    *) workers+=("$1"); shift ;;
+  esac
+done
+
+if [ -z "$initiator_harness" ]; then
+  pane_command="$(_duet_tmux display-message -p -t "$INITIATOR_PANE" \
+    '#{pane_current_command}' 2>/dev/null || true)"
+  case "$pane_command" in
+    claude|codex|kimi) initiator_harness="$pane_command" ;;
+    *)
+      echo "duet: could not infer the invoking harness; pass --initiator claude, codex, or kimi." >&2
+      exit 2
+      ;;
+  esac
+fi
+case "$initiator_harness" in
+  claude|codex|kimi) : ;;
+  *) usage; echo "duet: unsupported initiator harness '$initiator_harness'" >&2; exit 2 ;;
+esac
+INITIATOR_NAME="${initiator_name_arg:-$initiator_harness}"
+case "$INITIATOR_NAME" in
+  ''|*[!A-Za-z0-9_-]*)
+    echo "duet: initiator name must contain only letters, digits, '_' or '-'." >&2
+    exit 2
+    ;;
+esac
+
+[ "${#workers[@]}" -gt 0 ] || workers=(codex)
+[ "${#workers[@]}" -ge 1 ] && [ "${#workers[@]}" -le 4 ] \
+  || { usage; exit 2; }
+
 if [ -z "${DUET_STATE_ROOT:-}" ]; then
   [ -n "${HOME:-}" ] || {
     echo "duet: set DUET_STATE_ROOT or HOME before starting a session." >&2
@@ -51,7 +96,6 @@ if [ -z "${DUET_STATE_ROOT:-}" ]; then
   DUET_STATE_ROOT="$HOME/.duet"
 fi
 
-workers=("$@")
 worker_names=()
 worker_panes=()
 worker_pids=()
@@ -63,11 +107,34 @@ kimi_count=0
 claude_count=0
 
 # Validate and name the entire requested roster before disturbing an old session.
+load_adapter "$initiator_harness"
+duet_harness_check
 for harness in "${workers[@]}"; do
   case "$harness" in
-    codex) codex_count=$((codex_count + 1)); worker_names+=("codex-$codex_count") ;;
-    kimi) kimi_count=$((kimi_count + 1)); worker_names+=("kimi-$kimi_count") ;;
-    claude) claude_count=$((claude_count + 1)); worker_names+=("claude-$claude_count") ;;
+    codex)
+      while :; do
+        codex_count=$((codex_count + 1))
+        candidate="codex-$codex_count"
+        [ "$candidate" != "$INITIATOR_NAME" ] && break
+      done
+      worker_names+=("$candidate")
+      ;;
+    kimi)
+      while :; do
+        kimi_count=$((kimi_count + 1))
+        candidate="kimi-$kimi_count"
+        [ "$candidate" != "$INITIATOR_NAME" ] && break
+      done
+      worker_names+=("$candidate")
+      ;;
+    claude)
+      while :; do
+        claude_count=$((claude_count + 1))
+        candidate="claude-$claude_count"
+        [ "$candidate" != "$INITIATOR_NAME" ] && break
+      done
+      worker_names+=("$candidate")
+      ;;
     *) usage; echo "duet: unsupported harness '$harness'" >&2; exit 2 ;;
   esac
   load_adapter "$harness"
@@ -265,7 +332,7 @@ trap 'exit 130' INT TERM
 
 mkdir -p "$DUET_DIR/ready"
 : > "$DUET_DIR/transcript.md"
-printf '# Duet assignments\n\nGeneration 0 leader: claude\n' > "$DUET_DIR/assignments.md"
+printf '# Duet assignments\n' > "$DUET_DIR/assignments.md"
 printf 'ok\n' > "$DUET_DIR/ready/$INITIATOR_NAME"
 
 for name in "${worker_names[@]}"; do
@@ -277,24 +344,7 @@ done
 mkdir -p "$DUET_DIR/inbox/$INITIATOR_NAME/delivered" \
          "$DUET_DIR/inbox/$INITIATOR_NAME/failed" \
          "$DUET_DIR/inbox/$INITIATOR_NAME/quarantine" \
-         "$DUET_DIR/inbox/$INITIATOR_NAME/superseded" \
-         "$DUET_DIR/inbox/leader/delivered" \
-         "$DUET_DIR/inbox/leader/failed" \
-         "$DUET_DIR/inbox/leader/quarantine" \
-         "$DUET_DIR/inbox/leader/superseded" \
-         "$DUET_DIR/inbox/promotions/delivered" \
-         "$DUET_DIR/inbox/promotions/failed" \
-         "$DUET_DIR/inbox/promotions/quarantine" \
-         "$DUET_DIR/inbox/promotions/superseded"
-
-# Leadership state is human-readable but never sourced as shell code.
-leader_tmp="$(mktemp "$DUET_DIR/.leader.XXXXXX")"
-printf 'term\t0\nleader\t%s\n' "$INITIATOR_NAME" > "$leader_tmp"
-if ! duet_publish_temp_file "$leader_tmp" "$DUET_DIR/leader"; then
-  rm -f "$leader_tmp" 2>/dev/null || true
-  echo "duet: could not publish initial leadership state." >&2
-  exit 7
-fi
+         "$DUET_DIR/inbox/$INITIATOR_NAME/superseded"
 
 render_brief(){
   local line
@@ -351,7 +401,7 @@ initiator_pid="$(_duet_tmux display-message -p -t "$INITIATOR_PANE" '#{pane_pid}
 roster_tmp="$(mktemp "$DUET_DIR/.roster.XXXXXX")"
 printf 'name\tharness\tpane_id\tpane_pid\trank\tspawned\n' > "$roster_tmp"
 printf '%s\t%s\t%s\t%s\t0\t0\n' \
-  "$INITIATOR_NAME" claude "$INITIATOR_PANE" "$initiator_pid" >> "$roster_tmp"
+  "$INITIATOR_NAME" "$initiator_harness" "$INITIATOR_PANE" "$initiator_pid" >> "$roster_tmp"
 for i in "${!workers[@]}"; do
   printf '%s\t%s\t%s\t%s\t%s\t1\n' \
     "${worker_names[$i]}" "${workers[$i]}" "${worker_panes[$i]}" \
@@ -446,8 +496,8 @@ for i in "${!workers[@]}"; do
   boot_states[$i]="$boot_state"
 
   printf -v ready_path_q '%q' "$DUET_DIR/ready/$name"
-  printf -v kick '[DUET boot]\nYou are %s (harness: %s). Read %s and %s/leader. Confirm readiness now by running exactly this shell command: printf '\''ok\\n'\'' > %s . Then wait for a task from the leader.' \
-    "$name" "$harness" "$DUET_HARNESS_BRIEF_FILE" "$DUET_DIR" "$ready_path_q"
+  printf -v kick '[DUET boot]\nYou are %s (harness: %s). Read %s. Confirm readiness now by running exactly this shell command: printf '\''ok\\n'\'' > %s . Then wait for a task from a peer.' \
+    "$name" "$harness" "$DUET_HARNESS_BRIEF_FILE" "$ready_path_q"
   kick_state=failed
   if kick_output="$(printf '%s' "$kick" \
       | DUET_CONFIG="$DUET_DIR/duet.env" DUET_SESSION="$DUET_SESSION" \
@@ -489,4 +539,4 @@ if [ "$failed" -ne 0 ]; then
   echo "duet: one or more workers did not confirm readiness; session left running for diagnosis." >&2
   exit 5
 fi
-echo "duet: all workers READY; leader=$INITIATOR_NAME generation=0"
+echo "duet: all peers READY; initiator=$INITIATOR_NAME harness=$initiator_harness"
