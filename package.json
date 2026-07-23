@@ -1,0 +1,27 @@
+{
+  "name": "duet-agents",
+  "version": "0.5.0",
+  "description": "Run Claude Code, Codex CLI, and Kimi CLI as a visible mesh of coding agents in tmux — any agent messages any agent, no leader (macOS/Linux; Windows runs the previous leader-hub protocol).",
+  "license": "MIT",
+  "author": {
+    "name": "Jonathan Rosado",
+    "url": "https://github.com/JonathanRosado"
+  },
+  "homepage": "https://github.com/JonathanRosado/duet-agents",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JonathanRosado/duet-agents.git"
+  },
+  "keywords": ["claude", "codex", "kimi", "tmux", "psmux", "powershell", "windows", "multi-agent", "ensemble", "orchestration", "duet"],
+  "bin": {
+    "duet-agents": "bin/duet-agents.js"
+  },
+  "files": [
+    "bin",
+    "plugins",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=16.7.0"
+  }
+}

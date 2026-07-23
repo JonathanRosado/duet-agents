@@ -1,7 +1,7 @@
 # Duet ensemble protocol
 
 You are one named agent in a live psmux ensemble. Workers receive their roster
-name in the boot message and `$env:DUET_SELF`; the initiating agent is `claude`.
+name in the boot message and `$env:DUET_SELF`; the initiating agent is `@INITIATOR@`.
 Use the full instance name (for example `codex-1`), because several agents may
 use the same harness.
 

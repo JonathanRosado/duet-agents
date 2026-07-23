@@ -1,6 +1,6 @@
 {
   "name": "duet",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Run Claude, Codex, and Kimi as a visible tmux mesh of coding agents with reliable queued delivery — any agent messages any agent, no leader. macOS/Linux; Windows parity next.",
   "author": {
     "name": "Jonathan Rosado",

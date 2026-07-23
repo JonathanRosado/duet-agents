@@ -4,13 +4,15 @@ set -euo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASH_BIN="${BASH:-bash}"
-SUITES='m1-delivery
+SUITES='installer
+m1-delivery
 m2-mesh
 m3-lifecycle
 v4-real-smoke'
 
 suite_file(){
   case "$1" in
+    installer) printf '%s/installer.tests.sh' "$TEST_DIR" ;;
     m1-delivery) printf '%s/m1-delivery.tests.sh' "$TEST_DIR" ;;
     m2-mesh) printf '%s/m2-mesh.tests.sh' "$TEST_DIR" ;;
     m3-lifecycle) printf '%s/m3-lifecycle.tests.sh' "$TEST_DIR" ;;

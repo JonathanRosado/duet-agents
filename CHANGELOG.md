@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 - 2026-07-23
+
+- Added the `npx duet-agents` installer (`install` / `update` / `uninstall`) so
+  Codex CLI and Kimi CLI are first-class install targets and session initiators
+  alongside Claude Code, on macOS/Linux and Windows.
+- Claude Code keeps its native marketplace path (the installer drives
+  `claude plugin marketplace add/install/update` for you). Codex reads the
+  skill `~/.agents/skills/duet` (`$duet` / `/skills`); Kimi reads
+  `$KIMI_CODE_HOME/skills/duet` (`/skill:duet`). Both share a versioned,
+  immutable runtime under `~/.duet/plugin/<version>` — the installer never
+  modifies or deletes a runtime, so live sessions stay pinned by construction.
+- The installer validates every canonicalized destination (symlink aliases
+  cannot bypass the no-overlap and source-tree rules, and paths with
+  shell-significant characters are rejected before rendering), writes ownership
+  markers, verifies a runtime's payload before reusing it, and never adopts,
+  overwrites, or deletes a pre-existing foreign directory.
+- The session briefs (Bash and PowerShell) no longer assume the initiator is
+  `claude`; they render the actual initiator roster name, and `duet-init.ps1`
+  gained the same explicit/inferred initiator-harness support as the Bash path.
+- Added an installer gate to the Bash test suite.
+
 ## 0.4.0 - 2026-07-23
 
 - Replaced the Bash leader hub with a leaderless, any-to-any mesh and removed

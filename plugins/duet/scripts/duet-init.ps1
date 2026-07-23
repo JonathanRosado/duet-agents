@@ -1,6 +1,8 @@
-# Start a two-to-five agent ensemble in the initiating Claude psmux window.
+# Start a two-to-five agent ensemble from a supported harness's psmux pane.
 [CmdletBinding()]
 param(
+  [string]$Initiator,
+  [string]$InitiatorName,
   [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
   [string[]]$Harnesses,
   [int]$ReadyTimeoutSeconds = 75
@@ -122,38 +124,19 @@ function Find-DuetPreIndexPredecessor {
 }
 
 if (-not $env:TMUX -or -not $env:TMUX_PANE) {
-  Write-DuetError 'duet: not inside psmux. Start Claude with: psmux new-session -s duet -- claude'
+  Write-DuetError 'duet: not inside psmux. Start claude, codex, or kimi inside psmux first.'
   exit 3
 }
 
 $Harnesses = @($Harnesses | Where-Object { $_ })
 if ($Harnesses.Count -eq 0) { $Harnesses = @('codex') }
 if ($Harnesses.Count -lt 1 -or $Harnesses.Count -gt 4) {
-  Write-DuetError 'usage: duet-init.ps1 [codex|kimi|claude ...] (1-4 workers; default: codex)'
+  Write-DuetError 'usage: duet-init.ps1 [-Initiator claude|codex|kimi] [-InitiatorName <name>] [codex|kimi|claude ...] (1-4 workers; default: codex)'
   exit 2
 }
 
 $PluginDir = Get-DuetCanonicalPath (Join-Path $SelfDir '..')
 if (-not $PluginDir) { Write-DuetError 'duet: plugin directory is unavailable.'; exit 7 }
-
-# Validate the full requested roster before touching any session state or pane.
-$counts = @{ codex = 0; kimi = 0; claude = 0 }
-$specs = @()
-foreach ($harness in $Harnesses) {
-  if (-not $counts.ContainsKey($harness)) {
-    Write-DuetError "duet: unsupported harness '$harness'"
-    exit 2
-  }
-  $adapter = Get-DuetHarnessAdapter -Harness $harness -PluginDir $PluginDir
-  if (-not $adapter) { Write-DuetError "duet: harness adapter '$harness.ps1' is invalid."; exit 2 }
-  if (-not (Invoke-DuetAdapterBoolean -Block $adapter['Check'])) { exit 3 }
-  $counts[$harness]++
-  $specs += [pscustomobject]@{
-    Harness = $harness
-    Name = ('{0}-{1}' -f $harness, $counts[$harness])
-    Adapter = $adapter
-  }
-}
 
 if (-not (Get-DuetCallerIdentity)) {
   Write-DuetError 'duet: could not prove the initiating psmux pane identity.'
@@ -164,7 +147,6 @@ if ($global:DUET_CALLER_PANE -ne $env:TMUX_PANE) {
   exit 3
 }
 
-$InitiatorName = 'claude'
 $InitiatorPane = $global:DUET_CALLER_PANE
 $InitiatorPanePid = $global:DUET_CALLER_PANE_PID
 $PsmuxSession = $global:DUET_CALLER_SESSION
@@ -180,6 +162,89 @@ $global:DUET_PSMUX_SERVER_PID = $PsmuxServerPid
 $global:DUET_PSMUX_NAMESPACE = $PsmuxNamespace
 $global:DUET_PSMUX_REGISTRY = $PsmuxRegistry
 if (-not (Test-DuetServerMatches)) { Write-DuetError 'duet: initiating psmux backend identity is unstable.'; exit 3 }
+
+$requestedInitiator = if ($PSBoundParameters.ContainsKey('Initiator')) {
+  $Initiator
+}
+elseif ($env:DUET_INITIATOR_HARNESS) {
+  $env:DUET_INITIATOR_HARNESS
+}
+else {
+  ''
+}
+
+if ($requestedInitiator) {
+  $InitiatorHarness = ([string]$requestedInitiator).ToLowerInvariant()
+}
+else {
+  $paneCommandOut = @(Invoke-DuetPsmux display-message -p -t "${PsmuxSession}:${InitiatorPane}" '#{pane_current_command}')
+  if ($global:DUET_PSMUX_RC -ne 0 -or $paneCommandOut.Count -ne 1) {
+    Write-DuetError 'duet: could not infer the invoking harness from the initiating pane; pass -Initiator claude, codex, or kimi.'
+    exit 2
+  }
+  $paneCommand = ([string]$paneCommandOut[0]).Trim()
+  $paneCommandName = [IO.Path]::GetFileNameWithoutExtension($paneCommand)
+  $InitiatorHarness = if ($paneCommandName) { $paneCommandName.ToLowerInvariant() } else { '' }
+  if (@('claude', 'codex', 'kimi') -notcontains $InitiatorHarness) {
+    Write-DuetError "duet: could not infer the invoking harness from pane command '$paneCommand'; pass -Initiator claude, codex, or kimi."
+    exit 2
+  }
+}
+if (@('claude', 'codex', 'kimi') -notcontains $InitiatorHarness) {
+  Write-DuetError "duet: unsupported initiator harness '$requestedInitiator'; expected claude, codex, or kimi."
+  exit 2
+}
+
+$requestedInitiatorName = if ($PSBoundParameters.ContainsKey('InitiatorName')) {
+  $InitiatorName
+}
+elseif ($env:DUET_INITIATOR_NAME) {
+  $env:DUET_INITIATOR_NAME
+}
+else {
+  ''
+}
+if (-not $requestedInitiatorName) { $requestedInitiatorName = $InitiatorHarness }
+if ($requestedInitiatorName -notmatch '^[A-Za-z0-9_-]+$') {
+  Write-DuetError 'duet: initiator name must contain only letters, digits, underscore, or hyphen.'
+  exit 2
+}
+if (@('leader', 'promotions', 'all', 'duet-system') -contains $requestedInitiatorName) {
+  Write-DuetError "duet: initiator name '$requestedInitiatorName' is reserved by the Windows protocol."
+  exit 2
+}
+$InitiatorName = [string]$requestedInitiatorName
+
+$initiatorAdapter = Get-DuetHarnessAdapter -Harness $InitiatorHarness -PluginDir $PluginDir
+if (-not $initiatorAdapter) {
+  Write-DuetError "duet: initiator harness adapter '$InitiatorHarness.ps1' is invalid."
+  exit 2
+}
+if (-not (Invoke-DuetAdapterBoolean -Block $initiatorAdapter['Check'])) { exit 3 }
+
+# Validate and name the full requested roster before touching session state or
+# splitting a pane. Skip a generated worker name if it matches a custom initiator.
+$counts = @{ codex = 0; kimi = 0; claude = 0 }
+$specs = @()
+foreach ($requestedHarness in $Harnesses) {
+  $harness = ([string]$requestedHarness).ToLowerInvariant()
+  if (-not $counts.ContainsKey($harness)) {
+    Write-DuetError "duet: unsupported harness '$requestedHarness'"
+    exit 2
+  }
+  $adapter = Get-DuetHarnessAdapter -Harness $harness -PluginDir $PluginDir
+  if (-not $adapter) { Write-DuetError "duet: harness adapter '$harness.ps1' is invalid."; exit 2 }
+  if (-not (Invoke-DuetAdapterBoolean -Block $adapter['Check'])) { exit 3 }
+  do {
+    $counts[$harness]++
+    $workerName = ('{0}-{1}' -f $harness, $counts[$harness])
+  } while ($workerName -eq $InitiatorName)
+  $specs += [pscustomobject]@{
+    Harness = $harness
+    Name = $workerName
+    Adapter = $adapter
+  }
+}
 
 $Workdir = Get-DuetCanonicalPath (Get-Location).Path
 if (-not $Workdir -or $Workdir -match "[\t\r\n]") { Write-DuetError 'duet: current workdir is unavailable or contains a control character.'; exit 7 }
@@ -261,7 +326,7 @@ try {
     }
   }
   Write-DuetUtf8NoBom -Path (Join-Path $DuetDir 'transcript.md') -Value ''
-  Write-DuetUtf8NoBom -Path (Join-Path $DuetDir 'assignments.md') -Value "# Duet assignments`n`nGeneration 0 leader: claude`n"
+  Write-DuetUtf8NoBom -Path (Join-Path $DuetDir 'assignments.md') -Value "# Duet assignments`n`nGeneration 0 leader: $InitiatorName`n"
   if (-not (Write-DuetAtomicMultiline -Path (Join-Path $DuetDir "ready\$InitiatorName") -Value 'ok') -or
       -not (Write-DuetLeaderState -DuetDir $DuetDir -Term '0' -Leader $InitiatorName)) {
     Stop-DuetInit 'duet: could not publish initial session state.'
@@ -270,7 +335,7 @@ try {
   $briefPath = Join-Path $PluginDir 'briefs\ENSEMBLE_BRIEF.win.md'
   $brief = Get-DuetFileText $briefPath
   if ($null -eq $brief) { Stop-DuetInit 'duet: Windows ensemble brief is missing.' }
-  $rendered = $brief.Replace('@DUET_DIR@', $DuetDir).Replace('@PLUGIN@', $PluginDir).Replace('@DUET_SESSION@', $SessionId)
+  $rendered = $brief.Replace('@DUET_DIR@', $DuetDir).Replace('@PLUGIN@', $PluginDir).Replace('@DUET_SESSION@', $SessionId).Replace('@INITIATOR@', $InitiatorName)
   if (-not (Add-DuetRenderedAnchor -Path (Join-Path $Workdir 'AGENTS.md') -Rendered $rendered) -or
       -not (Add-DuetRenderedAnchor -Path (Join-Path $Workdir 'CLAUDE.md') -Rendered $rendered)) {
     Stop-DuetInit 'duet: could not publish durable instruction anchors.'
@@ -312,7 +377,7 @@ try {
   if ($workers.Count -gt 1) { Invoke-DuetPsmux select-layout -t $PsmuxSession tiled | Out-Null }
 
   $rosterLines = @('name' + "`t" + 'harness' + "`t" + 'pane_id' + "`t" + 'pane_pid' + "`t" + 'rank' + "`t" + 'spawned')
-  $rosterLines += ($InitiatorName, 'claude', $InitiatorPane, $InitiatorPanePid, '0', '0') -join "`t"
+  $rosterLines += ($InitiatorName, $InitiatorHarness, $InitiatorPane, $InitiatorPanePid, '0', '0') -join "`t"
   foreach ($worker in $workers) { $rosterLines += ($worker.Name, $worker.Harness, $worker.PaneId, $worker.PanePid, [string]$worker.Rank, '1') -join "`t" }
   if (-not (Write-DuetAtomicMultiline -Path (Join-Path $DuetDir 'roster.tsv') -Value ($rosterLines -join "`n"))) { Stop-DuetInit 'duet: could not publish the roster.' }
   $null = @(Import-DuetRoster (Join-Path $DuetDir 'roster.tsv'))

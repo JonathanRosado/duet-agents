@@ -202,6 +202,7 @@ render_brief(){
     line="${line//@DUET_DIR@/$DUET_DIR}"
     line="${line//@PLUGIN@/$PLUGIN_DIR}"
     line="${line//@DUET_SESSION@/$DUET_SESSION}"
+    line="${line//@INITIATOR@/$INITIATOR_NAME}"
     printf '%s\n' "$line"
   done < "$PLUGIN_DIR/briefs/ENSEMBLE_BRIEF.md"
 }

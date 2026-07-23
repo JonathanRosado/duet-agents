@@ -5,13 +5,17 @@ agents in tmux. Every agent can message every other agent directly — to divide
 work, debate an approach, or cross-check one another. There is **no leader and
 no election**; the agent the task was given to coordinates by convention.
 
-This repository is a Claude Code plugin marketplace. Installing the `duet`
-plugin adds `/duet:duet`, which creates the panes, a durable brief, per-recipient
-message queues, and one delivery daemon.
+This repository ships an npm installer (`npx duet-agents`) that sets the mesh
+up for **Claude Code, Codex CLI, and Kimi CLI** alike — any of the three can
+install it, update it, and initiate a session. It is also still a Claude Code
+plugin marketplace for users who prefer native Claude plugin management.
+Installing adds a `duet` command to each selected CLI, which creates the panes,
+a durable brief, per-recipient message queues, and one delivery daemon.
 
-> **Platform status (0.4.0):** the v4 mesh ships on **macOS/Linux (Bash + tmux)**.
+> **Platform status (0.5.0):** the v4 mesh ships on **macOS/Linux (Bash + tmux)**.
 > Windows/PowerShell (psmux) parity is the next release — the bundled `.ps1`
-> scripts still run the previous leader-hub protocol.
+> scripts still run the previous leader-hub protocol, so "no leader" applies to
+> the Bash path only.
 
 ```text
       ┌──────── one delivery daemon (per session) ────────┐
@@ -63,19 +67,56 @@ The transcript is a human-readable activity log, not proof of delivery.
 
 ## Requirements
 
-- macOS or Linux with [`tmux`](https://github.com/tmux/tmux). (Windows/psmux v4
-  support is the next release.)
-- [Claude Code](https://claude.com/claude-code) (`claude` on `PATH`)
-- Each selected worker CLI on `PATH` and already authenticated:
-  [Codex CLI](https://github.com/openai/codex) (`codex`),
-  [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) (`kimi`), or another
-  `claude` process
+- macOS or Linux with [`tmux`](https://github.com/tmux/tmux) for the v4 mesh —
+  or Windows with [psmux](https://github.com/psmux/psmux) and PowerShell, which
+  currently runs the previous leader-hub protocol (v4 parity is the next
+  release).
+- [Node.js](https://nodejs.org) ≥ 16.7 for the `npx duet-agents` installer.
+- At least one of the supported CLIs on `PATH` and already authenticated —
+  [Claude Code](https://claude.com/claude-code) (`claude`),
+  [Codex CLI](https://github.com/openai/codex) (`codex`), or
+  [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) (`kimi`). Any of them can
+  initiate a session; each additionally selected worker CLI must also be on
+  `PATH` and authenticated.
 
 A session has one initiator plus one to four workers — a hard cap of five
-agents. Through `/duet:duet` the initiator is the Claude that runs it; the Bash
-runtime itself can be initiated by any supported harness.
+agents. The initiator is whichever CLI you run the duet command in: Claude,
+Codex, and Kimi are all first-class initiators.
 
 ## Install
+
+One command installs duet for every detected harness (or pick a subset with
+`--claude`, `--codex`, `--kimi`):
+
+```bash
+npx duet-agents@latest install
+```
+
+Straight from GitHub, without waiting for an npm publish:
+
+```bash
+npx github:JonathanRosado/duet-agents install
+```
+
+What each harness gets:
+
+- **Claude Code** — the `duet` plugin from this repository's marketplace
+  (the installer runs `claude plugin marketplace add` + `claude plugin
+  install` for you), giving `/duet:duet`.
+- **Codex CLI** — the skill `~/.agents/skills/duet`, giving `$duet` (or
+  `/skills → duet`).
+- **Kimi CLI** — the skill `$KIMI_CODE_HOME/skills/duet` (default
+  `~/.kimi-code/skills/duet`), giving `/skill:duet`.
+
+Codex and Kimi share one **versioned, immutable** runtime under
+`~/.duet/plugin/<version>` — the rendered skills point at it, and every duet
+session pins its absolute path at launch. The installer canonicalizes every
+destination (symlink aliases cannot bypass validation), refuses to adopt any
+directory it did not create, and only ever deletes installed directories
+carrying its own ownership marker.
+
+**Claude-only alternative.** If you only use Claude Code, the plain plugin
+commands still work exactly as before:
 
 ```bash
 claude plugin marketplace add JonathanRosado/duet-agents
@@ -85,39 +126,64 @@ claude plugin install duet@duet-agents
 Or `/plugin marketplace add JonathanRosado/duet-agents` then
 `/plugin install duet@duet-agents` from inside Claude Code.
 
+Restart each CLI after installing so it picks up the new plugin/skill.
+
 ## Updating
 
-Move an existing install to the latest release, then **restart Claude Code** to
+Move an existing install to the latest release, then **restart each CLI** to
 apply it:
 
 ```bash
-claude plugin update duet@duet-agents
+npx duet-agents@latest update
 ```
 
-If the marketplace source needs an explicit refresh first, run
-`claude plugin marketplace update duet-agents`. A running duet session is
-version-pinned — its script paths are baked into `duet.env` at launch, so an
-update never hot-upgrades a live session; it applies to the next `/duet:duet`
-after the restart.
+For Claude Code this runs `claude plugin update duet@duet-agents` (after a
+best-effort `claude plugin marketplace update duet-agents`). For Codex and Kimi
+it installs a new `~/.duet/plugin/<version>` directory and repoints only the
+installed skills. Runtime directories are **immutable**: a running duet session
+pins its version's absolute path in `duet.env` at launch, and the installer
+never modifies or deletes a runtime — so an update can never hot-upgrade or
+break a live session; it applies to the next session you start after the
+restart.
+
+To remove duet from the selected harnesses, per-harness:
+
+```bash
+npx duet-agents@latest uninstall [--claude] [--codex] [--kimi]
+```
+
+Uninstall removes each selected harness's skill and the Claude plugin. Runtime
+copies under `~/.duet/plugin` are deliberately left in place — they are small
+and a live session may still pin one; delete that directory yourself when no
+sessions are running. Uninstall never touches session state under `~/.duet` or
+directories it did not install, and it exits nonzero if any selected piece
+could not be removed.
 
 ## Use
 
-Start Claude inside tmux, then choose the worker roster:
+Start any installed CLI inside tmux — the one you start becomes the initiator —
+then choose the worker roster:
 
 ```bash
-tmux new-session claude
+tmux new-session claude   # then: /duet:duet
+tmux new-session codex    # then: $duet   (or pick duet from /skills)
+tmux new-session kimi     # then: /skill:duet
 ```
 
 ```text
-/duet:duet
-/duet:duet codex kimi
-/duet:duet codex codex kimi
-/duet:duet codex kimi claude
+/duet:duet codex kimi       # Claude Code
+$duet codex kimi            # Codex CLI
+/skill:duet codex kimi      # Kimi CLI
 ```
 
-With no arguments, the two-agent Claude + Codex default remains. Workers get
-instance names (`codex-1`, `kimi-1`, `claude-1`); the bare name `claude` is the
-initiator. Repeating a harness launches multiple instances.
+Roster arguments work the same in every CLI: no arguments means one Codex
+worker, and repeating a harness word launches multiple instances
+(`codex codex kimi` = four agents total).
+
+With no arguments, the initiator + one Codex worker default remains. Workers
+get instance names (`codex-1`, `kimi-1`, `claude-1`); the initiator keeps its
+harness's bare name (`claude`, `codex`, or `kimi`). Repeating a harness
+launches multiple instances.
 
 Any agent addresses any other by exact roster name, or `all` to broadcast to
 every other live, **deliverable** member (itself, and any dead or blocked peer,
@@ -140,13 +206,18 @@ injected at launch.
 
 ```bash
 DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
-  bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-send.sh" codex-1 <<'DUET_EOF'
+  bash "$DUET_PLUGIN/scripts/duet-send.sh" codex-1 <<'DUET_EOF'
 ...message...
 DUET_EOF
 
-bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-status.sh" \
+bash "$DUET_PLUGIN/scripts/duet-status.sh" \
   --session "/absolute/path/to/.duet/<session>/duet.env"
 ```
+
+Here `$DUET_PLUGIN` is wherever duet is installed: `$CLAUDE_PLUGIN_ROOT` for a
+Claude Code plugin install, or `~/.duet/plugin/<version>` for an `npx
+duet-agents` install. (Agents never have to care — the session brief and
+`duet.env` always carry the absolute path that launched them.)
 
 Duet cross-checks the sender's tmux pane, `DUET_SELF` (when the pane has it),
 roster membership, and session ID, and refuses cross-session sends. **Multiple
@@ -157,8 +228,8 @@ before init to place session state somewhere other than the default `$HOME/.duet
 ## Model and permission overrides
 
 Built-in adapters use each worker CLI's configured default model unless its
-override is set before `/duet:duet` starts. These do not change the already-
-running initiating Claude:
+override is set before the session starts. These do not change the already-
+running initiating agent:
 
 | Harness | Environment variable | Launch argument |
 | --- | --- | --- |
@@ -198,8 +269,8 @@ Register the harness name and instance counter in init.
 Diagnostics take an explicit `--session`:
 
 ```bash
-bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-status.sh" --session "/absolute/path/to/.duet/<session>/duet.env"
-bash "$CLAUDE_PLUGIN_ROOT/scripts/duet-doctor.sh"  --session "/absolute/path/to/.duet/<session>/duet.env"
+bash "$DUET_PLUGIN/scripts/duet-status.sh" --session "/absolute/path/to/.duet/<session>/duet.env"
+bash "$DUET_PLUGIN/scripts/duet-doctor.sh"  --session "/absolute/path/to/.duet/<session>/duet.env"
 ```
 
 Status shows the pinned session id, daemon liveness, each roster pane / harness /
@@ -224,6 +295,8 @@ readiness, per-recipient queue depth, and any **dead** or **blocked** recipients
 ## Repository layout
 
 ```text
+package.json                          # npm manifest for the npx installer
+bin/duet-agents.js                    # cross-platform install/update/uninstall entrypoint
 .claude-plugin/marketplace.json
 plugins/duet/
 ├── .claude-plugin/plugin.json
@@ -231,7 +304,10 @@ plugins/duet/
 │   ├── ENSEMBLE_BRIEF.md             # v4 mesh brief (Bash path)
 │   └── ENSEMBLE_BRIEF.win.md         # previous protocol; pending Windows parity
 ├── harnesses/{claude,codex,kimi}.sh  # + matching .ps1 (previous protocol; pending parity)
-├── skills/duet/SKILL.md
+├── skills/duet/SKILL.md              # Claude Code plugin skill (/duet:duet)
+├── templates/
+│   ├── agents-skill.posix.md         # rendered for Codex (~/.agents/skills/duet) and Kimi ($KIMI_CODE_HOME/skills/duet)
+│   └── agents-skill.win.md           # Windows variant (.ps1, previous protocol)
 ├── scripts/
 │   ├── duet-common.sh                # shared library + harness-aware verified send
 │   ├── duet-init.sh                  # roster, brief render, launch, daemon
@@ -241,7 +317,7 @@ plugins/duet/
 │   ├── duet-status.sh
 │   └── duet-doctor.sh                # (matching *.ps1 remain on the previous protocol)
 └── tests/
-    └── run-bash-tests.sh             # m1-delivery · m2-mesh · m3-lifecycle · v4-real-smoke
+    └── run-bash-tests.sh             # installer · m1-delivery · m2-mesh · m3-lifecycle · v4-real-smoke
 ```
 
 ## Safety notes

@@ -1,7 +1,7 @@
 # Duet mesh
 
 You are one named agent in a live tmux mesh of coding agents. If you started the
-session you are `claude`; a spawned worker's name is in its boot message and in
+session you are `@INITIATOR@`; a spawned worker's name is in its boot message and in
 `$DUET_SELF` (for example `codex-1`, `kimi-1`). Use the full name — several agents
 may share a harness. Your peers are listed in the roster `@DUET_DIR@/roster.tsv`
 (columns: name, harness, pane, pid, rank, spawned).
