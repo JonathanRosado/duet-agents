@@ -29,7 +29,7 @@ load_adapter(){
 }
 
 [ -n "${TMUX:-}" ] || {
-  echo "duet: not inside tmux. Start Claude with: tmux new-session claude" >&2
+  echo "duet: not inside tmux. Start a supported harness in tmux first." >&2
   exit 3
 }
 command -v tmux >/dev/null 2>&1 || { echo "duet: tmux not found on PATH" >&2; exit 3; }
