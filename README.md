@@ -5,12 +5,12 @@ agents in tmux. Every agent can message every other agent directly — to divide
 work, debate an approach, or cross-check one another. There is **no leader and
 no election**; the agent the task was given to coordinates by convention.
 
-This repository ships an npm installer (`npx duet-agents`) that sets the mesh
-up for **Claude Code, Codex CLI, and Kimi CLI** alike — any of the three can
-install it, update it, and initiate a session. It is also still a Claude Code
-plugin marketplace for users who prefer native Claude plugin management.
-Installing adds a `duet` command to each selected CLI, which creates the panes,
-a durable brief, per-recipient message queues, and one delivery daemon.
+This repository ships an npx installer (`npx
+github:JonathanRosado/duet-agents`) that sets the mesh up for **Claude Code,
+Codex CLI, and Kimi CLI** alike — any of the three can install it, update it,
+and initiate a session. Installing adds a `duet` command to each selected CLI,
+which creates the panes, a durable brief, per-recipient message queues, and one
+delivery daemon.
 
 > **Platform status (0.5.0):** the v4 mesh ships on **macOS/Linux (Bash + tmux)**.
 > Windows/PowerShell (psmux) parity is the next release — the bundled `.ps1`
@@ -88,8 +88,6 @@ Codex, and Kimi are all first-class initiators.
 One command installs duet for every detected harness (or pick a subset with
 `--claude`, `--codex`, `--kimi`):
 
-Straight from GitHub, without waiting for an npm publish:
-
 ```bash
 npx github:JonathanRosado/duet-agents install
 ```
@@ -111,17 +109,6 @@ destination (symlink aliases cannot bypass validation), refuses to adopt any
 directory it did not create, and only ever deletes installed directories
 carrying its own ownership marker.
 
-**Claude-only alternative.** If you only use Claude Code, the plain plugin
-commands still work exactly as before:
-
-```bash
-claude plugin marketplace add JonathanRosado/duet-agents
-claude plugin install duet@duet-agents
-```
-
-Or `/plugin marketplace add JonathanRosado/duet-agents` then
-`/plugin install duet@duet-agents` from inside Claude Code.
-
 Restart each CLI after installing so it picks up the new plugin/skill.
 
 ## Updating
@@ -130,7 +117,7 @@ Move an existing install to the latest release, then **restart each CLI** to
 apply it:
 
 ```bash
-npx duet-agents@latest update
+npx github:JonathanRosado/duet-agents update
 ```
 
 For Claude Code this runs `claude plugin update duet@duet-agents` (after a
@@ -145,7 +132,7 @@ restart.
 To remove duet from the selected harnesses, per-harness:
 
 ```bash
-npx duet-agents@latest uninstall [--claude] [--codex] [--kimi]
+npx github:JonathanRosado/duet-agents uninstall [--claude] [--codex] [--kimi]
 ```
 
 Uninstall removes each selected harness's skill and the Claude plugin. Runtime
