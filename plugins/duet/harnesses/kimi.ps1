@@ -16,8 +16,11 @@
     $bin = Resolve-DuetExecutable 'kimi'
     $sid = Split-Path -Leaf $DuetDir
     $mode = if ($env:DUET_KIMI_MODE_FLAG) { $env:DUET_KIMI_MODE_FLAG } else { '--auto' }
-    $cmd = ('Set-Location -LiteralPath {0}; $env:DUET_SELF={1}; $env:DUET_CONFIG={2}; $env:DUET_SESSION={3}; & {4} {5}' -f `
-      (ConvertTo-DuetPsLiteral $Workdir), (ConvertTo-DuetPsLiteral $Name),
+    $homeAssignment = if ($env:KIMI_CODE_HOME) {
+      '$env:KIMI_CODE_HOME=' + (ConvertTo-DuetPsLiteral $env:KIMI_CODE_HOME) + '; '
+    } else { '' }
+    $cmd = ('Set-Location -LiteralPath {0}; {1}$env:DUET_SELF={2}; $env:DUET_CONFIG={3}; $env:DUET_SESSION={4}; & {5} {6}' -f `
+      (ConvertTo-DuetPsLiteral $Workdir), $homeAssignment, (ConvertTo-DuetPsLiteral $Name),
       (ConvertTo-DuetPsLiteral (Join-Path $DuetDir 'duet.env')), (ConvertTo-DuetPsLiteral $sid),
       (ConvertTo-DuetPsLiteral $bin), (ConvertTo-DuetPsLiteral $mode))
     if ($env:DUET_KIMI_MODEL) { $cmd += ' -m ' + (ConvertTo-DuetPsLiteral $env:DUET_KIMI_MODEL) }

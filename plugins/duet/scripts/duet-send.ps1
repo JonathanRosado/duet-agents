@@ -1,94 +1,104 @@
-# Enqueue one duet message (injection is owned exclusively by duet-deliverd).
-# Native params; body on stdin:
-#   ... | duet-send.ps1 <recipient|leader|all> [-Interrupt] [-From <name>] [-Session <cfg>]
+# Enqueue one message in an explicitly pinned Windows/psmux v4 session.
+# Pane injection belongs exclusively to duet-deliverd.
 [CmdletBinding()]
 param(
   [Parameter(Position = 0, Mandatory = $true)][string]$Recipient,
   [switch]$Interrupt,
-  [string]$From,
-  [string]$Session
+  [string]$From
 )
+
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
 . (Join-Path (Split-Path -Parent $PSCommandPath) 'duet-common.ps1')
 
-$callerPin = $env:DUET_SESSION
 $callerSelf = $env:DUET_SELF
-$hadCaller = Get-DuetCallerIdentity
-$actualCallerSession = if ($hadCaller) { $global:DUET_CALLER_SESSION } else { '' }
-$actualCallerServerPid = if ($hadCaller) { $global:DUET_CALLER_SERVER_PID } else { '' }
-
-if (-not (Resolve-DuetConfig $Session 0)) { exit 1 }
+if (-not (Get-DuetCallerIdentity)) {
+  Write-DuetError 'duet: caller is not an identifiable psmux pane.'
+  exit 7
+}
+if (-not (Resolve-DuetConfig -SessionArg '' -RequireEnvironment 1)) { exit 1 }
 $cfgPath = $global:DUET_RESOLVED_CONFIG
 $cfg = Import-DuetConfig $cfgPath
-if (-not (Test-DuetLoadedSession -Config $cfg -ExpectedSession $callerPin -ConfigPath $cfgPath)) { exit 7 }
+if (-not $global:DUET_CONFIG_VALID -or
+    -not (Test-DuetLoadedSession -Config $cfg -ConfigPath $cfgPath)) { exit 7 }
 Set-DuetSessionVariables -Config $cfg
-$DuetDir = Get-DuetCanonicalPath $cfg['DUET_DIR']
-$Sid = $cfg['DUET_SESSION_ID']
+$DuetDir = $global:DUET_DIR
+$Sid = $global:DUET_SESSION_ID
 $RosterPath = Join-Path $DuetDir 'roster.tsv'
-if (Test-Path -LiteralPath (Join-Path $DuetDir '.ended')) { Write-DuetError "duet: session has ended; refusing to enqueue."; exit 1 }
-if (-not (Test-Path -LiteralPath $RosterPath)) { Write-DuetError "duet: session roster is missing."; exit 1 }
-$rosterRows = @(Import-DuetRoster $RosterPath)
-if (-not $global:DUET_ROSTER_VALID) { Write-DuetError "duet: session roster is invalid."; exit 1 }
-if (-not (Read-DuetLeaderState -DuetDir $DuetDir)) { exit 1 }
-if (-not (Test-DuetDaemonAlive -DuetDir $DuetDir -SessionId $Sid)) { Write-DuetError "duet: delivery daemon is not alive; message was not queued."; exit 6 }
 
-$paneName = ''
-if (Get-DuetCallerRosterName -RosterPath $RosterPath -ExpectedSession $cfg['DUET_PSMUX_SESSION'] -ExpectedServerPid $cfg['DUET_PSMUX_SERVER_PID']) { $paneName = $global:DUET_CALLER_NAME }
-if ($paneName -and $callerSelf -and $paneName -ne $callerSelf) { Write-DuetError "duet: identity mismatch: pane is '$paneName' but DUET_SELF is '$callerSelf'."; exit 7 }
-if (-not $paneName -and $hadCaller -and ($actualCallerSession -ne $cfg['DUET_PSMUX_SESSION'] -or $actualCallerServerPid -ne $cfg['DUET_PSMUX_SERVER_PID'])) {
-  Write-DuetError "duet: caller belongs to psmux session '$actualCallerSession', not pinned session '$Sid'."
+if (Test-Path -LiteralPath (Join-Path $DuetDir '.ended')) {
+  Write-DuetError 'duet: session has ended; refusing to enqueue.'
+  exit 1
+}
+$rosterRows = @(Import-DuetRoster $RosterPath)
+if (-not $global:DUET_ROSTER_VALID) {
+  Write-DuetError 'duet: session roster is invalid; refusing to enqueue.'
+  exit 1
+}
+if (-not (Test-DuetDaemonAlive -DuetDir $DuetDir -SessionId $Sid)) {
+  Write-DuetError 'duet: delivery daemon is not alive; message was not queued.'
+  exit 6
+}
+if (-not (Get-DuetCallerRosterName -RosterPath $RosterPath `
+    -ExpectedSession $cfg['DUET_PSMUX_SESSION'] `
+    -ExpectedServerPid $cfg['DUET_PSMUX_SERVER_PID'])) {
+  Write-DuetError "duet: caller pane is not exactly one member of session '$Sid'."
+  exit 7
+}
+$sender = $global:DUET_CALLER_NAME
+if ($callerSelf -and $callerSelf -ne $sender) {
+  Write-DuetError "duet: identity mismatch: caller pane is '$sender' but DUET_SELF is '$callerSelf'."
+  exit 7
+}
+if ($From -and $From -ne $sender) {
+  Write-DuetError "duet: -From '$From' does not match caller pane identity '$sender'."
   exit 7
 }
 
-$sender = ''
-if ($From) {
-  if (-not (Test-DuetRosterHasName -RosterPath $RosterPath -Name $From)) { Write-DuetError "duet: --From '$From' is not in the roster."; exit 7 }
-  if ($paneName -and $paneName -ne $From -and -not $env:DUET_ALLOW_FROM_OVERRIDE) { Write-DuetError "duet: --From '$From' does not match caller pane identity '$paneName'."; exit 7 }
-  if ($callerSelf -and $callerSelf -ne $From -and -not $env:DUET_ALLOW_FROM_OVERRIDE) { Write-DuetError "duet: --From '$From' does not match DUET_SELF '$callerSelf'."; exit 7 }
-  if (-not $paneName -and -not $env:DUET_ALLOW_FROM_OVERRIDE) { Write-DuetError "duet: caller pane is not a member of session '$Sid'; override refused."; exit 7 }
-  $sender = $From
+if ($Recipient -ne 'all' -and
+    -not (Test-DuetRosterHasName -RosterPath $RosterPath -Name $Recipient)) {
+  Write-DuetError "duet: recipient '$Recipient' is not an exact roster name."
+  exit 2
 }
-else {
-  if (-not $paneName) { Write-DuetError "duet: caller is not a member of session '$Sid'."; exit 7 }
-  $sender = $paneName
+if ($Recipient -ne 'all' -and
+    -not (Test-DuetMemberAlive -RosterPath $RosterPath -Name $Recipient)) {
+  Write-DuetError "duet: recipient '$Recipient' is not live; message was not queued."
+  exit 8
+}
+if ($Recipient -ne 'all' -and
+    (Test-Path -LiteralPath (Join-Path (Join-Path $DuetDir 'blocked') $Recipient))) {
+  Write-DuetError "duet: recipient '$Recipient' is blocked after ambiguous delivery; message was not queued."
+  exit 8
 }
 
 $body = [Console]::In.ReadToEnd()
 $mode = if ($Interrupt) { 'INTERRUPT' } else { 'NORMAL' }
-$origin = if ($sender -eq $global:DUET_CURRENT_LEADER) { 'LEADER' } else { 'WORKER' }
-
-function Enqueue-One([string]$Queue, [string]$Rcpt) {
-  if (-not (Add-DuetMessage -DuetDir $DuetDir -SessionId $Sid -Queue $Queue -Sender $sender -Recipient $Rcpt -Term $global:DUET_CURRENT_TERM -Mode $mode -Origin $origin -LeaderAtSend $global:DUET_CURRENT_LEADER -Body $body)) { return $false }
-  [Console]::Out.WriteLine(("duet: queued {0} for {1}{2}" -f $global:DUET_ENQUEUED_ID, $Rcpt, $(if ($Interrupt) { ' (interrupt)' } else { '' })))
+function Add-OneDuetMessage {
+  param([string]$Queue, [string]$WireRecipient)
+  if (-not (Add-DuetMessage -DuetDir $DuetDir -SessionId $Sid -Queue $Queue `
+      -Sender $sender -Recipient $WireRecipient -Mode $mode -Body $body)) {
+    return $false
+  }
+  [Console]::Out.WriteLine(('duet: queued {0} for {1}{2}' -f
+      $global:DUET_ENQUEUED_ID, $Queue, $(if ($Interrupt) { ' (interrupt)' } else { '' })))
   return $true
 }
 
-if ($sender -eq $global:DUET_CURRENT_LEADER) {
-  if ($Recipient -eq 'all') {
-    foreach ($r in $rosterRows) {
-      if (-not $r.name -or $r.name -eq $sender) { continue }
-      if (-not (Enqueue-One $r.name $r.name)) { exit 1 }
-    }
-    exit 0
-  }
-  if ($Recipient -eq 'leader') { Write-DuetError "duet: leader '$sender' cannot send to itself through the leader alias."; exit 8 }
-  $rcpt = Resolve-DuetRosterName -RosterPath $RosterPath -Token $Recipient
-  if (-not $rcpt) { Write-DuetError "duet: unknown or ambiguous recipient '$Recipient'."; exit 2 }
-  if ($rcpt -eq $sender) { Write-DuetError "duet: sender and recipient are both '$sender'."; exit 8 }
-  if (-not (Enqueue-One $rcpt $rcpt)) { exit 1 }
-  exit 0
+if ($Recipient -ne 'all') {
+  if (Add-OneDuetMessage -Queue $Recipient -WireRecipient $Recipient) { exit 0 }
+  exit 1
 }
 
-# Worker traffic canonicalizes to the symbolic leader queue (survives handoff).
-if ($Recipient -eq 'all') {
-  Write-DuetError "duet: hub violation: worker '$sender' may send only to leader '$($global:DUET_CURRENT_LEADER)'; broadcast requires the current leader."
+$fanout = 0
+foreach ($row in $rosterRows) {
+  if ($row.name -eq $sender) { continue }
+  if (-not (Test-DuetMemberAlive -RosterPath $RosterPath -Name $row.name)) { continue }
+  if (Test-Path -LiteralPath (Join-Path (Join-Path $DuetDir 'blocked') $row.name)) { continue }
+  if (-not (Add-OneDuetMessage -Queue $row.name -WireRecipient 'all')) { exit 1 }
+  $fanout++
+}
+if ($fanout -eq 0) {
+  Write-DuetError 'duet: broadcast has no other live recipients.'
   exit 8
 }
-if ($Recipient -ne 'leader') {
-  $rcpt = Resolve-DuetRosterName -RosterPath $RosterPath -Token $Recipient
-  if (-not $rcpt) { Write-DuetError "duet: unknown or ambiguous recipient '$Recipient'."; exit 2 }
-  if ($rcpt -ne $global:DUET_CURRENT_LEADER) { Write-DuetError "duet: hub violation: worker '$sender' may send only to leader '$($global:DUET_CURRENT_LEADER)'."; exit 8 }
-}
-if (-not (Enqueue-One 'leader' 'leader')) { exit 1 }
 exit 0

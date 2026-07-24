@@ -1,45 +1,37 @@
-# Deterministic + live-psmux failure-path tests for the Windows/psmux foundation.
-# Runnable inside OR outside a psmux pane (live assertions skip outside one) and
-# under $ErrorActionPreference='Stop' (expected failures must RETURN, not throw).
-# Run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File foundation.tests.ps1
+# Deterministic foundation tests for the Windows/psmux v4 mesh.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$script:Pass = 0; $script:Fail = 0; $script:Skip = 0
-function Check([bool]$Cond, [string]$Name) {
-  if ($Cond) { $script:Pass++; Write-Host "  PASS $Name" -ForegroundColor Green }
-  else { $script:Fail++; Write-Host "  FAIL $Name" -ForegroundColor Red }
+$script:Pass = 0
+$script:Fail = 0
+$script:Skip = 0
+function Check([bool]$Condition, [string]$Name) {
+  if ($Condition) {
+    $script:Pass++
+    Write-Host "  PASS $Name" -ForegroundColor Green
+  } else {
+    $script:Fail++
+    Write-Host "  FAIL $Name" -ForegroundColor Red
+  }
 }
-# Enforce the library failure contract: RETURN falsy, never throw (a regression
-# to a terminating Write-Error under Stop is itself a failure, not a pass).
-function CheckReturnsFalse([scriptblock]$Block, [string]$Name) {
-  try { $r = & $Block; Check (-not $r) $Name }
-  catch { Check $false ("$Name (threw instead of returning `$false: " + $_.Exception.Message + ")") }
+function CheckFalse([scriptblock]$Block, [string]$Name) {
+  try { Check (-not (& $Block)) $Name }
+  catch { Check $false "$Name (threw: $($_.Exception.Message))" }
 }
-function Skip([string]$Name) { $script:Skip++; Write-Host "  SKIP $Name" -ForegroundColor Yellow }
+function Skip([string]$Name) {
+  $script:Skip++
+  Write-Host "  SKIP $Name" -ForegroundColor Yellow
+}
 
-$common = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\duet-common.ps1'
+$plugin = Split-Path -Parent $PSScriptRoot
+$common = Join-Path $plugin 'scripts\duet-common.ps1'
 . $common
-Write-Host "dot-sourced $common"
-
-$haveMux = $true
-try { $null = Get-DuetPsmux } catch { $haveMux = $false }
-$inPane = [bool]$env:TMUX_PANE
-Write-Host ("environment: psmux={0} inPane={1}" -f $haveMux, $inPane)
-
-$scratch = Join-Path $env:TEMP ("duet-ftests-" + [guid]::NewGuid().ToString('N'))
+$scratch = Join-Path $env:TEMP ('duet-v4-foundation-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch | Out-Null
+$encoding = New-Object Text.UTF8Encoding($false)
 
 try {
-  # --- 1. StrictMode: optional-global reads must not throw (blocker 1) --------
-  if ($haveMux) {
-    $threw = $false
-    try { $null = Get-DuetPsmux } catch { $threw = $true }
-    Check (-not $threw) "Get-DuetPsmux does not throw under StrictMode/Stop"
-  } else { Skip "Get-DuetPsmux StrictMode (no psmux binary)" }
-  $threw = $false
-  try { $null = Test-DuetServerMatches } catch { $threw = $true }
-  Check (-not $threw) "Test-DuetServerMatches does not throw with unset globals"
+  Write-Host 'foundation: psmux invocation and marker scope'
   $fakeMux = Join-Path $scratch 'fake-psmux.cmd'
   Write-DuetUtf8NoBom -Path $fakeMux -Value '@echo %*'
   $savedMuxPath = $global:DUET_PSMUX_PATH
@@ -49,202 +41,309 @@ try {
     $global:DUET_PSMUX_PATH = $fakeMux
     $global:DUET_PSMUX_NAMESPACE = ''
     $global:DUET_PSMUX_REGISTRY = ''
-    $nativeArgs = @(Invoke-DuetPsmux capture-pane -p -t live:1)
-    Check ($global:DUET_PSMUX_RC -eq 0 -and ($nativeArgs -join "`n").Trim() -eq 'capture-pane -p -t live:1') "Invoke-DuetPsmux forwards native -p without PowerShell parameter abbreviation"
+    $native = @(Invoke-DuetPsmux capture-pane -p -t live:1)
+    Check ($global:DUET_PSMUX_RC -eq 0 -and ($native -join "`n").Trim() -eq 'capture-pane -p -t live:1') `
+      'Invoke-DuetPsmux preserves native -p and -t arguments'
   }
-  catch { Check $false ("Invoke-DuetPsmux native -p binding threw: " + $_.Exception.Message) }
   finally {
     $global:DUET_PSMUX_PATH = $savedMuxPath
     $global:DUET_PSMUX_NAMESPACE = $savedMuxNs
     $global:DUET_PSMUX_REGISTRY = $savedMuxReg
   }
-  Check ((Get-DuetClaudeComposerMarker '❯ [Pastedtext#1+5lines]') -eq 'claudePastedtext15lines') "Claude compact collapsed-paste marker is recognized"
-  Check ((Get-DuetClaudeComposerMarker '> [Pasted text #12 + 3 lines]') -eq 'claudePastedtext123lines') "Claude spaced collapsed-paste marker is recognized"
-  $savedMuxRc = $global:DUET_PSMUX_RC
-  $blankRow = & {
+  Check ((Get-DuetClaudeComposerMarker '> [Pasted text #12 + 3 lines]') -eq 'claudePastedtext123lines') `
+    'Claude collapsed-paste marker is normalized'
+  $framedClaudeMarker = & {
     . $common
-    function Resolve-DuetPaneResolution { [pscustomobject]@{ Known = $true; Alive = $true; Target = 's:%1' } }
-    function Invoke-DuetPsmux { $global:DUET_PSMUX_RC = 0; return $null }
-    Invoke-DuetPaneRowCapture -Session s -ServerPid 1 -PaneId '%1' -PanePid 2 -Row 29
+    $composerRule = -join (([char]0x2500).ToString() * 36)
+    function Invoke-DuetPaneCapture {
+      [pscustomobject]@{
+        Ok = $true
+        Alive = $true
+        Lines = @(
+          'older transcript'
+          ($composerRule + ' claude-1')
+          '> [Pasted text #4 + 5 lines]'
+          $composerRule
+          'bypass permissions on'
+        )
+      }
+    }
+    function Invoke-DuetPaneGeometry {
+      throw 'framed composer proof must not depend on cursor geometry'
+    }
+    function Invoke-DuetPaneRowCapture {
+      [pscustomobject]@{ Ok = $true; Alive = $true; Line = 'bypass permissions on' }
+    }
+    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2 -Harness claude
   }
-  Check ($blankRow.Ok -and $blankRow.Alive -and $blankRow.Line -eq '') "exact psmux row capture treats rc=0/blank stdout as a successfully empty row"
-  $trimmedMarker = & {
+  Check ($framedClaudeMarker.Ok -and
+      $framedClaudeMarker.Marker -eq 'claudePastedtext45lines') `
+    'Claude status-row cursor falls back to a composer-border-scoped marker'
+  $hintedClaudeMarker = & {
     . $common
-    function Invoke-DuetPaneCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history', 'context') } }
-    function Invoke-DuetPaneGeometry { [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = '29'; Height = '30' } }
-    function Invoke-DuetPaneRowCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Line = '' } }
-    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2
+    function Invoke-DuetPaneCapture {
+      [pscustomobject]@{
+        Ok = $true
+        Alive = $true
+        Lines = @(
+          '> [Pastedtext#7+9lines]'
+          'paste again to expand'
+          '', '', '', '', '', '', '', ''
+        )
+      }
+    }
+    function Invoke-DuetPaneGeometry {
+      throw 'active composer hint proof must not depend on cursor geometry'
+    }
+    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2 -Harness claude
   }
-  Check ($trimmedMarker.Ok -and $trimmedMarker.Alive -and $trimmedMarker.Marker -eq '') "trimmed trailing cursor row is positive evidence of an empty composer"
-  $exactMarker = & {
+  Check ($hintedClaudeMarker.Ok -and
+      $hintedClaudeMarker.Marker -eq 'claudePastedtext79lines') `
+    'Claude active-composer hint survives trailing blank terminal rows'
+  $historyClaudeMarker = & {
     . $common
-    function Invoke-DuetPaneCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history') } }
-    function Invoke-DuetPaneGeometry { [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = '25'; Height = '30' } }
-    function Invoke-DuetPaneRowCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Line = '> [Pasted Content 2048 chars]' } }
-    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2
+    function Invoke-DuetPaneCapture {
+      [pscustomobject]@{
+        Ok = $true
+        Alive = $true
+        Lines = @('❯ [Pasted text #4 + 5 lines]', 'model output', 'status')
+      }
+    }
+    function Invoke-DuetPaneGeometry {
+      [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = '8'; Height = '12' }
+    }
+    function Invoke-DuetPaneRowCapture {
+      [pscustomobject]@{ Ok = $true; Alive = $true; Line = 'status' }
+    }
+    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2 -Harness claude
   }
-  Check ($exactMarker.Ok -and $exactMarker.Marker -eq 'codexPastedContent2048chars') "exact cursor-row capture still detects a collapsed Codex marker"
-  $movingCursor = & {
+  Check ($historyClaudeMarker.Ok -and -not $historyClaudeMarker.Marker) `
+    'Claude transcript-only marker is not mistaken for its active composer'
+  Check (Test-DuetCodexMarkerOwned 'codexPastedContent10charsPastedContent20chars' 'codexPastedContent10chars') `
+    'Codex split collapsed markers extend exact ownership'
+  $kimiMarker = & {
     . $common
-    $script:cursorReads = 0
-    function Invoke-DuetPaneCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history') } }
-    function Invoke-DuetPaneGeometry { $script:cursorReads++; [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = $(if ($script:cursorReads -eq 1) { '29' } else { '28' }); Height = '30' } }
-    function Invoke-DuetPaneRowCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Line = '' } }
-    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2
+    function Invoke-DuetPaneCapture {
+      [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history') }
+    }
+    function Invoke-DuetPaneGeometry {
+      [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = '4'; Height = '10' }
+    }
+    function Invoke-DuetPaneRowCapture {
+      [pscustomobject]@{ Ok = $true; Alive = $true; Line = '> [paste #7 +12 lines]' }
+    }
+    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2 -Harness kimi
   }
-  Check (-not $movingCursor.Ok -and $movingCursor.Alive) "cursor movement during an exact-row composer read remains UNKNOWN"
-  $outOfRangeCursor = & {
+  Check ($kimiMarker.Ok -and $kimiMarker.Marker -eq 'kimipaste712lines') `
+    'Kimi collapsed-paste marker is cursor-row scoped'
+  $wrongHarness = & {
     . $common
-    function Invoke-DuetPaneCapture { [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history') } }
-    function Invoke-DuetPaneGeometry { [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = '30'; Height = '30' } }
-    function Invoke-DuetPaneRowCapture { throw 'out-of-range geometry must not read a row' }
-    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2
+    function Invoke-DuetPaneCapture {
+      [pscustomobject]@{ Ok = $true; Alive = $true; Lines = @('history') }
+    }
+    function Invoke-DuetPaneGeometry {
+      [pscustomobject]@{ Ok = $true; Alive = $true; CursorY = '4'; Height = '10' }
+    }
+    function Invoke-DuetPaneRowCapture {
+      [pscustomobject]@{ Ok = $true; Alive = $true; Line = '> [paste #7 +12 lines]' }
+    }
+    Get-DuetPaneMarker -Session s -ServerPid 1 -PaneId '%1' -PanePid 2 -Harness codex
   }
-  Check (-not $outOfRangeCursor.Ok -and $outOfRangeCursor.Alive) "out-of-range cursor geometry remains UNKNOWN"
-  $global:DUET_PSMUX_RC = $savedMuxRc
-  $encodedReady = ConvertTo-DuetPowerShellEncodedCommand "Set-Content -LiteralPath 'C:\odd path & `$cash\ready' -Value ok -NoNewline"
-  $decodedReady = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encodedReady))
-  Check ($decodedReady -eq "Set-Content -LiteralPath 'C:\odd path & `$cash\ready' -Value ok -NoNewline") "encoded PowerShell readiness command round-trips shell metacharacters"
+  Check ($wrongHarness.Ok -and -not $wrongHarness.Marker) `
+    'one harness cannot claim another harness marker'
 
-  # --- 2. Lock: dead-owner recovery + owner-first publish (blocker 3) ---------
-  $lk = Join-Path $scratch '.deadlock'
-  New-Item -ItemType Directory -Path $lk | Out-Null
-  $deadPid = 999990
-  while (Test-DuetProcessAlive $deadPid) { $deadPid++ }
-  [System.IO.File]::WriteAllText((Join-Path $lk 'owner'), "$deadPid`tdead-token`n")
-  Check (Lock-DuetAcquire $lk 30) "Lock-DuetAcquire reaps a dead-owner lock"
-  Check ((Get-DuetLockOwnerPid $lk) -eq "$PID") "reaped lock is now owned by us (never ownerless)"
-  Check (Unlock-DuetRelease $lk) "Unlock-DuetRelease releases our lock"
-  Check (-not (Test-Path -LiteralPath $lk)) "released lock directory is gone"
-  $lk2 = Join-Path $scratch '.livelock'
-  New-Item -ItemType Directory -Path $lk2 | Out-Null
-  [System.IO.File]::WriteAllText((Join-Path $lk2 'owner'), "$PID`tsomeone-elses-token`n")
-  CheckReturnsFalse { Lock-DuetAcquire $lk2 3 } "Lock-DuetAcquire refuses a live foreign-owned lock"
+  Write-Host 'foundation: uncertain paste continuation'
+  $continued = & {
+    . $common
+    $script:pasteCalls = 0
+    $script:markerReads = 0
+    $script:enterCalls = 0
+    function Write-DuetError { param([string]$Message) }
+    function Resolve-DuetPaneResolution {
+      [pscustomobject]@{ Known = $true; Alive = $true; Target = 'fixture:%1' }
+    }
+    function Send-DuetControlPaste {
+      $script:pasteCalls++
+      return $global:DUET_PASTE_UNCERTAIN
+    }
+    function Get-DuetTailAlnumT {
+      [pscustomobject]@{ Ok = $true; Alive = $true; Text = '' }
+    }
+    function Get-DuetPaneMarker {
+      $script:markerReads++
+      $marker = if ($script:markerReads -eq 2) { 'claudePastedtext15lines' } else { '' }
+      [pscustomobject]@{ Ok = $true; Alive = $true; Marker = $marker }
+    }
+    function Send-DuetPaneKey {
+      $script:enterCalls++
+      [pscustomobject]@{ Ok = $true; Alive = $true }
+    }
+    $result = Send-DuetVerified -Session fixture -ServerPid 1 -PaneId '%1' -PanePid 2 `
+      -Registry fixture -Payload 'unique uncertain payload' -Interrupt $false -Harness claude
+    [pscustomobject]@{
+      Code = $result.Code
+      Landing = $result.LandingObserved
+      PasteCalls = $script:pasteCalls
+      EnterCalls = $script:enterCalls
+    }
+  }
+  Check ($continued.Code -eq 0 -and $continued.Landing -eq 'marker') `
+    'an uncertain acknowledgment can finish only after visible owned landing clears'
+  Check ($continued.PasteCalls -eq 1 -and $continued.EnterCalls -eq 1) `
+    'uncertain continuation never repastes and uses one Enter'
 
-  # --- 3. Workdir key case-insensitivity (blocker 4) -------------------------
-  New-Item -ItemType Directory -Path (Join-Path $scratch 'WorkDir') | Out-Null
-  $kUpper = Get-DuetWorkdirKey (Join-Path $scratch 'WorkDir')
-  $kLower = Get-DuetWorkdirKey (Join-Path $scratch 'workdir')
-  Check ($kUpper -and $kUpper -eq $kLower) "workdir key is case-insensitive (one owner per workdir)"
-  $sessionIds = @(1..100 | ForEach-Object { New-DuetSessionId })
-  Check (@($sessionIds | Sort-Object -Unique).Count -eq 100 -and -not @($sessionIds | Where-Object { $_ -notmatch '^[0-9]{8}-[0-9]{9}-[0-9a-f]{12}$' })) "session ids are unique and filesystem-safe"
-
-  # --- 4-6. Caller identity / resolver / liveness (live psmux) ---------------
-  if ($haveMux -and $inPane) {
-    Check (Get-DuetCallerIdentity) "Get-DuetCallerIdentity resolves the caller pane by ancestry"
-    Check ($global:DUET_CALLER_PANE -eq $env:TMUX_PANE) "ancestry-derived pane_id matches TMUX_PANE ($($global:DUET_CALLER_PANE))"
-    Check ($global:DUET_CALLER_SESSION -and $global:DUET_CALLER_SERVER_PID -and $global:DUET_CALLER_PANE_PID) "caller session/serverpid/panepid all populated"
-    $sess = $global:DUET_CALLER_SESSION; $srv = $global:DUET_CALLER_SERVER_PID
-    $pane = $global:DUET_CALLER_PANE;    $ppid = $global:DUET_CALLER_PANE_PID
-    Check ((Resolve-DuetPaneTarget -PaneId $pane -PanePid $ppid -Session $sess -ServerPid $srv) -eq "${sess}:${pane}") "resolver returns bounded target ${sess}:${pane}"
-    CheckReturnsFalse { Resolve-DuetPaneTarget -PaneId $pane -PanePid '1' -Session $sess -ServerPid $srv } "resolver refuses a pane_pid mismatch (DEAD)"
-    CheckReturnsFalse { Resolve-DuetPaneTarget -PaneId $pane -PanePid $ppid -Session 'no-such-session' -ServerPid $srv } "resolver refuses a foreign session"
-    CheckReturnsFalse { Resolve-DuetPaneTarget -PaneId $pane -PanePid $ppid -Session $sess -ServerPid '1' } "resolver refuses a backend-pid mismatch"
-    $global:DUET_PSMUX_SESSION = $sess; $global:DUET_PSMUX_SERVER_PID = $srv
-    Check (Test-DuetServerMatches) "Test-DuetServerMatches true for the live session tuple"
-    $global:DUET_PSMUX_SERVER_PID = '1'
-    CheckReturnsFalse { Test-DuetServerMatches } "Test-DuetServerMatches false for a wrong backend pid"
-    $global:DUET_PSMUX_SERVER_PID = $srv
-    $roster = Join-Path $scratch 'roster.tsv'
-    Write-DuetAtomicMultiline -Path $roster -Value ("name`tharness`tpane_id`tpane_pid`trank`tspawned`nclaude`tclaude`t$pane`t$ppid`t0`t0`nghost`tcodex`t%9999`t1`t1`t1") | Out-Null
-    Check (Test-DuetMemberAlive -RosterPath $roster -Name 'claude') "Test-DuetMemberAlive true for the real caller tuple"
-    CheckReturnsFalse { Test-DuetMemberAlive -RosterPath $roster -Name 'ghost' } "Test-DuetMemberAlive false for a wrong pane_pid"
-  } else { Skip "live-psmux caller/resolver/liveness (not in a pane)" }
-
-  # --- 7. Config: current pointer file + validation --------------------------
-  $root = Join-Path $scratch 'stateroot'; $sid = 'ftsess'; $sdir = Join-Path $root $sid
-  New-Item -ItemType Directory -Path $sdir | Out-Null
-  $envFile = Join-Path $sdir 'duet.env'
-  $plugin = Get-DuetCanonicalPath (Split-Path -Parent $PSScriptRoot)
-  $testWorkdir = Get-DuetCanonicalPath $scratch
-  $testWorkdirKey = Get-DuetWorkdirKey $testWorkdir
-  Write-DuetAtomicMultiline -Path $envFile -Value ("DUET_DIR=$sdir`nDUET_STATE_ROOT=$root`nWORKDIR=$testWorkdir`nPLUGIN_DIR=$plugin`n" +
-    "DUET_PSMUX_SESSION=1`nDUET_PSMUX_SERVER_PID=36928`nDUET_PSMUX_REGISTRY=1`nDUET_PSMUX_NAMESPACE=`n" +
-    "DUET_SESSION=$sid`nDUET_SESSION_ID=$sid`nDUET_WORKDIR_KEY=$testWorkdirKey`nDUET_INITIATOR=claude`nDUET_INITIATOR_PANE=%1") | Out-Null
-  Write-DuetAtomicMultiline -Path (Join-Path $root 'current.session') -Value $sdir | Out-Null
-  $savedRoot = $env:DUET_STATE_ROOT; $savedCfg = $env:DUET_CONFIG; $savedSess = $env:DUET_SESSION
+  Write-Host 'foundation: exact config pinning'
+  $root = Join-Path $scratch 'state'
+  $workdir = Join-Path $scratch 'work'
+  $sid = 'v4-foundation'
+  $sessionDir = Join-Path $root $sid
+  New-Item -ItemType Directory -Path $sessionDir, $workdir -Force | Out-Null
+  $root = Get-DuetCanonicalPath $root
+  $workdir = Get-DuetCanonicalPath $workdir
+  $pluginCanonical = Get-DuetCanonicalPath $plugin
+  $sessionDir = Get-DuetCanonicalPath $sessionDir
+  $configPath = Join-Path $sessionDir 'duet.env'
+  $configText = @(
+    "DUET_DIR=$sessionDir"
+    "DUET_STATE_ROOT=$root"
+    "WORKDIR=$workdir"
+    "PLUGIN_DIR=$pluginCanonical"
+    'DUET_PSMUX_SESSION=v4test'
+    'DUET_PSMUX_SERVER_PID=12345'
+    'DUET_PSMUX_REGISTRY=v4test'
+    'DUET_PSMUX_NAMESPACE='
+    "DUET_SESSION=$sid"
+    "DUET_SESSION_ID=$sid"
+    'DUET_INITIATOR=claude'
+    'DUET_INITIATOR_PANE=%1'
+  ) -join "`n"
+  Write-DuetAtomicMultiline -Path $configPath -Value $configText | Out-Null
+  $savedConfig = $env:DUET_CONFIG
   try {
-    $env:DUET_STATE_ROOT = $root; $env:DUET_CONFIG = ''; $env:DUET_SESSION = ''
-    Check (Resolve-DuetConfig '' 1) "Resolve-DuetConfig follows the current.session pointer file"
-    Check ($global:DUET_RESOLVED_CONFIG -eq $envFile) "current pointer resolved to the right duet.env"
-    Check (Resolve-DuetConfig $sid 0) "Resolve-DuetConfig resolves a bare session id under DUET_STATE_ROOT"
-    CheckReturnsFalse { Resolve-DuetConfig 'no-such-session' 0 } "Resolve-DuetConfig refuses an unknown session id"
-  } finally {
-    $env:DUET_STATE_ROOT = $savedRoot; $env:DUET_CONFIG = $savedCfg; $env:DUET_SESSION = $savedSess
+    $env:DUET_CONFIG = ''
+    CheckFalse { Resolve-DuetConfig -SessionArg '' -RequireEnvironment 1 } `
+      'mutation config resolution rejects an absent DUET_CONFIG'
+    Check (Resolve-DuetConfig -SessionArg $configPath -RequireEnvironment 0) `
+      'diagnostics accept one explicit absolute duet.env'
+    Check ($global:DUET_RESOLVED_CONFIG -eq $configPath) `
+      'explicit config resolves to its canonical file'
+    CheckFalse { Resolve-DuetConfig -SessionArg $sid -RequireEnvironment 0 } `
+      'session-id routing fallback is absent'
+    CheckFalse { Resolve-DuetConfig -SessionArg $sessionDir -RequireEnvironment 0 } `
+      'session-directory routing fallback is absent'
+    $env:DUET_CONFIG = $configPath
+    Check (Resolve-DuetConfig -SessionArg '' -RequireEnvironment 1) `
+      'mutation resolves the absolute DUET_CONFIG'
+    $otherDir = Join-Path $root 'other'
+    New-Item -ItemType Directory -Path $otherDir | Out-Null
+    $otherConfig = Join-Path $otherDir 'duet.env'
+    Write-DuetAtomicMultiline -Path $otherConfig -Value $configText | Out-Null
+    CheckFalse { Resolve-DuetConfig -SessionArg $otherConfig -RequireEnvironment 1 } `
+      'explicit daemon pin cannot disagree with DUET_CONFIG'
   }
-  $cfg = Import-DuetConfig $envFile
-  Check (Test-DuetLoadedSession -Config $cfg -ExpectedSession $sid -ConfigPath $envFile) "Test-DuetLoadedSession accepts a valid config"
-  $duplicateConfig = Join-Path $sdir 'duplicate.env'
-  Write-DuetAtomicMultiline -Path $duplicateConfig -Value ((Get-DuetFileText $envFile).TrimEnd() + "`nDUET_SESSION_ID=other") | Out-Null
+  finally { $env:DUET_CONFIG = $savedConfig }
+
+  $cfg = Import-DuetConfig $configPath
+  Check ($global:DUET_CONFIG_VALID -and
+      (Test-DuetLoadedSession -Config $cfg -ExpectedSession $sid -ConfigPath $configPath)) `
+    'generated v4 config parses and validates'
+  $duplicateConfig = Join-Path $sessionDir 'duplicate.env'
+  [IO.File]::WriteAllText($duplicateConfig, $configText + "`nDUET_SESSION_ID=other`n", $encoding)
   $null = Import-DuetConfig $duplicateConfig
-  Check (-not $global:DUET_CONFIG_VALID) "config parser rejects duplicate keys instead of taking the last value"
-  CheckReturnsFalse { Test-DuetLoadedSession -Config $cfg -ExpectedSession 'other' } "Test-DuetLoadedSession rejects a session-id mismatch"
-  $bad = @{ DUET_DIR = "$sdir`twith-tab"; DUET_SESSION_ID = $sid; DUET_SESSION = $sid; DUET_STATE_ROOT = $root }
-  CheckReturnsFalse { Test-DuetLoadedSession -Config $bad } "Test-DuetLoadedSession rejects control chars in paths"
+  Check (-not $global:DUET_CONFIG_VALID) 'config parser rejects duplicate keys'
+  $unknownConfig = Join-Path $sessionDir 'unknown.env'
+  [IO.File]::WriteAllText($unknownConfig, $configText + "`nLEADER=gone`n", $encoding)
+  $null = Import-DuetConfig $unknownConfig
+  Check (-not $global:DUET_CONFIG_VALID) 'config parser rejects removed protocol fields'
 
-  # --- 7b. Mandatory psmux tuple + reparse config validation (review 2) ------
-  $noPsmux = @{ DUET_DIR = $sdir; DUET_SESSION_ID = $sid; DUET_SESSION = $sid; DUET_STATE_ROOT = $root }
-  CheckReturnsFalse { Test-DuetLoadedSession -Config $noPsmux } "config missing DUET_PSMUX_* is rejected"
-  $badSess = @{ DUET_DIR = $sdir; DUET_SESSION_ID = $sid; DUET_SESSION = $sid; DUET_STATE_ROOT = $root; DUET_PSMUX_SESSION = 'a:b'; DUET_PSMUX_SERVER_PID = '10'; DUET_PSMUX_REGISTRY = 'ok' }
-  CheckReturnsFalse { Test-DuetLoadedSession -Config $badSess } "config with ':' in psmux session name is rejected"
-  $badPid = @{ DUET_DIR = $sdir; DUET_SESSION_ID = $sid; DUET_SESSION = $sid; DUET_STATE_ROOT = $root; DUET_PSMUX_SESSION = '1'; DUET_PSMUX_SERVER_PID = 'x'; DUET_PSMUX_REGISTRY = '1' }
-  CheckReturnsFalse { Test-DuetLoadedSession -Config $badPid } "config with non-numeric backend pid is rejected"
-  $badReg = @{ DUET_DIR = $sdir; DUET_SESSION_ID = $sid; DUET_SESSION = $sid; DUET_STATE_ROOT = $root; DUET_PSMUX_SESSION = '1'; DUET_PSMUX_SERVER_PID = '10'; DUET_PSMUX_REGISTRY = 'a/b' }
-  CheckReturnsFalse { Test-DuetLoadedSession -Config $badReg } "config with unsafe registry base (has /) is rejected"
-  $dotted = @{ DUET_DIR = $sdir; DUET_SESSION_ID = $sid; DUET_SESSION = $sid; DUET_STATE_ROOT = $root; WORKDIR = $testWorkdir; PLUGIN_DIR = $plugin; DUET_WORKDIR_KEY = $testWorkdirKey; DUET_INITIATOR = 'claude'; DUET_INITIATOR_PANE = '%1'; DUET_PSMUX_SESSION = 'my.session'; DUET_PSMUX_SERVER_PID = '10'; DUET_PSMUX_REGISTRY = 'ns__my.session'; DUET_PSMUX_NAMESPACE = 'ns' }
-  Check (Test-DuetLoadedSession -Config $dotted) "dotted session + namespaced registry accepted (cli.rs:580)"
+  Write-Host 'foundation: immutable roster'
+  $rosterPath = Join-Path $sessionDir 'roster.tsv'
+  $validRoster = @(
+    "name`tharness`tpane_id`tpane_pid`trank`tspawned"
+    "claude`tclaude`t%1`t101`t0`t0"
+    "codex-1`tcodex`t%2`t102`t1`t1"
+    "kimi-1`tkimi`t%3`t103`t2`t1"
+  ) -join "`n"
+  Write-DuetAtomicMultiline -Path $rosterPath -Value $validRoster | Out-Null
+  $rows = @(Import-DuetRoster $rosterPath)
+  Check ($global:DUET_ROSTER_VALID -and $rows.Count -eq 3) `
+    'v4 roster validates three exact members'
+  $sixRows = @("name`tharness`tpane_id`tpane_pid`trank`tspawned")
+  for ($i = 0; $i -lt 6; $i++) {
+    $sixRows += "peer-$i`tcodex`t%$($i + 1)`t$($i + 200)`t$i`t1"
+  }
+  Write-DuetAtomicMultiline -Path $rosterPath -Value ($sixRows -join "`n") | Out-Null
+  $null = @(Import-DuetRoster $rosterPath)
+  Check (-not $global:DUET_ROSTER_VALID) 'roster enforces the five-agent cap'
+  $caseDuplicate = $validRoster + "`nCLAUDE`tcodex`t%4`t104`t3`t1"
+  Write-DuetAtomicMultiline -Path $rosterPath -Value $caseDuplicate | Out-Null
+  $null = @(Import-DuetRoster $rosterPath)
+  Check (-not $global:DUET_ROSTER_VALID) 'roster names are unique case-insensitively'
+  Write-DuetAtomicMultiline -Path $rosterPath -Value $validRoster | Out-Null
 
-  # --- 9. Reaper mutex crash/abandon recovery + foreign-holder refusal --------
-  $childPs = Join-Path $scratch 'mutexchild.ps1'
-  Set-Content -LiteralPath $childPs -Encoding ASCII -Value @'
-param([string]$MutexName, [string]$FlagPath, [int]$HoldMs)
-$m = New-Object System.Threading.Mutex($false, $MutexName)
-[void]$m.WaitOne(3000)
-if ($FlagPath) { [System.IO.File]::WriteAllText($FlagPath, '1') }
-Start-Sleep -Milliseconds $HoldMs
-[Environment]::Exit(0)
-'@
-  $mlock = Join-Path $scratch '.mlock'
-  $mname = Get-DuetMutexName $mlock
-  # Child acquires the reaper mutex, then exits WITHOUT releasing (crash sim).
-  $c1 = Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $childPs, '-MutexName', $mname, '-HoldMs', '150' -PassThru -WindowStyle Hidden
-  $c1.WaitForExit()
-  Check (Lock-DuetReaperAcquire $mlock 2000) "reaper mutex recovers from an abandoned (crashed) holder"
-  Lock-DuetReaperRelease $mlock
-  # Live foreign holder must block us.
-  $flag2 = Join-Path $scratch 'held2.flag'
-  $c2 = Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $childPs, '-MutexName', $mname, '-FlagPath', $flag2, '-HoldMs', '4000' -PassThru -WindowStyle Hidden
-  for ($i = 0; $i -lt 60 -and -not (Test-Path -LiteralPath $flag2); $i++) { Start-Sleep -Milliseconds 50 }
-  CheckReturnsFalse { Lock-DuetReaperAcquire $mlock 300 } "reaper mutex refuses while a live foreign holder holds it"
-  try { Stop-Process -Id $c2.Id -Force -ErrorAction SilentlyContinue } catch { }
+  Write-Host 'foundation: DUETv4 envelope'
+  $message = Join-Path $sessionDir 'valid.msg'
+  $body = "hello Ω`nsecond line"
+  $body64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+  $wire = "DUETv4`nid`tm-$sid-codex-1-0000000001`nsession`t$sid`nmode`tNORMAL`nsender`tclaude`nrecipient`tcodex-1`nbody64`t$body64`n"
+  [IO.File]::WriteAllText($message, $wire, $encoding)
+  Check ((Read-DuetMessage $message) -and $global:DUET_MESSAGE_BODY -eq $body) `
+    'valid UTF-8 DUETv4 envelope round-trips'
+  $payload = Build-DuetPayload
+  Check ($payload.Contains('from=claude to=codex-1') -and $payload.Contains($body)) `
+    'delivered payload names exact from and to'
+  [IO.File]::WriteAllText($message, $wire.Replace("id`tm-", "id`ta`nid`tm-"), $encoding)
+  CheckFalse { Read-DuetMessage $message } 'duplicate fields are rejected'
+  [IO.File]::WriteAllText($message, $wire.Replace("body64`t", "unknown`tx`nbody64`t"), $encoding)
+  CheckFalse { Read-DuetMessage $message } 'unknown fields are rejected'
+  [IO.File]::WriteAllText($message, $wire.Replace('DUETv4', 'DUETv1'), $encoding)
+  CheckFalse { Read-DuetMessage $message } 'legacy DUETv1 envelope is rejected'
+  $nul64 = [Convert]::ToBase64String([byte[]](65, 0, 66))
+  [IO.File]::WriteAllText($message, $wire.Replace($body64, $nul64), $encoding)
+  CheckFalse { Read-DuetMessage $message } 'NUL-bearing decoded bodies are rejected'
 
-  # --- 10. Executable resolution (Process + User + Machine PATH) (blocker 4) --
-  Check (($null -ne (Resolve-DuetExecutable 'psmux')) -or ($null -ne (Resolve-DuetExecutable 'tmux'))) "Resolve-DuetExecutable finds psmux/tmux by absolute path"
-  Check ($null -eq (Resolve-DuetExecutable 'definitely-not-a-real-exe-xyz-123')) "Resolve-DuetExecutable returns null for a missing exe"
-  $kimi = Resolve-DuetExecutable 'kimi'
-  if ($kimi) { Write-Host "  INFO kimi resolved -> $kimi" -ForegroundColor Cyan } else { Write-Host "  INFO kimi not resolvable on this host" -ForegroundColor Cyan }
+  Write-Host 'foundation: removed recovery and leadership surfaces'
+  foreach ($removedCommand in @(
+      'Read-DuetLeaderState', 'Write-DuetLeaderState', 'Invoke-DuetPromoteLocked',
+      'Send-DuetEnterOnly', 'Clear-DuetRefusedComposer', 'Invoke-DuetReapSession')) {
+    Check (-not (Get-Command $removedCommand -ErrorAction SilentlyContinue)) `
+      "$removedCommand is absent"
+  }
+  Check (-not (Test-Path -LiteralPath (Join-Path $plugin 'scripts\duet-promote.ps1'))) `
+    'duet-promote.ps1 is absent'
+  Check (-not (Test-Path -LiteralPath (Join-Path $plugin 'scripts\duet-deliverd.process.ps1'))) `
+    'restart reconciliation module is absent'
+  Check (Test-Path -LiteralPath (Join-Path $plugin 'scripts\duet-ready.ps1')) `
+    'authenticated short readiness helper is present'
 
-  # --- 11. Reparse-point session dir rejection (best-effort; needs junction) --
-  $realDir = Join-Path $scratch 'realsess'
-  New-Item -ItemType Directory -Path $realDir | Out-Null
-  $jname = 'junc'; $jct = Join-Path $scratch $jname
-  $madeJct = $false
-  try { New-Item -ItemType Junction -Path $jct -Target $realDir -ErrorAction Stop | Out-Null; $madeJct = $true } catch { }
-  if ($madeJct) {
-    $rcfg = @{ DUET_DIR = $jct; DUET_SESSION_ID = $jname; DUET_SESSION = $jname; DUET_STATE_ROOT = $scratch; DUET_PSMUX_SESSION = '1'; DUET_PSMUX_SERVER_PID = '10'; DUET_PSMUX_REGISTRY = '1' }
-    CheckReturnsFalse { Test-DuetLoadedSession -Config $rcfg } "reparse-point (junction) session directory is rejected"
-  } else { Skip "reparse rejection (junction creation unavailable)" }
+  Write-Host 'foundation: anchor preservation'
+  $anchor = Join-Path $workdir 'AGENTS.md'
+  $anchorText = "user-before`n<!-- DUET:BEGIN test -->`nmesh`n<!-- DUET:END -->`nuser-after`n"
+  [IO.File]::WriteAllText($anchor, $anchorText, $encoding)
+  Check ((Remove-DuetAnchorFile $anchor) -and
+      (Get-DuetFileText $anchor).Contains('user-before') -and
+      (Get-DuetFileText $anchor).Contains('user-after') -and
+      -not (Get-DuetFileText $anchor).Contains('DUET:BEGIN')) `
+    'anchor removal preserves surrounding user content'
+  $emptyAnchor = Join-Path $workdir 'CLAUDE.md'
+  [IO.File]::WriteAllText($emptyAnchor, "<!-- DUET:BEGIN test -->`nmesh`n<!-- DUET:END -->`n", $encoding)
+  Check ((Remove-DuetAnchorFile $emptyAnchor) -and (Test-Path -LiteralPath $emptyAnchor)) `
+    'anchor removal preserves an otherwise-empty instruction file'
 
-  # --- 8. Leader state / manual-leadership surface ----------------------------
-  Write-DuetLeaderState -DuetDir $scratch -Term '0' -Leader 'claude' | Out-Null
-  Check ((Read-DuetLeaderState -DuetDir $scratch) -and $global:DUET_CURRENT_LEADER -eq 'claude') "leader state round-trips"
-  Check (-not (Get-Command Select-DuetSuccessor -ErrorAction SilentlyContinue)) "automatic successor selection is absent"
-  Check (-not (Get-Command Write-DuetWatchdog -ErrorAction SilentlyContinue)) "watchdog mutation surface is absent"
+  $haveMux = $true
+  try { $null = Get-DuetPsmux } catch { $haveMux = $false }
+  if ($haveMux -and $env:TMUX_PANE) {
+    Check (Get-DuetCallerIdentity) 'live psmux caller identity resolves by process ancestry'
+  } else {
+    Skip 'live psmux caller identity (test runner is outside a pane)'
+  }
 }
 finally {
-  try { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+  Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host ""
-Write-Host ("RESULT: {0} passed, {1} failed, {2} skipped" -f $script:Pass, $script:Fail, $script:Skip) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
-if ($script:Fail) { exit 1 } else { exit 0 }
+Write-Host ''
+Write-Host ("RESULT: {0} passed, {1} failed, {2} skipped" -f
+  $script:Pass, $script:Fail, $script:Skip) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
+if ($script:Fail) { exit 1 }
+exit 0

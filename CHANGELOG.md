@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0 - 2026-07-24
+
+- Brought Windows/PowerShell + psmux to the v4 leaderless protocol: every live
+  member can send directly to any other member or broadcast to `all`, with the
+  same immutable roster, per-recipient FIFO queues, and immediate teardown as
+  the Bash/tmux path.
+- Removed the Windows leader, promotion, generation, restart-reconciliation,
+  admission, and predecessor-reaping surfaces. A failed recipient is isolated
+  as dead, blocked, or rejected without sinking the rest of the mesh.
+- Added an authenticated short readiness helper, exact pane/daemon ancestry
+  checks, isolated `CODEX_HOME`/`KIMI_CODE_HOME` propagation, and tuple-bound
+  handling of Claude's worktree trust prompt.
+- Hardened Windows delivery against concurrent lock reads, uncertain TCP
+  acknowledgments, stale psmux environments, tiled-pane boot redraws, and
+  Claude's status-row collapsed-paste rendering. An uncertain write is never
+  repeated; only a visibly owned composer can receive the Enter continuation.
+- Added seven deterministic PowerShell suites plus a real psmux smoke covering
+  Claude 2.1.218, Codex 0.144.6, and Kimi 0.29.1. Claude and Codex executed
+  readiness/model tasks; Kimi's actual TUI passed boot, direct, broadcast, and
+  peer-delivery transport while its local model remained unconfigured.
+
 ## 0.5.0 - 2026-07-23
 
 - Added the `npx duet-agents` installer (`install` / `update` / `uninstall`) so
