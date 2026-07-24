@@ -1,7 +1,9 @@
 # Windows/psmux harness adapter: Claude Code. Dot-source duet-common.ps1 first,
 # then `$h = & claude.ps1` to get the contract hashtable.
 @{
-  BootRegex = 'Claude Code'
+  # psmux's capture of Claude's styled banner can omit the visual spacer.
+  BootRegex = 'Claude\s*Code'
+  TrustRegex = 'Quick\s*safety\s*check|Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+(?:folder|directory)'
   BriefFile = 'CLAUDE.md'
   Check     = {
     if (Resolve-DuetExecutable 'claude') { return $true }

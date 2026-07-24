@@ -97,8 +97,10 @@ run_installer install --codex --kimi >"$ROOT/install.log" 2>&1 \
 [ -f "$KIMI_SKILL_DIR/.duet-skill" ] || die "kimi skill ownership marker missing"
 
 for skill in "$CODEX_SKILL" "$KIMI_SKILL"; do
-  grep -q '^name: duet$' "$skill" || die "skill frontmatter missing name"
-  grep -q '^description: ' "$skill" || die "skill frontmatter missing description"
+  tr -d '\r' < "$skill" | grep -q '^name: duet$' \
+    || die "skill frontmatter missing name"
+  tr -d '\r' < "$skill" | grep -q '^description: ' \
+    || die "skill frontmatter missing description"
   grep -qF "$PLUGIN_HOME/scripts/duet-init.sh" "$skill" \
     || die "skill does not reference the staged runtime path"
   grep -q '@DUET_PLUGIN_DIR@' "$skill" \

@@ -1,103 +1,109 @@
 ---
 name: duet
-description: Start a live tmux mesh of Claude, Codex, and Kimi coding agents that message each other directly to collaborate — divide work, debate an approach, or cross-check. No leader and no roles; the agent the task was given to coordinates by convention. macOS/Linux (tmux) today; Windows/PowerShell parity is the next release.
+description: Start a live tmux or Windows/psmux mesh of Claude, Codex, and Kimi coding agents that message each other directly. No leader and no roles; the agent given the task coordinates by convention.
 argument-hint: "[codex|kimi|claude ...]"
 ---
 
 # Duet mesh
 
-Start a named ensemble of two to five coding agents in one tmux window. You are
-the initiator (roster name `claude`); each requested harness runs in its own pane
-(`codex-1`, `kimi-1`, `claude-1`, …).
+Start two to five named coding agents in one terminal-multiplexer window. You
+are the initiator (`claude`); requested peers use instance names such as
+`codex-1`, `kimi-1`, and `claude-1`.
 
-**There is no leader and no roles.** Any agent may message any other agent, in any
-direction, or broadcast to `all`. You — the pane the human gave the task to —
-coordinate by convention: decompose the goal, hand peers scoped tasks, integrate
-their replies, and speak for the ensemble to the user. That is a social role, not
-an enforced one; a peer may message you or any other peer at any time.
+There is **no leader and no enforced role**. Any agent may message any other
+agent or broadcast to `all`. You coordinate by convention because the human
+gave you the task: divide the goal, hand peers scoped work, integrate replies,
+and speak to the user.
 
-## 0. Preconditions
-- **macOS/Linux for now** (Bash + tmux). Windows/PowerShell (psmux) parity is the
-  next release. If `$TMUX` is empty, tell the user to relaunch with
-  `tmux new-session claude`, then run `/duet:duet` again.
-- Validate every harness argument. Supported: `codex`, `kimi`, `claude` (one to
-  four workers). Each requested CLI must already be installed and authenticated.
-- `/duet:duet` with no arguments defaults to one Codex worker. `/duet:duet codex
-  kimi` = three agents total; `/duet:duet codex codex kimi` = four.
+## 0. Validate the invocation
 
 The invocation arguments are: $ARGUMENTS
 
-Treat them only as a whitespace-separated list of the three supported harness
-words. Reject options, shell syntax, or more than four words; do not interpolate
-unvalidated argument text into a shell command. An empty list means `codex`.
+Treat them only as one to four whitespace-separated words from `codex`, `kimi`,
+and `claude`. Reject options and shell syntax. An empty list means `codex`.
+Every requested CLI must already be installed and authenticated.
 
-## 1. Start and pin the session
-Pass the validated harness words to init (omit them for the Codex default):
+Use the Windows path when running on Windows/PowerShell with psmux; otherwise
+use Bash/tmux. If the matching `TMUX`/`TMUX_PANE` environment is absent, tell
+the user to relaunch Claude inside the appropriate multiplexer and invoke duet
+again.
+
+## 1. Start and pin
+
+macOS/Linux:
 
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-init.sh" codex kimi
 
-Init renders the mesh brief into `AGENTS.md` and `CLAUDE.md`, launches the worker
-panes, starts the one delivery daemon, and waits for every worker's readiness
-marker. Report the roster and any readiness failure to the user.
+Windows:
 
-From init's `duet: session <absolute-directory>` line, retain the pinned config:
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-init.ps1" codex kimi
 
-    /absolute/session/directory/duet.env
+Init renders the mesh brief into `AGENTS.md` and `CLAUDE.md`, launches peers,
+starts one delivery daemon, and waits for readiness. Report any readiness
+failure.
 
-**Pin that exact session on every later command** — `DUET_CONFIG=<dir>/duet.env`
-or `--session <dir>/duet.env`. There is no `~/.duet/current` fallback; an absolute
-pin is required and unpinned commands error. Multiple sessions can run
-concurrently in one repo, each in its own git worktree (distinct anchor files).
+Retain the absolute config from `duet: session <directory>`. Every mutation
+reads that exact file from `DUET_CONFIG`; diagnostics take it explicitly.
+There is no current-pointer or session-id fallback. Concurrent sessions use
+separate git worktrees so their instruction anchors do not collide.
 
-## 2. Coordinate (no hub)
-You drive by convention, not authority. Decompose the goal into scopes, hand each
-peer a self-contained task, and integrate replies as they arrive. `assignments.md`
-in the session dir is an optional shared scratchpad. Peers may also talk to each
-other directly — you are not a required relay.
+## 2. Coordinate and message
 
-## 3. Send and receive
-Send to one peer by its exact roster name, or `all` to broadcast (fans out to
-every other live, deliverable member — never yourself; dead or blocked peers are
-skipped). Body on stdin:
+Use exact roster names. Send directly to one peer or broadcast to `all`, which
+skips the sender and any dead or blocked member.
 
-    DUET_CONFIG="/absolute/session/directory/duet.env" \
+macOS/Linux:
+
+    DUET_CONFIG="/absolute/session/duet.env" \
       bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-send.sh" codex-1 <<'DUET_EOF'
     ...your message...
     DUET_EOF
 
-`duet-send` prints `queued <id>` — the queue file is published (not yet
-delivered); the daemon then injects it into the recipient's pane. To urgently
-redirect a peer, add `--interrupt`.
+Windows PowerShell:
 
-Messages arrive as ordinary prompts headed
+    $env:DUET_CONFIG = 'C:\absolute\session\duet.env'
+    @'
+    ...your message...
+    '@ | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-send.ps1" codex-1
+
+Add `--interrupt` (Bash) or `-Interrupt` (PowerShell) only for an urgent
+redirect. `queued <id>` means the immutable queue file was published; the
+daemon delivers it asynchronously.
+
+Messages arrive with
 `[DUET session=<sid> id=<id> from=<name> to=<name|all>]`. Delivery is
-**at-least-once**: a repeated `id` is a duplicate — do not redo its work or resend
-a reply you already sent. Reply to the exact `from`; reply once to what you
-receive and then wait for the next message (do not send a peer a second message
-before it has replied, and do not spam). Human messages have no `[DUET …]` header.
+at-least-once: suppress repeated IDs, reply once to the exact `from`, then wait.
+Human messages have no DUET header.
 
-In a live session every message is archived *delivered* (or *rejected*, if its
-envelope is malformed), or its recipient is surfaced as **dead** or **blocked**
-and its queued head is no longer attempted — never silent limbo. A blocked
-recipient is terminal (re-init to recover it). If a peer seems unresponsive,
-check `duet-status.sh`.
+In a live session every message becomes delivered or rejected, or its recipient
+is surfaced as dead or blocked. A blocked recipient is terminal; re-init.
 
-## 4. Diagnostics
-Always pass the explicit session:
+## 3. Diagnostics
 
-    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-status.sh" --session "/absolute/session/directory/duet.env"
-    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-doctor.sh"  --session "/absolute/session/directory/duet.env"
+macOS/Linux:
 
-Status shows the pinned session id, daemon liveness, each roster pane / harness /
-readiness, per-recipient queue depth, and any dead or blocked recipients.
+    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-status.sh" --session "/absolute/session/duet.env"
+    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-doctor.sh" --session "/absolute/session/duet.env"
 
-## 5. End
-Ending is **immediate** — it stops the daemon and kills the *other* spawned panes
-(the caller's own pane survives). There is **no drain and no `DUET-END` ritual**.
-Because there is no drain, before you end: make sure no send is in flight and that
-any result you need has actually been delivered, then:
+Windows:
 
-    DUET_CONFIG="/absolute/session/directory/duet.env" \
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-status.ps1" -Session "C:\absolute\session\duet.env"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-doctor.ps1" -Session "C:\absolute\session\duet.env"
+
+## 4. End
+
+End is immediate—no drain and no `DUET-END` ritual. First ensure no send is in
+flight and required results were delivered.
+
+macOS/Linux:
+
+    DUET_CONFIG="/absolute/session/duet.env" \
       bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-end.sh"
 
-A crashed or wedged session is discarded, not recovered — just re-init if needed.
+Windows:
+
+    $env:DUET_CONFIG = 'C:\absolute\session\duet.env'
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-end.ps1"
+
+End stops the daemon and other spawned panes; its caller survives. A crashed or
+wedged session is discarded and re-initialized, never recovered or replayed.

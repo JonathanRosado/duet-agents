@@ -1,9 +1,10 @@
 # duet-agents
 
 Run **Claude Code**, **Codex CLI**, and **Kimi CLI** as a visible **mesh** of
-agents in tmux. Every agent can message every other agent directly — to divide
-work, debate an approach, or cross-check one another. There is **no leader and
-no election**; the agent the task was given to coordinates by convention.
+agents in tmux (macOS/Linux) or psmux (Windows). Every agent can message every
+other agent directly — to divide work, debate an approach, or cross-check one
+another. There is **no leader and no election**; the agent the task was given
+to coordinates by convention.
 
 This repository ships an npx installer (`npx
 github:JonathanRosado/duet-agents`) that sets the mesh up for **Claude Code,
@@ -12,10 +13,8 @@ and initiate a session. Installing adds a `duet` command to each selected CLI,
 which creates the panes, a durable brief, per-recipient message queues, and one
 delivery daemon.
 
-> **Platform status (0.5.0):** the v4 mesh ships on **macOS/Linux (Bash + tmux)**.
-> Windows/PowerShell (psmux) parity is the next release — the bundled `.ps1`
-> scripts still run the previous leader-hub protocol, so "no leader" applies to
-> the Bash path only.
+> **Platform status (0.6.0):** the v4 leaderless mesh ships on
+> **macOS/Linux (Bash + tmux)** and **Windows (PowerShell + psmux)**.
 
 ```text
       ┌──────── one delivery daemon (per session) ────────┐
@@ -56,7 +55,7 @@ The transport's properties:
   peer's failure is recipient-scoped and never sinks the mesh. (The documented
   exceptions are a send racing an immediate `end`, and a discarded crashed
   session — see **Ending** and **No recovery**.)
-- **Harness-aware submission.** Bracketed paste plus cursor-row composer-marker
+- **Harness-aware submission.** Bracketed paste plus active-composer marker
   detection for Claude, Codex, and Kimi; after a paste is seen to land, the
   daemon only retries Enter and never repastes — closing the known transport
   duplication path (delivery still being at-least-once overall).
@@ -67,17 +66,15 @@ The transcript is a human-readable activity log, not proof of delivery.
 
 ## Requirements
 
-- macOS or Linux with [`tmux`](https://github.com/tmux/tmux) for the v4 mesh —
-  or Windows with [psmux](https://github.com/psmux/psmux) and PowerShell, which
-  currently runs the previous leader-hub protocol (v4 parity is the next
-  release).
-- [Node.js](https://nodejs.org) ≥ 16.7 for the `npx duet-agents` installer.
+- macOS or Linux with [`tmux`](https://github.com/tmux/tmux), or Windows with
+  [psmux](https://github.com/psmux/psmux) and Windows PowerShell.
+- [Node.js](https://nodejs.org) ≥ 16.7 for the npx installer.
 - At least one of the supported CLIs on `PATH` and already authenticated —
   [Claude Code](https://claude.com/claude-code) (`claude`),
   [Codex CLI](https://github.com/openai/codex) (`codex`), or
-  [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) (`kimi`). Any of them can
-  initiate a session; each additionally selected worker CLI must also be on
-  `PATH` and authenticated.
+  [Kimi Code CLI](https://github.com/MoonshotAI/kimi-code) (`kimi`). Any of them
+  can initiate a session; each additionally selected worker CLI must also be on
+  `PATH` and configured with a usable model.
 
 A session has one initiator plus one to four workers — a hard cap of five
 agents. The initiator is whichever CLI you run the duet command in: Claude,
@@ -144,13 +141,21 @@ could not be removed.
 
 ## Use
 
-Start any installed CLI inside tmux — the one you start becomes the initiator —
-then choose the worker roster:
+Start any installed CLI inside tmux or psmux — the one you start becomes the
+initiator — then choose the worker roster:
 
 ```bash
+# macOS/Linux
 tmux new-session claude   # then: /duet:duet
-tmux new-session codex    # then: $duet   (or pick duet from /skills)
+tmux new-session codex    # then: $duet
 tmux new-session kimi     # then: /skill:duet
+```
+
+```powershell
+# Windows
+psmux new-session -s duet -- claude  # then: /duet:duet
+psmux new-session -s duet -- codex   # then: $duet
+psmux new-session -s duet -- kimi    # then: /skill:duet
 ```
 
 ```text
@@ -197,16 +202,29 @@ bash "$DUET_PLUGIN/scripts/duet-status.sh" \
   --session "/absolute/path/to/.duet/<session>/duet.env"
 ```
 
-Here `$DUET_PLUGIN` is wherever duet is installed: `$CLAUDE_PLUGIN_ROOT` for a
-Claude Code plugin install, or `~/.duet/plugin/<version>` for an `npx
-duet-agents` install. (Agents never have to care — the session brief and
-`duet.env` always carry the absolute path that launched them.)
+```powershell
+$DuetPlugin = 'C:\absolute\path\to\duet\plugin'
+$env:DUET_CONFIG = 'C:\absolute\path\to\.duet\<session>\duet.env'
+'...message...' |
+  powershell.exe -NoProfile -ExecutionPolicy Bypass `
+    -File "$DuetPlugin\scripts\duet-send.ps1" codex-1
 
-Duet cross-checks the sender's tmux pane, `DUET_SELF` (when the pane has it),
-roster membership, and session ID, and refuses cross-session sends. **Multiple
-sessions can run concurrently in one repository — put each in its own git
-worktree** (distinct `AGENTS.md`/`CLAUDE.md` anchor files). Set `DUET_STATE_ROOT`
-before init to place session state somewhere other than the default `$HOME/.duet`.
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File "$DuetPlugin\scripts\duet-status.ps1" `
+  -Session 'C:\absolute\path\to\.duet\<session>\duet.env'
+```
+
+Here `$DUET_PLUGIN` / `$DuetPlugin` is wherever duet is installed: the
+versioned runtime under `~/.duet/plugin/<version>` for an npx install. Agents
+never have to care: the session brief and `duet.env` always carry the absolute
+path that launched them.
+
+Duet cross-checks the sender's multiplexer pane, `DUET_SELF` (when the pane has
+it), roster membership, and session ID, and refuses cross-session sends.
+**Multiple sessions can run concurrently in one repository — put each in its
+own git worktree** (distinct `AGENTS.md`/`CLAUDE.md` anchor files). Set
+`DUET_STATE_ROOT` before init to place session state somewhere other than the
+default `$HOME/.duet`.
 
 ## Model and permission overrides
 
@@ -225,13 +243,13 @@ Workers are launched as capable peers: Codex defaults to
 `-s danger-full-access -a never`, Claude workers to
 `--dangerously-skip-permissions`, and Kimi workers to `--auto`. Override with
 `DUET_CODEX_SANDBOX`, `DUET_CODEX_APPROVAL`, `DUET_CLAUDE_PERMISSION_FLAG`, and
-`DUET_KIMI_MODE_FLAG`. Restricting a worker below tmux or shared-workdir access
-can prevent delivery or collaboration.
+`DUET_KIMI_MODE_FLAG`. Restricting a worker below multiplexer or shared-workdir
+access can prevent delivery or collaboration.
 
 ## Adding another CLI harness
 
-Add `plugins/duet/harnesses/<harness>.sh` for Bash/tmux (and a matching
-`<harness>.ps1` for the pending PowerShell path). Bash adapters implement:
+Add matching `plugins/duet/harnesses/<harness>.sh` and `<harness>.ps1`
+adapters. Bash adapters implement:
 
 ```bash
 DUET_HARNESS_BOOT_RE='regex visible after a successful boot'
@@ -242,18 +260,38 @@ duet_harness_pretrust(){ ...; }                 # $1 = workdir; idempotent; supp
 duet_harness_launch_cmd(){ ...; }               # $1 = workdir, $2 = duet dir, $3 = instance name
 ```
 
-The launch command must start in the shared workdir, give the CLI access to the
-session directory, avoid approval dialogs, export `DUET_SELF`, the absolute
+PowerShell adapters return one hashtable:
+
+```powershell
+@{
+  BootRegex    = 'regex visible after a successful boot'
+  BriefFile    = 'AGENTS.md' # or CLAUDE.md
+  Check         = { ... }
+  Pretrust      = { param($Workdir) ... }
+  LaunchCommand = { param($Workdir, $DuetDir, $Name) ... }
+  # TrustRegex  = 'optional visible trust prompt'
+}
+```
+
+Both launch commands must start in the shared workdir, give the CLI access to
+the session directory, avoid approval dialogs, export `DUET_SELF`, the absolute
 `DUET_CONFIG`, and the unique `DUET_SESSION`, and auto-load the selected brief.
-Register the harness name and instance counter in init.
+Register the harness name and instance counter in both init implementations.
 
 ## Troubleshooting
 
-Diagnostics take an explicit `--session`:
+Diagnostics take an explicit session config:
 
 ```bash
 bash "$DUET_PLUGIN/scripts/duet-status.sh" --session "/absolute/path/to/.duet/<session>/duet.env"
 bash "$DUET_PLUGIN/scripts/duet-doctor.sh"  --session "/absolute/path/to/.duet/<session>/duet.env"
+```
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File "$DuetPlugin\scripts\duet-status.ps1" -Session 'C:\path\to\duet.env'
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File "$DuetPlugin\scripts\duet-doctor.ps1" -Session 'C:\path\to\duet.env'
 ```
 
 Status shows the pinned session id, daemon liveness, each roster pane / harness /
@@ -284,23 +322,22 @@ bin/duet-agents.js                    # cross-platform install/update/uninstall 
 plugins/duet/
 ├── .claude-plugin/plugin.json
 ├── briefs/
-│   ├── ENSEMBLE_BRIEF.md             # v4 mesh brief (Bash path)
-│   └── ENSEMBLE_BRIEF.win.md         # previous protocol; pending Windows parity
-├── harnesses/{claude,codex,kimi}.sh  # + matching .ps1 (previous protocol; pending parity)
+│   ├── ENSEMBLE_BRIEF.md             # v4 mesh brief (Bash/tmux)
+│   └── ENSEMBLE_BRIEF.win.md         # v4 mesh brief (PowerShell/psmux)
+├── harnesses/{claude,codex,kimi}.{sh,ps1}
 ├── skills/duet/SKILL.md              # Claude Code plugin skill (/duet:duet)
 ├── templates/
 │   ├── agents-skill.posix.md         # rendered for Codex (~/.agents/skills/duet) and Kimi ($KIMI_CODE_HOME/skills/duet)
-│   └── agents-skill.win.md           # Windows variant (.ps1, previous protocol)
+│   └── agents-skill.win.md           # Windows v4 variant (.ps1)
 ├── scripts/
-│   ├── duet-common.sh                # shared library + harness-aware verified send
-│   ├── duet-init.sh                  # roster, brief render, launch, daemon
-│   ├── duet-send.sh                  # enqueue: <name> | all
-│   ├── duet-deliverd.sh              # per-recipient FIFO delivery daemon
-│   ├── duet-end.sh                   # immediate teardown
-│   ├── duet-status.sh
-│   └── duet-doctor.sh                # (matching *.ps1 remain on the previous protocol)
+│   ├── duet-{common,init,send,deliverd,end,status,doctor}.{sh,ps1}
+│   ├── duet-deliverd.lib.ps1         # Windows recipient-scoped delivery core
+│   └── duet-ready.ps1                # authenticated short boot acknowledgment
 └── tests/
-    └── run-bash-tests.sh             # installer · m1-delivery · m2-mesh · m3-lifecycle · v4-real-smoke
+    ├── run-bash-tests.sh             # installer · delivery · mesh · lifecycle
+    ├── run-powershell-tests.ps1      # foundation · adapters · queue · daemon · transport · mesh · lifecycle
+    ├── v4-real-smoke.sh              # real Bash/tmux TUIs
+    └── real-smoke.tests.ps1          # real PowerShell/psmux TUIs
 ```
 
 ## Safety notes
@@ -308,11 +345,13 @@ plugins/duet/
 - Concurrent sessions in one repo use one git worktree each; a single worktree
   should host only one session (they share one `DUET:BEGIN`/`DUET:END` anchor).
 - Codex pretrust adds the same trusted-project entry its own confirmation UI
-  would write to `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`).
+  would write to `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). On
+  Windows, a newly launched Claude peer's visible current-folder trust prompt
+  is accepted only after its exact recorded pane tuple is revalidated.
 - Durable blocks in `AGENTS.md`/`CLAUDE.md` are delimited by `DUET:BEGIN`/
   `DUET:END`; teardown removes only those blocks.
 - End kills only panes recorded as spawned and always exempts the caller pane,
-  after checking the recorded tmux server and pane PID.
+  after checking the recorded multiplexer server and pane PID.
 
 ## License
 

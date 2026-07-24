@@ -26,11 +26,16 @@
     $sid = Split-Path -Leaf $DuetDir
     $sandbox = if ($env:DUET_CODEX_SANDBOX) { $env:DUET_CODEX_SANDBOX } else { 'danger-full-access' }
     $approval = if ($env:DUET_CODEX_APPROVAL) { $env:DUET_CODEX_APPROVAL } else { 'never' }
-    $cmd = ('Set-Location -LiteralPath {0}; $env:DUET_SELF={1}; $env:DUET_CONFIG={2}; $env:DUET_SESSION={3}; & {4} -c {5} --add-dir {6} -s {7} -a {8}' -f `
-      (ConvertTo-DuetPsLiteral $Workdir), (ConvertTo-DuetPsLiteral $Name),
-      (ConvertTo-DuetPsLiteral (Join-Path $DuetDir 'duet.env')), (ConvertTo-DuetPsLiteral $sid),
-      (ConvertTo-DuetPsLiteral $bin), (ConvertTo-DuetPsLiteral 'check_for_update_on_startup=false'),
-      (ConvertTo-DuetPsLiteral $DuetDir), (ConvertTo-DuetPsLiteral $sandbox), (ConvertTo-DuetPsLiteral $approval))
+    $homeAssignment = if ($env:CODEX_HOME) {
+      '$env:CODEX_HOME=' + (ConvertTo-DuetPsLiteral $env:CODEX_HOME) + '; '
+    } else { '' }
+    $cmd = ('Set-Location -LiteralPath {0}; {1}$env:DUET_SELF={2}; $env:DUET_CONFIG={3}; $env:DUET_SESSION={4}; & {5} -c {6} --add-dir {7} -s {8} -a {9}' -f `
+      (ConvertTo-DuetPsLiteral $Workdir), $homeAssignment,
+      (ConvertTo-DuetPsLiteral $Name), (ConvertTo-DuetPsLiteral (Join-Path $DuetDir 'duet.env')),
+      (ConvertTo-DuetPsLiteral $sid), (ConvertTo-DuetPsLiteral $bin),
+      (ConvertTo-DuetPsLiteral 'check_for_update_on_startup=false'),
+      (ConvertTo-DuetPsLiteral $DuetDir), (ConvertTo-DuetPsLiteral $sandbox),
+      (ConvertTo-DuetPsLiteral $approval))
     if ($env:DUET_CODEX_MODEL) { $cmd += ' -m ' + (ConvertTo-DuetPsLiteral $env:DUET_CODEX_MODEL) }
     if ($env:DUET_CODEX_REASONING_EFFORT) {
       $cmd += ' -c ' + (ConvertTo-DuetPsLiteral ('model_reasoning_effort=' + $env:DUET_CODEX_REASONING_EFFORT))
