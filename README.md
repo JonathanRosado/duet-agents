@@ -88,10 +88,6 @@ Codex, and Kimi are all first-class initiators.
 One command installs duet for every detected harness (or pick a subset with
 `--claude`, `--codex`, `--kimi`):
 
-```bash
-npx duet-agents@latest install
-```
-
 Straight from GitHub, without waiting for an npm publish:
 
 ```bash
