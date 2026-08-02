@@ -245,7 +245,16 @@ for required in tmux claude codex kimi git base64 awk sed grep mktemp; do
 done
 kimi doctor >/dev/null 2>&1 || die "kimi doctor failed"
 KIMI_VERSION="$(kimi --version 2>/dev/null || true)"
-case "$KIMI_VERSION" in 0.29.*) :;; *) die "expected Kimi 0.29.x, got $KIMI_VERSION";; esac
+[ -n "$KIMI_VERSION" ] || die "could not read a Kimi version"
+# The transport gate below proves collapse, submission, and composer clearing
+# directly against whatever Kimi is installed, and accepts either landing kind.
+# Pinning an exact version here proved nothing extra and made the whole suite
+# unrunnable the moment Kimi moved on (0.29.x -> 0.31.1). Report an unfamiliar
+# version instead of refusing to run.
+case "$KIMI_VERSION" in
+  0.29.*|0.30.*|0.31.*) : ;;
+  *) say "note: Kimi $KIMI_VERSION is outside the versions this suite has been exercised against" ;;
+esac
 if tmux_smoke list-sessions >/dev/null 2>&1; then
   die "isolated tmux label $TMUX_LABEL is already in use"
 fi
@@ -326,7 +335,7 @@ grep -qF "delivered m-$SESSION_ID-claude-" \
   || die "Codex reply did not traverse the live Claude delivery path"
 say "PASS live Codex -> Claude id=$CODEX_TASK_ID"
 
-say "proving Kimi 0.29 long-paste delivery"
+say "proving Kimi long-paste delivery (Kimi $KIMI_VERSION)"
 KIMI_TOKEN="M1-KIMI-COLLAPSED-$PPID-${RANDOM:-0}"
 KIMI_BODY="M1 live Kimi transport gate $KIMI_TOKEN. Do not run tools or send a duet reply; accept this prompt and wait."
 line=1
