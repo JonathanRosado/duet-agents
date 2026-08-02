@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+Fixes the delivery defect that silently stopped peers — most visibly Kimi —
+from receiving messages, and removes the policy that turned one bad observation
+into a peer's permanent removal from the session. Bash/tmux path only; the
+Windows/PowerShell path still carries the same defect class (see issues #7, #8).
+
+- The composer probe no longer reports "empty" when it simply could not read the
+  cursor row. A pane that is still streaming a response relocates its composer
+  row as output arrives, so the detector's before/capture/after cursor samples
+  can disagree; measured at roughly 1 in 100 samples against a real Kimi TUI.
+  That unreadable result was previously indistinguishable from a cleared
+  composer, so the daemon recorded messages as **delivered that were still
+  sitting unsent in the peer's composer**. The next message then found the
+  leftover placeholder, stalled 30 times, and the peer was fenced as "composer
+  wedged". Reads are now retried for a stable row and reported as indeterminate
+  when no stable row is obtained, and an indeterminate read decides nothing.
+- A cleared composer must be observed twice in a row before a message is scored
+  as submitted, so a single blank frame mid-redraw cannot fake an accepted
+  message.
+- Collapsed-placeholder ownership tolerates a redraw for every harness. It was
+  exact-match for all but Codex, so an ordinary renumber or reflow in a Claude
+  or Kimi pane read as "someone else owns the composer" and blocked that peer.
+  This is why Codex survived sessions in which Claude and Kimi were both fenced.
+- An unconfirmed submission is no longer terminal. It is resumed enter-only on
+  later passes — never repasted — and the recipient is fenced only after
+  `DUET_AMBIGUOUS_LIMIT` (default 20) unresolved resumes. Resuming re-reads the
+  composer, so the common case (the peer was merely busy) now resolves as a
+  normal delivery.
+- The landing budget is 40 clean checks instead of 20, and samples that could
+  not be read do not consume it.
+- Added `duet-resume.sh <name>`: returns a blocked but live and idle peer to the
+  session, clearing both the block and the in-process counters that produced it.
+  Delivery continues from that recipient's existing queue head. A blocked peer
+  is no longer a reason to re-initialize the session.
+- Every supported harness queues input while it is generating — verified against
+  real Kimi (0.30.0 and 0.31.1) and Codex (0.144.6) TUIs. A peer being busy is
+  therefore never a reason a message cannot be sent, and the code and briefs now
+  say so.
+
 ## 0.5.0 - 2026-07-23
 
 - Added the `npx duet-agents` installer (`install` / `update` / `uninstall`) so

@@ -77,7 +77,8 @@ if [ "$recipient" != all ] && ! duet_roster_member_alive "$recipient"; then
   exit 8
 fi
 if [ "$recipient" != all ] && [ -f "$DUET_DIR/blocked/$recipient" ]; then
-  echo "duet: recipient '$recipient' is blocked after ambiguous delivery; message was not queued." >&2
+  echo "duet: recipient '$recipient' is blocked; message was not queued." >&2
+  echo "duet: if its pane is alive and idle, run duet-resume.sh '$recipient' and send again." >&2
   exit 8
 fi
 

@@ -16,6 +16,14 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DUET_NOT_LANDED_NAMES=()
 DUET_NOT_LANDED_HEADS=()
 DUET_NOT_LANDED_COUNTS=()
+# A message whose payload was observed in the composer but whose submission was
+# not. It is resumed enter-only on later passes and is never repasted.
+DUET_LANDED_IDS=()
+DUET_LANDED_TOKENS=()
+DUET_AMBIGUOUS_COUNTS=()
+# Recipients this daemon has fenced. An operator resume clears the block file;
+# the counters that produced it live here and must be cleared with it.
+DUET_BLOCK_SEEN=()
 
 duet_deliverd_log(){
   printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" \
@@ -137,6 +145,8 @@ duet_block_recipient(){
   mkdir -p "${DUET_DIR:?}/blocked" || return 1
   duet_atomic_write "$DUET_DIR/blocked/$name" \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')	$reason" || return 1
+  duet_not_landed_slot "$name"
+  DUET_BLOCK_SEEN[$DUET_NOT_LANDED_SLOT]=1
   duet_deliverd_log "BLOCKED recipient $name: $reason"
   printf 'duet: recipient %s blocked: %s\n' "$name" "$reason" >&2
 }
@@ -154,6 +164,75 @@ duet_not_landed_slot(){
   DUET_NOT_LANDED_NAMES[$DUET_NOT_LANDED_SLOT]="$name"
   DUET_NOT_LANDED_HEADS[$DUET_NOT_LANDED_SLOT]=""
   DUET_NOT_LANDED_COUNTS[$DUET_NOT_LANDED_SLOT]=0
+  DUET_LANDED_IDS[$DUET_NOT_LANDED_SLOT]=""
+  DUET_LANDED_TOKENS[$DUET_NOT_LANDED_SLOT]=""
+  DUET_AMBIGUOUS_COUNTS[$DUET_NOT_LANDED_SLOT]=0
+  DUET_BLOCK_SEEN[$DUET_NOT_LANDED_SLOT]=""
+}
+
+# An operator cleared this recipient's block. Start it from a clean slate, or
+# the counters that fenced it would fence it again on the next observation.
+duet_resume_if_unblocked(){
+  local name="${1:?recipient required}" slot
+  duet_not_landed_slot "$name"
+  slot="$DUET_NOT_LANDED_SLOT"
+  [ -n "${DUET_BLOCK_SEEN[$slot]}" ] || return 0
+  DUET_BLOCK_SEEN[$slot]=""
+  DUET_NOT_LANDED_COUNTS[$slot]=0
+  DUET_AMBIGUOUS_COUNTS[$slot]=0
+  duet_deliverd_log "resuming recipient $name after operator unblock"
+}
+
+# Record that this exact message is in the recipient's composer. Later passes
+# resume it enter-only so an unconfirmed submission is never repasted.
+duet_landed_mark(){
+  local name="${1:?recipient required}" id="${2:?message id required}" slot
+  local token="${3:-}"
+  duet_not_landed_slot "$name"
+  slot="$DUET_NOT_LANDED_SLOT"
+  if [ "${DUET_LANDED_IDS[$slot]}" != "$id" ]; then
+    DUET_LANDED_IDS[$slot]="$id"
+    DUET_AMBIGUOUS_COUNTS[$slot]=0
+  fi
+  # Keep the last placeholder actually seen; a later pass may observe none.
+  [ -z "$token" ] || DUET_LANDED_TOKENS[$slot]="$token"
+}
+
+duet_landed_clear(){
+  local name="${1:?recipient required}" slot
+  duet_not_landed_slot "$name"
+  slot="$DUET_NOT_LANDED_SLOT"
+  DUET_LANDED_IDS[$slot]=""
+  DUET_LANDED_TOKENS[$slot]=""
+  DUET_AMBIGUOUS_COUNTS[$slot]=0
+}
+
+# True when this exact message already landed and must be resumed, not repasted.
+# Sets DUET_LANDED_TOKEN to the placeholder last observed for it, if any.
+duet_landed_pending(){
+  local name="${1:?recipient required}" id="${2:?message id required}" slot
+  duet_not_landed_slot "$name"
+  slot="$DUET_NOT_LANDED_SLOT"
+  DUET_LANDED_TOKEN=""
+  [ -n "${DUET_LANDED_IDS[$slot]}" ] && [ "${DUET_LANDED_IDS[$slot]}" = "$id" ] \
+    || return 1
+  DUET_LANDED_TOKEN="${DUET_LANDED_TOKENS[$slot]}"
+}
+
+duet_ambiguous_increment(){
+  local name="${1:?recipient required}" slot count
+  local configured="${DUET_AMBIGUOUS_LIMIT:-20}"
+  if ! duet_decimal_d10 "$configured" || [ "$DUET_DECIMAL_VALUE" = 0 ]; then
+    configured=20
+  else
+    configured="$DUET_DECIMAL_VALUE"
+  fi
+  duet_not_landed_slot "$name"
+  slot="$DUET_NOT_LANDED_SLOT"
+  count=$(( ${DUET_AMBIGUOUS_COUNTS[$slot]:-0} + 1 ))
+  DUET_AMBIGUOUS_COUNTS[$slot]="$count"
+  DUET_AMBIGUOUS_COUNT="$count"
+  DUET_AMBIGUOUS_BOUND="$configured"
 }
 
 # A different physical queue head starts a fresh consecutive-failure window.
@@ -197,6 +276,7 @@ duet_not_landed_increment(){
 duet_process_one(){
   local box="${1:?queue directory required}" exact_file="${2:-}"
   local file queue payload interrupt="" target_harness rc id_prefix id_sequence reason
+  local enter_only="" resume_token=""
   DUET_PROCESS_ATTEMPTED=""
   DUET_PROCESS_TARGET_NAME=""
   DUET_PROCESS_TARGET_PANE=""
@@ -293,8 +373,14 @@ duet_process_one(){
   payload="$(duet_build_payload)"
   [ "$DUET_MESSAGE_MODE" != INTERRUPT ] || interrupt=1
   DUET_PROCESS_ATTEMPTED=1
+  enter_only=""
+  resume_token=""
+  if duet_landed_pending "$DUET_TARGET_NAME" "$DUET_MESSAGE_ID"; then
+    enter_only=1
+    resume_token="$DUET_LANDED_TOKEN"
+  fi
   if duet_send_verified "$DUET_TARGET_PANE" "$payload" "$interrupt" \
-      "$target_harness"; then
+      "$target_harness" "$enter_only" "$resume_token"; then
     rc=0
   else
     rc=$?
@@ -311,6 +397,11 @@ duet_process_one(){
         return 1
       }
       duet_not_landed_reset "$DUET_TARGET_NAME"
+      duet_landed_clear "$DUET_TARGET_NAME"
+      if [ -n "$enter_only" ]; then
+        duet_deliverd_log \
+          "resumed $DUET_MESSAGE_ID -> $DUET_TARGET_NAME (${DUET_SEND_LANDING_OBSERVED:-unknown})"
+      fi
       duet_deliverd_log "delivered $DUET_MESSAGE_ID -> $DUET_TARGET_NAME"
       ;;
     "$DUET_SEND_NOT_LANDED")
@@ -334,12 +425,25 @@ duet_process_one(){
       }
       ;;
     "$DUET_SEND_LANDED_UNVERIFIED")
-      duet_block_recipient "$DUET_TARGET_NAME" \
-        "delivery-ambiguous after paste for $DUET_MESSAGE_ID" || {
+      # The payload is in the recipient's composer but submission was not
+      # observed. This used to end the recipient's session on the first
+      # occurrence, which bricked healthy peers whose panes were merely busy or
+      # redrawing. Resume enter-only instead: never repaste, and give up only
+      # after the ambiguity persists across a bounded number of passes.
+      duet_landed_mark "$DUET_TARGET_NAME" "$DUET_MESSAGE_ID" \
+        "${DUET_SEND_LANDING_TOKEN:-}"
+      duet_ambiguous_increment "$DUET_TARGET_NAME"
+      if [ "$DUET_AMBIGUOUS_COUNT" -ge "$DUET_AMBIGUOUS_BOUND" ]; then
+        reason="submission unconfirmed after $DUET_AMBIGUOUS_COUNT enter-only resumes for $DUET_MESSAGE_ID"
+        duet_block_recipient "$DUET_TARGET_NAME" "$reason" || {
           duet_mark_unhealthy \
             "could not fence ambiguous delivery for $DUET_MESSAGE_ID -> $DUET_TARGET_NAME"
           return 1
         }
+      else
+        duet_deliverd_log \
+          "ambiguous $DUET_MESSAGE_ID -> $DUET_TARGET_NAME; will resume enter-only ($DUET_AMBIGUOUS_COUNT/$DUET_AMBIGUOUS_BOUND)"
+      fi
       ;;
     *)
       duet_block_recipient "$DUET_TARGET_NAME" \
@@ -364,6 +468,7 @@ duet_deliverd_pass(){
   while IFS=$'\t' read -r name _; do
     [ -n "$name" ] || continue
     [ ! -f "$DUET_DIR/blocked/$name" ] || continue
+    duet_resume_if_unblocked "$name"
     box="$DUET_DIR/inbox/$name"
     [ -d "$box" ] || continue
     duet_queue_next "$box" || continue

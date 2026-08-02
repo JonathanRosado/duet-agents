@@ -78,8 +78,12 @@ before it has replied, and do not spam). Human messages have no `[DUET …]` hea
 
 In a live session every message is archived *delivered* (or *rejected*, if its
 envelope is malformed), or its recipient is surfaced as **dead** or **blocked**
-and its queued head is no longer attempted — never silent limbo. A blocked
-recipient is terminal (re-init to recover it). If a peer seems unresponsive,
+and its queued head is no longer attempted — never silent limbo. Every supported
+harness queues input while it is generating, so a peer being busy is never a
+reason a message cannot be sent; an unreadable composer is retried, not fenced.
+A **blocked** peer can be returned to the session with `duet-resume.sh <name>`
+once its pane is alive and idle; delivery continues from its queue head and a
+message that already landed is never pasted twice. If a peer seems unresponsive,
 check `duet-status.sh`.
 
 ## 4. Diagnostics
@@ -87,6 +91,11 @@ Always pass the explicit session:
 
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-status.sh" --session "/absolute/session/directory/duet.env"
     bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-doctor.sh"  --session "/absolute/session/directory/duet.env"
+
+To return a blocked peer to the session:
+
+    DUET_CONFIG="/absolute/session/directory/duet.env" \
+      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-resume.sh" kimi-1
 
 Status shows the pinned session id, daemon liveness, each roster pane / harness /
 readiness, per-recipient queue depth, and any dead or blocked recipients.

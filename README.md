@@ -260,12 +260,23 @@ Status shows the pinned session id, daemon liveness, each roster pane / harness 
 readiness, per-recipient queue depth, and any **dead** or **blocked** recipients.
 
 - **A peer stops receiving.** Check status. `dead` = its pane is gone. `blocked`
-  = the daemon has terminally fenced that recipient (a wedged composer after
-  `DUET_NOT_LANDED_LIMIT` attempts, default 30 ≈ a few seconds; an ambiguous
-  submit; or a rejected head). A blocked recipient is **not** auto-recovered —
-  the daemon skips it and new sends to it are refused; **re-init** if you need
-  it. The exact reason is in `<session>/blocked/<name>` and `deliverd.log`;
-  malformed messages are archived under `<session>/rejected/` with a reason.
+  = the daemon has fenced that recipient (a wedged composer after
+  `DUET_NOT_LANDED_LIMIT` attempts, default 30 ≈ a few seconds; or a submission
+  it could not confirm after `DUET_AMBIGUOUS_LIMIT` enter-only resumes, default
+  20). A peer being *busy* never causes this: every supported harness queues
+  input while it is generating, and a composer that cannot be read is retried
+  rather than fenced. While blocked, the daemon skips it and new sends are
+  refused; once its pane is alive and idle, return it to the session with:
+
+  ```bash
+  DUET_CONFIG="/absolute/path/to/.duet/<session>/duet.env" \
+    bash "$DUET_PLUGIN/scripts/duet-resume.sh" kimi-1
+  ```
+
+  Delivery continues from that recipient's existing queue head, and a message
+  that already landed is resumed rather than pasted again. The exact reason is in
+  `<session>/blocked/<name>` and `deliverd.log`; malformed messages are archived
+  under `<session>/rejected/` with a reason.
 - **`queued` but nothing arrives.** The daemon may be down (`duet-status`) —
   sends are refused when it is not alive. Do not blindly re-send: a landed paste
   may already be accepted.
@@ -296,6 +307,7 @@ plugins/duet/
 │   ├── duet-init.sh                  # roster, brief render, launch, daemon
 │   ├── duet-send.sh                  # enqueue: <name> | all
 │   ├── duet-deliverd.sh              # per-recipient FIFO delivery daemon
+│   ├── duet-resume.sh                # return a blocked recipient to the session
 │   ├── duet-end.sh                   # immediate teardown
 │   ├── duet-status.sh
 │   └── duet-doctor.sh                # (matching *.ps1 remain on the previous protocol)

@@ -210,7 +210,8 @@ printf 'TEST runtime contains no authority/election surface\n'
 if rg -n -i 'leader|generation|promot|handoff|watchdog|failover' \
     "$SCRIPTS/duet-common.sh" "$SCRIPTS/duet-send.sh" \
     "$SCRIPTS/duet-deliverd.sh" "$SCRIPTS/duet-init.sh" \
-    "$SCRIPTS/duet-status.sh" "$SCRIPTS/duet-doctor.sh" >/dev/null; then
+    "$SCRIPTS/duet-status.sh" "$SCRIPTS/duet-doctor.sh" \
+    "$SCRIPTS/duet-resume.sh" >/dev/null; then
   fail "authority/election vocabulary remains in Bash runtime"
 fi
 [ ! -e "$SCRIPTS/duet-promote.sh" ] \

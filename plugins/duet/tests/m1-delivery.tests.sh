@@ -50,6 +50,11 @@ run_case(){
   CURRENT_CASE="$label"
   before="$FAILURES"
   printf 'TEST %s\n' "$label"
+  # A renamed or deleted case must fail the suite rather than silently pass.
+  if ! declare -F "$fn" >/dev/null; then
+    fail "test function '$fn' is not defined"
+    return
+  fi
   "$fn"
   if [ "$FAILURES" -eq "$before" ]; then
     printf '  PASS\n'
@@ -252,11 +257,21 @@ run_verified_scenario(){
     _duet_alive(){ return 0; }
     duet_tmux_server_matches(){ return 0; }
     _duet_tail_strip(){ printf ''; }
-    _duet_paste_marker(){
+    _duet_sample_marker(){
+      DUET_PASTE_MARKER=""
+      DUET_PASTE_MARKER_INDETERMINATE=""
       case "$(cat "$state")" in
-        existing) printf 'kimipaste174lines' ;;
-        landed) [ "$mode" != no-evidence ] && printf 'kimipaste174lines' ;;
+        existing) DUET_PASTE_MARKER='kimipaste174lines' ;;
+        landed)
+          [ "$mode" = no-evidence ] || DUET_PASTE_MARKER='kimipaste174lines'
+          ;;
+        submitted)
+          # A pane whose composer row cannot be read stably. It is NOT an
+          # empty composer, and must never be scored as an accepted message.
+          [ "$mode" != unreadable ] || DUET_PASTE_MARKER_INDETERMINATE=1
+          ;;
       esac
+      return 0
     }
     _duet_tmux(){
       local count
@@ -295,6 +310,71 @@ run_verified_scenario(){
   )
 }
 
+# A resumed send must recognize the placeholder it left behind. Pressing Enter
+# at a composer somebody else filled would submit their input, not ours.
+test_resume_refuses_foreign_composer(){
+  local enters="$TEST_ROOT/foreign.enters"
+  printf '0\n' > "$enters"
+  if ! (
+    local rc=0
+    _duet_alive(){ return 0; }
+    duet_tmux_server_matches(){ return 0; }
+    _duet_tail_strip(){ printf ''; }
+    _duet_sample_marker(){
+      DUET_PASTE_MARKER='kimipaste999lines'
+      DUET_PASTE_MARKER_INDETERMINATE=""
+      return 0
+    }
+    _duet_tmux(){
+      local count
+      if [ "$1" = send-keys ] && [ "${4:-}" = Enter ]; then
+        count="$(cat "$enters")"
+        printf '%s\n' "$((count + 1))" > "$enters"
+      fi
+    }
+    DUET_SUBMIT_ATTEMPTS=1
+    DUET_SUBMIT_CHECKS=1
+    DUET_SUBMIT_SLEEP=0
+    duet_send_verified_production '%1' 'payload with unique tail 8675309' '' kimi 1 \
+      'kimipaste174lines' >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq "$DUET_SEND_LANDED_UNVERIFIED" ]
+  ); then
+    fail "resume accepted a composer holding an unrelated placeholder"
+  fi
+  assert_eq 0 "$(cat "$enters")" "resume pressed Enter at a foreign composer"
+
+  # The same resume against our own placeholder, grown by a second marker,
+  # is ours and must proceed.
+  printf '0\n' > "$enters"
+  if ! (
+    local rc=0
+    _duet_alive(){ return 0; }
+    duet_tmux_server_matches(){ return 0; }
+    _duet_tail_strip(){ printf ''; }
+    _duet_sample_marker(){
+      DUET_PASTE_MARKER='kimipaste174linespaste175lines'
+      DUET_PASTE_MARKER_INDETERMINATE=""
+      return 0
+    }
+    _duet_tmux(){
+      local count
+      if [ "$1" = send-keys ] && [ "${4:-}" = Enter ]; then
+        count="$(cat "$enters")"
+        printf '%s\n' "$((count + 1))" > "$enters"
+      fi
+    }
+    DUET_SUBMIT_ATTEMPTS=1
+    DUET_SUBMIT_CHECKS=1
+    DUET_SUBMIT_SLEEP=0
+    duet_send_verified_production '%1' 'payload with unique tail 8675309' '' kimi 1 \
+      'kimipaste174lines' >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq "$DUET_SEND_LANDED_UNVERIFIED" ]
+  ); then
+    fail "resume did not recognize its own grown placeholder"
+  fi
+  assert_eq 1 "$(cat "$enters")" "resume did not retry Enter on its own payload"
+}
+
 test_verified_send_fsm(){
   run_verified_scenario success
   assert_eq 0 "$(cat "$TEST_ROOT/verifier-success.rc")" "verified success"
@@ -321,6 +401,17 @@ test_verified_send_fsm(){
     "$(cat "$TEST_ROOT/verifier-preexisting.rc")" "pre-existing marker stalls"
   assert_eq 0 "$(cat "$TEST_ROOT/verifier-preexisting.pastes")" \
     "pre-existing marker blocks paste"
+
+  # A composer that cannot be read stably used to be indistinguishable from a
+  # cleared one, so a busy peer's unsent message was recorded as delivered.
+  run_verified_scenario unreadable
+  assert_eq "$DUET_SEND_LANDED_UNVERIFIED" \
+    "$(cat "$TEST_ROOT/verifier-unreadable.rc")" \
+    "unreadable composer was scored as an accepted message"
+  assert_eq 1 "$(cat "$TEST_ROOT/verifier-unreadable.pastes")" \
+    "unreadable composer caused a repaste"
+  assert_eq 3 "$(cat "$TEST_ROOT/verifier-unreadable.enters")" \
+    "Enter was not retried while the composer stayed unreadable"
 }
 
 # shellcheck disable=SC1090
@@ -329,15 +420,27 @@ test_verified_send_fsm(){
 FAKE_LOG=""
 FAKE_STALLED_TARGET=""
 FAKE_AMBIGUOUS_TARGET=""
+# Empty means "ambiguous forever"; a count means that many ambiguous outcomes
+# and then success, which is how a resumed send is exercised.
+FAKE_AMBIGUOUS_REMAINING=""
 
+# The fourth column records the enter-only flag, so a test can prove a resumed
+# message was never repasted.
 duet_send_verified(){
-  printf '%s\t%s\t%s\n' "$DUET_MESSAGE_ID" "$DUET_TARGET_NAME" \
-    "$DUET_MESSAGE_BODY" >> "$FAKE_LOG"
+  printf '%s\t%s\t%s\t%s\n' "$DUET_MESSAGE_ID" "$DUET_TARGET_NAME" \
+    "$DUET_MESSAGE_BODY" "${5:-}" >> "$FAKE_LOG"
   if [ "$DUET_TARGET_NAME" = "$FAKE_STALLED_TARGET" ]; then
     return "$DUET_SEND_NOT_LANDED"
   fi
-  if [ "$DUET_TARGET_NAME" = "$FAKE_AMBIGUOUS_TARGET" ]; then
-    return "$DUET_SEND_LANDED_UNVERIFIED"
+  if [ -n "$FAKE_AMBIGUOUS_TARGET" ] \
+      && [ "$DUET_TARGET_NAME" = "$FAKE_AMBIGUOUS_TARGET" ]; then
+    if [ -z "$FAKE_AMBIGUOUS_REMAINING" ]; then
+      return "$DUET_SEND_LANDED_UNVERIFIED"
+    fi
+    if [ "$FAKE_AMBIGUOUS_REMAINING" -gt 0 ]; then
+      FAKE_AMBIGUOUS_REMAINING=$((FAKE_AMBIGUOUS_REMAINING - 1))
+      return "$DUET_SEND_LANDED_UNVERIFIED"
+    fi
   fi
   return 0
 }
@@ -482,25 +585,114 @@ test_persistent_stall_blocks_only_recipient(){
     "healthy peer did not advance during every stalled pass"
 }
 
-test_ambiguous_delivery_blocks_only_recipient(){
+# A single ambiguous observation used to end a recipient's session outright.
+# A pane that is merely busy or redrawing produces exactly that observation, so
+# ambiguity must be resumed enter-only and fenced only when it persists.
+test_ambiguous_delivery_resumes_before_blocking(){
+  local kimi_box
+  local DUET_AMBIGUOUS_LIMIT=3
   create_state ambiguous
   FAKE_LOG="$DUET_DIR/fake.log"
   : > "$FAKE_LOG"
   FAKE_STALLED_TARGET=""
   FAKE_AMBIGUOUS_TARGET=kimi-1
+  FAKE_AMBIGUOUS_REMAINING=""
   enqueue_one kimi-1 ambiguous-body
   enqueue_one codex-1 healthy-peer-body
+  kimi_box="$DUET_DIR/inbox/kimi-1"
+
   duet_deliverd_pass || fail "ambiguous pass stopped the whole daemon"
   assert_no_file "$DUET_DIR/.unhealthy" "no session-wide unhealthy marker"
-  assert_file "$DUET_DIR/blocked/kimi-1" "recipient block marker"
-  assert_contains "$DUET_DIR/blocked/kimi-1" delivery-ambiguous \
-    "loud ambiguity reason"
-  assert_eq 1 "$(active_count "$DUET_DIR/inbox/kimi-1")" \
-    "ambiguous message remains for diagnosis"
+  assert_no_file "$DUET_DIR/blocked/kimi-1" \
+    "one ambiguous observation blocked a live recipient"
+  assert_eq 1 "$(active_count "$kimi_box")" \
+    "ambiguous message left its queue before submission was confirmed"
   assert_eq 1 "$(delivered_count "$DUET_DIR/inbox/codex-1")" \
     "healthy peer advances despite another recipient's ambiguity"
-  assert_no_file "$DUET_DIR/inbox/kimi-1/N-0000000001.msg.phase" \
-    "no ENTER_ONLY recovery state"
+
+  duet_deliverd_pass || fail "ambiguous resume pass failed"
+  assert_no_file "$DUET_DIR/blocked/kimi-1" "second ambiguity blocked too early"
+  assert_contains "$DUET_DIR/deliverd.log" "will resume enter-only" \
+    "resume was not surfaced in the daemon log"
+  if ! awk -F '\t' '$2 == "kimi-1" { n++; if (n > 1 && $4 != "1") bad = 1 }
+      END { exit bad }' "$FAKE_LOG"; then
+    fail "ambiguous head was repasted instead of resumed enter-only"
+  fi
+
+  duet_deliverd_pass || fail "ambiguous terminal pass failed"
+  assert_file "$DUET_DIR/blocked/kimi-1" "unresolved ambiguity was never fenced"
+  assert_contains "$DUET_DIR/blocked/kimi-1" \
+    "submission unconfirmed after 3 enter-only resumes" \
+    "bounded ambiguity reason"
+  assert_eq 1 "$(active_count "$kimi_box")" \
+    "blocked recipient did not retain its head for diagnosis"
+}
+
+# The ordinary case the old policy could never reach: the pane was simply busy,
+# the next pass observes the composer clear, and the message is delivered.
+test_ambiguous_delivery_resolves_on_resume(){
+  local kimi_box
+  create_state ambiguous-resolves
+  FAKE_LOG="$DUET_DIR/fake.log"
+  : > "$FAKE_LOG"
+  FAKE_STALLED_TARGET=""
+  FAKE_AMBIGUOUS_TARGET=kimi-1
+  FAKE_AMBIGUOUS_REMAINING=2
+  enqueue_one kimi-1 slow-peer-body
+  kimi_box="$DUET_DIR/inbox/kimi-1"
+
+  duet_deliverd_pass || fail "resolve pass 1 failed"
+  duet_deliverd_pass || fail "resolve pass 2 failed"
+  assert_no_file "$DUET_DIR/blocked/kimi-1" "busy peer was blocked while resuming"
+  duet_deliverd_pass || fail "resolve pass 3 failed"
+
+  assert_eq 1 "$(delivered_count "$kimi_box")" \
+    "resumed message was never delivered"
+  assert_eq 0 "$(active_count "$kimi_box")" "delivered message stayed queued"
+  assert_no_file "$DUET_DIR/blocked/kimi-1" "resolved ambiguity still blocked"
+  assert_eq 3 "$(awk -F '\t' '$2 == "kimi-1"' "$FAKE_LOG" | wc -l | tr -d ' ')" \
+    "unexpected number of delivery attempts"
+  if ! awk -F '\t' '$2 == "kimi-1" { n++; if (n == 1 && $4 != "") bad = 1 }
+      END { exit bad }' "$FAKE_LOG"; then
+    fail "first attempt should paste, not resume"
+  fi
+}
+
+# Clearing the block file must also clear the in-process counters that produced
+# it, or a resumed recipient is re-fenced by its own history.
+test_operator_resume_restores_delivery(){
+  local kimi_box
+  local DUET_AMBIGUOUS_LIMIT=1
+  create_state operator-resume
+  FAKE_LOG="$DUET_DIR/fake.log"
+  : > "$FAKE_LOG"
+  FAKE_STALLED_TARGET=""
+  FAKE_AMBIGUOUS_TARGET=kimi-1
+  FAKE_AMBIGUOUS_REMAINING=""
+  enqueue_one kimi-1 blocked-body
+  kimi_box="$DUET_DIR/inbox/kimi-1"
+
+  duet_deliverd_pass || fail "resume setup pass failed"
+  assert_file "$DUET_DIR/blocked/kimi-1" "recipient was not fenced at bound 1"
+
+  duet_deliverd_pass || fail "pass over a blocked recipient failed"
+  assert_eq 0 "$(delivered_count "$kimi_box")" \
+    "blocked recipient was still delivered to"
+
+  # The operator clears the block; the peer is healthy again.
+  rm -f "$DUET_DIR/blocked/kimi-1"
+  FAKE_AMBIGUOUS_TARGET=""
+  duet_deliverd_pass || fail "post-resume pass failed"
+  assert_eq 1 "$(delivered_count "$kimi_box")" \
+    "resumed recipient did not receive its queued head"
+  assert_contains "$DUET_DIR/deliverd.log" \
+    "resuming recipient kimi-1 after operator unblock" \
+    "resume was not surfaced in the daemon log"
+  # The head had already landed, so the resumed attempt must not repaste.
+  if ! awk -F '\t' '$2 == "kimi-1" { n++; if (n > 1 && $4 != "1") bad = 1 }
+      END { exit bad }' "$FAKE_LOG"; then
+    fail "resumed head was repasted instead of continued enter-only"
+  fi
 }
 
 test_concurrent_fifo_and_dedupe(){
@@ -578,12 +770,18 @@ run_case 'paste markers are exact and cursor-row scoped' \
   test_marker_cursor_scope
 run_case 'verified send pastes once and retries Enter only' \
   test_verified_send_fsm
+run_case 'resume only submits a composer it recognizes' \
+  test_resume_refuses_foreign_composer
 run_case 'failed head preserves FIFO without blocking peers' \
   test_failed_head_is_fair_and_fifo
 run_case 'persistent pre-landing stall blocks only its recipient' \
   test_persistent_stall_blocks_only_recipient
-run_case 'post-paste ambiguity blocks only its recipient' \
-  test_ambiguous_delivery_blocks_only_recipient
+run_case 'post-paste ambiguity resumes enter-only before blocking' \
+  test_ambiguous_delivery_resumes_before_blocking
+run_case 'post-paste ambiguity resolves when the peer was only busy' \
+  test_ambiguous_delivery_resolves_on_resume
+run_case 'operator resume restores delivery to a fenced recipient' \
+  test_operator_resume_restores_delivery
 run_case '50 concurrent enqueues preserve FIFO and dedupe IDs' \
   test_concurrent_fifo_and_dedupe
 

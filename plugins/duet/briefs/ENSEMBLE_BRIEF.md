@@ -42,11 +42,14 @@ have no `[DUET …]` header; handle them normally.
 ## No recovery
 A crashed or wedged session is discarded, not repaired. If a peer's pane dies,
 the mesh keeps running for everyone else and only that peer stops receiving.
-There is no leadership takeover and no promotion. A message that cannot yet land
-is retried a bounded number of times; if the recipient's composer stays occupied
-it is marked *blocked* and its queue stops (re-init to recover that peer). There
-is **no crash-recovery or restart replay** — nothing is re-injected across a
-daemon restart.
+There is no leadership takeover and no promotion. Every supported harness queues
+input while it is generating, so a busy peer is still a deliverable peer. A
+message that cannot yet land is retried a bounded number of times, and one whose
+submission cannot be confirmed is resumed without ever being pasted twice. Only
+if that stays unresolved is the recipient marked *blocked* and its queue stopped;
+`duet-resume.sh <name>` returns a live, idle peer to the session. There is **no
+crash-recovery or restart replay** — nothing is re-injected across a daemon
+restart.
 
 ## Ending
 Ending is **immediate**: it stops the daemon and kills the *other* recorded

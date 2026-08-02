@@ -82,8 +82,9 @@ duet_doctor_main(){
     fi
     [ ! -f "$DUET_DIR/dead/$name" ] \
       || duet_doctor_issue "recipient $name was marked dead"
-    [ ! -f "$DUET_DIR/blocked/$name" ] \
-      || duet_doctor_issue "recipient $name is blocked after ambiguous delivery"
+    if [ -f "$DUET_DIR/blocked/$name" ]; then
+      duet_doctor_issue "recipient $name is blocked; if its pane is alive and idle, clear it with duet-resume.sh $name"
+    fi
   done < "$DUET_DIR/roster.tsv"
 
   if [ "$DUET_DOCTOR_ISSUES" -eq 0 ]; then
