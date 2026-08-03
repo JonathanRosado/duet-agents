@@ -534,11 +534,6 @@ function main() {
     if (succeeded.claude) console.log(`  Claude Code:  ${shell} claude   then  /duet:duet`);
     if (succeeded.codex) console.log(`  Codex:        ${shell} codex    then  $duet (or pick duet from /skills)`);
     if (succeeded.kimi) console.log(`  Kimi:         ${shell} kimi     then  /skill:duet`);
-    if (IS_WIN) {
-      console.log('');
-      console.log('The Windows runtime currently speaks the previous leader-hub protocol');
-      console.log('(v4 mesh parity is pending).');
-    }
   }
   process.exit(failures.length ? 1 : 0);
 }

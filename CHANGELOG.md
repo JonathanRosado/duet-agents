@@ -4,8 +4,11 @@
 
 Fixes the delivery defect that silently stopped peers — most visibly Kimi —
 from receiving messages, and removes the policy that turned one bad observation
-into a peer's permanent removal from the session. Bash/tmux path only; the
-Windows/PowerShell path still carries the same defect class (see issues #7, #8).
+into a peer's permanent removal from the session. Bash/tmux path only. The
+Windows/PowerShell v4 path shipped in 0.6.0 already separates an unreadable
+composer from an empty one, but still fences a recipient on its first ambiguous
+observation, still tolerates a redrawn placeholder for Codex alone, and has no
+resume path; tracked in #9.
 
 - The composer probe no longer reports "empty" when it simply could not read the
   cursor row. A pane that is still streaming a response relocates its composer
@@ -39,6 +42,27 @@ Windows/PowerShell path still carries the same defect class (see issues #7, #8).
   real Kimi (0.30.0 and 0.31.1) and Codex (0.144.6) TUIs. A peer being busy is
   therefore never a reason a message cannot be sent, and the code and briefs now
   say so.
+
+## 0.6.0 - 2026-07-24
+
+- Brought Windows/PowerShell + psmux to the v4 leaderless protocol: every live
+  member can send directly to any other member or broadcast to `all`, with the
+  same immutable roster, per-recipient FIFO queues, and immediate teardown as
+  the Bash/tmux path.
+- Removed the Windows leader, promotion, generation, restart-reconciliation,
+  admission, and predecessor-reaping surfaces. A failed recipient is isolated
+  as dead, blocked, or rejected without sinking the rest of the mesh.
+- Added an authenticated short readiness helper, exact pane/daemon ancestry
+  checks, isolated `CODEX_HOME`/`KIMI_CODE_HOME` propagation, and tuple-bound
+  handling of Claude's worktree trust prompt.
+- Hardened Windows delivery against concurrent lock reads, uncertain TCP
+  acknowledgments, stale psmux environments, tiled-pane boot redraws, and
+  Claude's status-row collapsed-paste rendering. An uncertain write is never
+  repeated; only a visibly owned composer can receive the Enter continuation.
+- Added seven deterministic PowerShell suites plus a real psmux smoke covering
+  Claude 2.1.218, Codex 0.144.6, and Kimi 0.29.1. Claude and Codex executed
+  readiness/model tasks; Kimi's actual TUI passed boot, direct, broadcast, and
+  peer-delivery transport while its local model remained unconfigured.
 
 ## 0.5.0 - 2026-07-23
 

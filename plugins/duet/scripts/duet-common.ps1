@@ -1,9 +1,9 @@
 Set-StrictMode -Version 2.0
 
 # =============================================================================
-# Shared helpers for the Windows/psmux n-agent ensemble path (v0.3 parity).
+# Shared helpers for the Windows/psmux duet v4 mesh.
 #
-# Faithful re-implementation of duet-common.sh on Windows-native primitives:
+# Windows-native equivalents of the Bash/tmux v4 primitives:
 #   * atomic publish  -> MoveFileEx(REPLACE_EXISTING|WRITE_THROUGH) + owner-first
 #                        claim-dir publish for locks (no ownerless generation).
 #   * advisory locks  -> directory-mkdir + Directory.Move publish + stale reaper.
@@ -25,12 +25,11 @@ Set-StrictMode -Version 2.0
 #     never by the ambient/active pane.
 # =============================================================================
 
-# --- duet_send_verified result codes (mirror duet-common.sh) -----------------
+# --- Send-DuetVerified result codes (mirror duet-common.sh) ------------------
 $global:DUET_SEND_OK                = 0
 $global:DUET_SEND_DEAD              = 20
 $global:DUET_SEND_NOT_LANDED        = 21
 $global:DUET_SEND_LANDED_UNVERIFIED = 22
-$global:DUET_SEND_COMPOSER_REFUSED  = 23
 
 # Send-DuetControlPaste outcomes. The distinction is load-bearing for A2: only a
 # PREWRITE_FAILED proves no bytes were sent (safe to repaste); an uncertain wire
@@ -57,18 +56,14 @@ $global:DUET_MOVEFILE_WRITE_THROUGH    = 0x8
 foreach ($__duetGlobal in @(
     'DUET_PSMUX_PATH', 'DUET_PSMUX_RC', 'DUET_PSMUX_SESSION', 'DUET_PSMUX_SERVER_PID',
     'DUET_PSMUX_REGISTRY', 'DUET_PSMUX_NAMESPACE',
-    'DUET_RESOLVED_CONFIG', 'DUET_CURRENT_TERM', 'DUET_CURRENT_LEADER',
+    'DUET_RESOLVED_CONFIG',
     'DUET_CALLER_SESSION', 'DUET_CALLER_PANE', 'DUET_CALLER_PANE_PID',
     'DUET_CALLER_SERVER_PID', 'DUET_CALLER_NAME', 'DUET_CALLER_NAMESPACE', 'DUET_CALLER_REGISTRY',
     'DUET_ENQUEUED_ID', 'DUET_ENQUEUED_FILE',
-    'DUET_SEQUENCE', 'DUET_MESSAGE_ORDER_ALLOC', 'DUET_DEDUPE_FILE', 'DUET_DEDUPE_ID',
-    'DUET_MESSAGE_ID', 'DUET_MESSAGE_SESSION', 'DUET_MESSAGE_ORDER', 'DUET_MESSAGE_MODE',
-    'DUET_MESSAGE_SENDER', 'DUET_MESSAGE_RECIPIENT', 'DUET_MESSAGE_TERM', 'DUET_MESSAGE_ORIGIN',
-    'DUET_MESSAGE_LEADER_AT_SEND', 'DUET_MESSAGE_DEDUPE', 'DUET_MESSAGE_HANDOFF_MODE',
-    'DUET_MESSAGE_PRIOR_TERM', 'DUET_MESSAGE_PRIOR_LEADER', 'DUET_MESSAGE_BODY',
-    'DUET_UNCERTAIN_FILE', 'DUET_PROMOTED_LEADER', 'DUET_PROMOTED_TERM', 'DUET_PROMOTION_FILE',
-    'DUET_PROMOTION_BLOCKER', 'DUET_DIR', 'DUET_STATE_ROOT', 'WORKDIR', 'PLUGIN_DIR',
-    'DUET_SESSION', 'DUET_SESSION_ID', 'DUET_WORKDIR_KEY', 'DUET_INITIATOR', 'DUET_INITIATOR_PANE',
+    'DUET_SEQUENCE', 'DUET_MESSAGE_ID', 'DUET_MESSAGE_SESSION', 'DUET_MESSAGE_MODE',
+    'DUET_MESSAGE_SENDER', 'DUET_MESSAGE_RECIPIENT', 'DUET_MESSAGE_BODY',
+    'DUET_DIR', 'DUET_STATE_ROOT', 'WORKDIR', 'PLUGIN_DIR',
+    'DUET_SESSION', 'DUET_SESSION_ID', 'DUET_INITIATOR', 'DUET_INITIATOR_PANE',
     'DUET_CONFIG_VALID', 'DUET_ROSTER_VALID')) {
   if (-not (Test-Path -LiteralPath ("Variable:global:" + $__duetGlobal))) {
     Set-Variable -Name $__duetGlobal -Scope Global -Value $null
@@ -167,8 +162,8 @@ function Resolve-DuetExecutable {
 function Get-DuetUnixTime { return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 function Get-DuetUtcStamp { return (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
 
-# Persisted protocol counters and terms are bounded to the D10 space used by
-# message ordering. Regex-only validation is insufficient: casting a hostile
+# Persisted protocol counters are bounded to the D10 space used by queue
+# sequencing. Regex-only validation is insufficient: casting a hostile
 # 1000-digit string throws before a caller can fail closed.
 function ConvertFrom-DuetDecimal {
   param([AllowEmptyString()][AllowNull()][string]$Value, [uint64]$Maximum = 9999999999, [switch]$AllowLeadingZeros)
@@ -221,8 +216,8 @@ function New-DuetTempFile {
 }
 
 function Move-DuetFileAtomic {
-  # NTFS-atomic replace-or-create rename (MUTABLE state only: leader, counters,
-  # sidecars). Refuses when the destination is a directory.
+  # NTFS-atomic replace-or-create rename for mutable counters and markers.
+  # Refuses when the destination is a directory.
   param([Parameter(Mandatory = $true)][string]$Source, [Parameter(Mandatory = $true)][string]$Destination)
   if (Test-Path -LiteralPath $Destination -PathType Container) { return $false }
   $flags = $global:DUET_MOVEFILE_REPLACE_EXISTING -bor $global:DUET_MOVEFILE_WRITE_THROUGH
@@ -275,8 +270,13 @@ Set-Alias -Name Write-DuetAtomic -Value Write-DuetAtomicMultiline -Scope Global
 
 function Get-DuetFileText {
   param([string]$Path)
-  if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-  try { return [System.IO.File]::ReadAllText($Path) } catch { return $null }
+  if (-not $Path) { return $null }
+  # A lock directory can be renamed or removed between namespace probes. On
+  # Windows, Test-Path may surface that race as UnauthorizedAccessException.
+  try {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf -ErrorAction Stop)) { return $null }
+    return [System.IO.File]::ReadAllText($Path)
+  } catch { return $null }
 }
 
 function Get-DuetFirstLineValue {
@@ -423,7 +423,7 @@ function Import-DuetConfig {
   if ($null -eq $text) { return $cfg }
   $known = @('DUET_DIR', 'DUET_STATE_ROOT', 'WORKDIR', 'PLUGIN_DIR', 'DUET_PSMUX_SESSION',
     'DUET_PSMUX_SERVER_PID', 'DUET_PSMUX_REGISTRY', 'DUET_PSMUX_NAMESPACE', 'DUET_SESSION',
-    'DUET_SESSION_ID', 'DUET_WORKDIR_KEY', 'DUET_INITIATOR', 'DUET_INITIATOR_PANE')
+    'DUET_SESSION_ID', 'DUET_INITIATOR', 'DUET_INITIATOR_PANE')
   foreach ($line in ($text -split "`r?`n")) {
     if (-not $line -or $line.StartsWith('#')) { continue }
     $idx = $line.IndexOf('=')
@@ -441,7 +441,7 @@ function Import-DuetConfig {
 function Set-DuetSessionVariables {
   param([hashtable]$Config)
   foreach ($k in @('DUET_DIR', 'DUET_STATE_ROOT', 'WORKDIR', 'PLUGIN_DIR', 'DUET_SESSION',
-      'DUET_SESSION_ID', 'DUET_WORKDIR_KEY', 'DUET_INITIATOR', 'DUET_INITIATOR_PANE',
+      'DUET_SESSION_ID', 'DUET_INITIATOR', 'DUET_INITIATOR_PANE',
       'DUET_PSMUX_SESSION', 'DUET_PSMUX_SERVER_PID', 'DUET_PSMUX_REGISTRY', 'DUET_PSMUX_NAMESPACE')) {
     $val = if ($Config.ContainsKey($k)) { $Config[$k] } else { $null }
     Set-Variable -Name $k -Value $val -Scope Global
@@ -488,62 +488,53 @@ function Test-DuetPathUnderRoot {
   return ($Child + $sep).StartsWith($Root + $sep, [StringComparison]::OrdinalIgnoreCase)
 }
 
-# Resolve an explicitly pinned session to its canonical duet.env path.
+# Resolve exactly one absolute config. Mutation commands require DUET_CONFIG;
+# read-only diagnostics pass that same absolute path explicitly. Session IDs,
+# directories, current pointers, and newest-session scans are never routing
+# inputs.
 function Resolve-DuetConfig {
-  param([string]$SessionArg, [int]$AllowCurrent = 0)
+  param([string]$SessionArg, [int]$RequireEnvironment = 1)
   $global:DUET_RESOLVED_CONFIG = ''
-  $stateRoot = $env:DUET_STATE_ROOT
   $envCfg = $env:DUET_CONFIG
-  $cfg = ''
-  $requireUnderRoot = $false
-  $resolveRoot = {
-    param($r)
-    if ($r) { return $r }
-    if ($env:USERPROFILE) { return (Join-Path $env:USERPROFILE '.duet') }
-    if ($HOME) { return (Join-Path $HOME '.duet') }
-    return $null
-  }
-
-  if ($SessionArg) {
-    if ($SessionArg -match '[\\/]duet\.env$' -or $SessionArg -eq 'duet.env') { $cfg = $SessionArg }
-    elseif ($SessionArg -match '[\\/]') { $cfg = (Join-Path ($SessionArg.TrimEnd('\', '/')) 'duet.env') }
-    else {
-      $stateRoot = & $resolveRoot $stateRoot
-      if (-not $stateRoot) { Write-DuetError "duet: USERPROFILE or DUET_STATE_ROOT is required to resolve session id '$SessionArg'."; return $false }
-      $cfg = Join-Path (Join-Path $stateRoot $SessionArg) 'duet.env'; $requireUnderRoot = $true
+  if ($RequireEnvironment -eq 1) {
+    if (-not $envCfg) {
+      Write-DuetError 'duet: DUET_CONFIG must name an absolute duet.env.'
+      return $false
+    }
+    $cfg = $envCfg
+    if ($SessionArg) {
+      $argCanonical = Get-DuetCanonicalPath $SessionArg
+      $envCanonical = Get-DuetCanonicalPath $envCfg
+      if (-not $argCanonical -or -not $envCanonical -or
+          -not $argCanonical.Equals($envCanonical, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-DuetError 'duet: -Session disagrees with DUET_CONFIG.'
+        return $false
+      }
     }
   }
-  elseif ($envCfg) { $cfg = $envCfg }
-  elseif ($env:DUET_SESSION) {
-    $stateRoot = & $resolveRoot $stateRoot
-    if (-not $stateRoot) { Write-DuetError "duet: USERPROFILE or DUET_STATE_ROOT is required to resolve DUET_SESSION."; return $false }
-    $cfg = Join-Path (Join-Path $stateRoot $env:DUET_SESSION) 'duet.env'; $requireUnderRoot = $true
-  }
-  elseif ($AllowCurrent -eq 1) {
-    $stateRoot = & $resolveRoot $stateRoot
-    if (-not $stateRoot) { Write-DuetError "duet: USERPROFILE or DUET_STATE_ROOT is required to resolve current."; return $false }
-    # `current` is a validated pointer FILE (Windows symlinks require privilege).
-    $target = Get-DuetFileText (Join-Path $stateRoot 'current.session')
-    if (-not $target) { Write-DuetError "duet: no current session pointer under $stateRoot"; return $false }
-    $cfg = Join-Path ($target.Trim()) 'duet.env'; $requireUnderRoot = $true
-  }
-  else { Write-DuetError "duet: no session was pinned; set DUET_CONFIG/DUET_SESSION or pass --session."; return $false }
-
-  if (-not (Test-Path -LiteralPath $cfg -PathType Leaf)) { Write-DuetError "duet: pinned session config does not exist: $cfg"; return $false }
-  $cfgDir = Get-DuetCanonicalPath (Split-Path -Parent $cfg)
-  if (-not $cfgDir) { Write-DuetError "duet: cannot canonicalize $cfg"; return $false }
-
-  if ($SessionArg -and $envCfg) {
-    $envDir = Get-DuetCanonicalPath (Split-Path -Parent $envCfg)
-    if (-not $envDir -or $envDir -ne $cfgDir) { Write-DuetError "duet: DUET_CONFIG and --session do not resolve to the same session."; return $false }
-  }
-  if ($requireUnderRoot) {
-    $canonicalRoot = Get-DuetCanonicalPath $stateRoot
-    if (-not $canonicalRoot -or -not (Test-DuetPathUnderRoot $cfgDir $canonicalRoot)) {
-      Write-DuetError "duet: resolved session escapes DUET_STATE_ROOT; refusing it."; return $false
+  else {
+    if (-not $SessionArg) {
+      Write-DuetError 'duet: an explicit absolute -Session duet.env is required.'
+      return $false
     }
+    $cfg = $SessionArg
   }
-  $global:DUET_RESOLVED_CONFIG = Join-Path $cfgDir 'duet.env'
+
+  if (-not [IO.Path]::IsPathRooted($cfg) -or (Split-Path -Leaf $cfg) -ne 'duet.env') {
+    Write-DuetError 'duet: config must be an absolute path ending in duet.env.'
+    return $false
+  }
+  if (-not (Test-Path -LiteralPath $cfg -PathType Leaf) -or (Test-DuetReparsePoint $cfg)) {
+    Write-DuetError "duet: pinned session config does not exist or is a reparse point: $cfg"
+    return $false
+  }
+  try { $full = [IO.Path]::GetFullPath($cfg) } catch { return $false }
+  $canonical = Get-DuetCanonicalPath $cfg
+  if (-not $canonical -or -not $full.Equals($canonical, [StringComparison]::OrdinalIgnoreCase)) {
+    Write-DuetError "duet: config path must be canonical: $canonical"
+    return $false
+  }
+  $global:DUET_RESOLVED_CONFIG = $canonical
   return $true
 }
 
@@ -552,19 +543,18 @@ function Test-DuetLoadedSession {
   if ($null -eq $Config) { Write-DuetError "duet: session config is unavailable."; return $false }
   foreach ($required in @('DUET_DIR', 'DUET_STATE_ROOT', 'WORKDIR', 'PLUGIN_DIR', 'DUET_PSMUX_SESSION',
       'DUET_PSMUX_SERVER_PID', 'DUET_PSMUX_REGISTRY', 'DUET_PSMUX_NAMESPACE', 'DUET_SESSION',
-      'DUET_SESSION_ID', 'DUET_WORKDIR_KEY', 'DUET_INITIATOR', 'DUET_INITIATOR_PANE')) {
+      'DUET_SESSION_ID', 'DUET_INITIATOR', 'DUET_INITIATOR_PANE')) {
     if (-not $Config.ContainsKey($required)) { Write-DuetError "duet: config missing $required."; return $false }
   }
   $dir = $Config['DUET_DIR']; $sid = $Config['DUET_SESSION_ID']; $root = $Config['DUET_STATE_ROOT']
   if (-not $dir -or -not $sid -or -not $root) { Write-DuetError "duet: config missing DUET_DIR, DUET_STATE_ROOT, or DUET_SESSION_ID."; return $false }
   if ($sid -notmatch '^[A-Za-z0-9_-]+$') { Write-DuetError "duet: session id contains unsupported characters."; return $false }
-  $workdir = $Config['WORKDIR']; $pluginDir = $Config['PLUGIN_DIR']; $workdirKey = $Config['DUET_WORKDIR_KEY']
+  $workdir = $Config['WORKDIR']; $pluginDir = $Config['PLUGIN_DIR']
   $initiator = $Config['DUET_INITIATOR']; $initiatorPane = $Config['DUET_INITIATOR_PANE']
-  if (-not $workdir -or -not $pluginDir -or -not $workdirKey -or -not $initiator -or -not $initiatorPane) {
+  if (-not $workdir -or -not $pluginDir -or -not $initiator -or -not $initiatorPane) {
     Write-DuetError "duet: config is missing a workdir, plugin, ownership, or initiator fence."; return $false
   }
   if (($dir + $root + $workdir + $pluginDir) -match "[\t\r\n]") { Write-DuetError "duet: session paths with TAB, CR, or LF are unsupported."; return $false }
-  if ($workdirKey -notmatch '^[0-9a-f]{64}$') { Write-DuetError "duet: DUET_WORKDIR_KEY is invalid."; return $false }
   if ($initiator -notmatch '^[A-Za-z0-9_-]+$' -or $initiatorPane -notmatch '^%[0-9]+$') { Write-DuetError "duet: initiator identity is invalid."; return $false }
   # Reject reparse points on the RAW supplied paths BEFORE canonicalizing --
   # Resolve-Path silently resolves through a junction/symlink and hides it.
@@ -581,7 +571,6 @@ function Test-DuetLoadedSession {
   if (-not (Test-DuetPathUnderRoot $canonDir $canonRoot)) { Write-DuetError "duet: session directory escapes its declared DUET_STATE_ROOT."; return $false }
   if ((Split-Path -Leaf $canonDir) -ne $sid) { Write-DuetError "duet: session id '$sid' does not match directory."; return $false }
   if ($Config['DUET_SESSION'] -ne $sid) { Write-DuetError "duet: config DUET_SESSION does not match DUET_SESSION_ID."; return $false }
-  if ((Get-DuetWorkdirKey $canonWorkdir) -ne $workdirKey) { Write-DuetError "duet: canonical workdir does not match DUET_WORKDIR_KEY."; return $false }
   # The psmux session name + backend server pid are the socket/server fence
   # analogue and are MANDATORY before any routing.
   $psmuxSession = $Config['DUET_PSMUX_SESSION']; $psmuxPid = $Config['DUET_PSMUX_SERVER_PID']
@@ -820,7 +809,9 @@ function Import-DuetRoster {
     if ($names.ContainsKey($name) -or $panes.ContainsKey($pane) -or $pids.ContainsKey($panePid) -or $ranks.ContainsKey($rank)) { return @() }
     $names[$name] = $true; $panes[$pane] = $true; $pids[$panePid] = $true; $ranks[$rank] = $true
     $rows += [pscustomobject]@{ name = $name; harness = $harness; pane_id = $pane; pane_pid = $panePid; rank = $rank; spawned = $spawned }
+    if ($rows.Count -gt 5) { return @() }
   }
+  if ($rows.Count -lt 1) { return @() }
   $global:DUET_ROSTER_VALID = $true
   return $rows
 }
@@ -828,18 +819,8 @@ function Get-DuetRosterRow { param([string]$RosterPath, [string]$Name); $rows = 
 function Get-DuetRosterRowByPane { param([string]$RosterPath, [string]$PaneId); $rows = @(Import-DuetRoster $RosterPath); if (-not $global:DUET_ROSTER_VALID) { return $null }; foreach ($r in $rows) { if ($r.pane_id -eq $PaneId) { return $r } }; return $null }
 function Test-DuetRosterHasName { param([string]$RosterPath, [string]$Name); return ($null -ne (Get-DuetRosterRow -RosterPath $RosterPath -Name $Name)) }
 
-function Resolve-DuetRosterName {
-  param([string]$RosterPath, [string]$Token)
-  $rows = @(Import-DuetRoster $RosterPath)
-  if (-not $global:DUET_ROSTER_VALID) { return $null }
-  if (@($rows | Where-Object { $_.name -eq $Token }).Count -eq 1) { return $Token }
-  $matches = @($rows | Where-Object { $_.harness -eq $Token })
-  if ($matches.Count -eq 1) { return $matches[0].name }
-  return $null
-}
-
 # Tri-state resolution keeps confirmed-dead members distinct from identity
-# uncertainty. Leadership changes remain an explicit operator action.
+# uncertainty.
 function Get-DuetMemberResolution {
   param([string]$RosterPath, [string]$Name)
   $row = Get-DuetRosterRow -RosterPath $RosterPath -Name $Name
@@ -855,84 +836,6 @@ function Test-DuetMemberAlive {
 }
 
 # =============================================================================
-# Leadership state and explicit handoff fence
-# =============================================================================
-
-function Read-DuetLeaderState {
-  param([string]$DuetDir)
-  $file = Join-Path $DuetDir 'leader'
-  $term = Get-DuetFirstLineValue -Path $file -Key 'term'
-  $leader = Get-DuetFirstLineValue -Path $file -Key 'leader'
-  if ($null -eq (ConvertFrom-DuetDecimal $term) -or $leader -notmatch '^[A-Za-z0-9_-]+$') { Write-DuetError "duet: invalid leadership state in $file"; return $false }
-  $global:DUET_CURRENT_TERM = $term
-  $global:DUET_CURRENT_LEADER = $leader
-  return $true
-}
-
-function Write-DuetLeaderState {
-  param([string]$DuetDir, [string]$Term, [string]$Leader)
-  if ($null -eq (ConvertFrom-DuetDecimal $Term)) { return $false }
-  if ($Leader -notmatch '^[A-Za-z0-9_-]+$') { return $false }
-  return (Write-DuetAtomicMultiline -Path (Join-Path $DuetDir 'leader') -Value ("term`t{0}`nleader`t{1}" -f $Term, $Leader))
-}
-
-# A message stuck in an uncertain delivery phase means a verifier may have placed
-# bytes in a live composer. Leadership must not advance while any such obligation
-# exists. CLEAR_RETRY is itself a durable "a marker may still own a pane" fence.
-function Test-DuetUncertainDelivery {
-  param([string]$DuetDir)
-  $global:DUET_UNCERTAIN_FILE = ''
-  $inbox = Join-Path $DuetDir 'inbox'
-  if (-not (Test-Path -LiteralPath $inbox)) { return $false }
-  foreach ($box in @(Get-ChildItem -LiteralPath $inbox -Directory -ErrorAction SilentlyContinue)) {
-    foreach ($file in @(Get-ChildItem -LiteralPath $box.FullName -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[NI]-[0-9]+\.msg$' })) {
-      $phase = Get-DuetFileText ($file.FullName + '.phase'); if ($phase) { $phase = $phase.Trim() }
-      if (@('ENTER_ONLY', 'INFLIGHT', 'CLEAR_RETRY') -notcontains $phase) { continue }
-      if ($phase -eq 'CLEAR_RETRY') { $global:DUET_UNCERTAIN_FILE = $file.FullName; return $true }
-      $bn = Get-DuetFileText ($file.FullName + '.target_name'); if ($bn) { $bn = $bn.Trim() }
-      $bp = Get-DuetFileText ($file.FullName + '.target_pane'); if ($bp) { $bp = $bp.Trim() }
-      $bt = Get-DuetFileText ($file.FullName + '.target_term'); if ($bt) { $bt = $bt.Trim() }
-      if ($bn -and $bp -and $bt) { $global:DUET_UNCERTAIN_FILE = $file.FullName; return $true }
-    }
-  }
-  return $false
-}
-
-# Complete one explicit operator handoff. The immutable MANUAL handoff message
-# is the crash journal; the daemon may finish this exact tuple but never chooses
-# a target. Return codes mirror duet_promote_locked.
-function Invoke-DuetPromoteLocked {
-  param([string]$DuetDir, [string]$SessionId, [string]$RosterPath,
-    [string]$ExpectedTerm, [string]$ExpectedLeader, [string]$Reason = 'MANUAL', [string]$Requested = '')
-  $global:DUET_PROMOTED_LEADER = ''; $global:DUET_PROMOTED_TERM = ''
-  $global:DUET_PROMOTION_FILE = ''; $global:DUET_PROMOTION_BLOCKER = ''
-  $lock = Join-Path $DuetDir '.promotion.lock'
-  if (-not (Lock-DuetAcquire $lock 200)) { return 1 }
-  try {
-    if (-not (Read-DuetLeaderState -DuetDir $DuetDir) -or $global:DUET_CURRENT_TERM -ne $ExpectedTerm -or $global:DUET_CURRENT_LEADER -ne $ExpectedLeader) { return 2 }
-    if (-not $Requested -or -not (Test-DuetRosterHasName -RosterPath $RosterPath -Name $Requested) `
-        -or $Requested -eq $ExpectedLeader -or -not (Test-DuetMemberAlive -RosterPath $RosterPath -Name $Requested)) { return 3 }
-    if (Test-DuetUncertainDelivery -DuetDir $DuetDir) { $global:DUET_PROMOTION_BLOCKER = $global:DUET_UNCERTAIN_FILE; return 11 }
-    $expectedTermNumber = ConvertFrom-DuetDecimal $ExpectedTerm
-    if ($null -eq $expectedTermNumber -or $expectedTermNumber -ge 9999999999) { return 1 }
-    $newTerm = [string]([uint64]$expectedTermNumber + 1)
-    $safeReason = ($Reason -replace "[\t\r\n]", ' ')
-    $body = ("Leadership handoff for session {0}: you are leader for generation {1}. Prior leader: {2}. Operator record: {3}. Read assignments.md, preserve disjoint scopes, and notify or reassign workers as needed." -f $SessionId, $newTerm, $ExpectedLeader, $safeReason)
-    if (-not (Add-DuetMessage -DuetDir $DuetDir -SessionId $SessionId -Queue 'promotions' -Sender 'duet-system' -Recipient $Requested -Term $newTerm -Mode 'NORMAL' -Origin 'SYSTEM' -LeaderAtSend $Requested -Body $body -Dedupe "promotion-$newTerm" -HandoffMode 'MANUAL' -PriorTerm $ExpectedTerm -PriorLeader $ExpectedLeader -Internal)) { return 1 }
-    $promoFile = $global:DUET_ENQUEUED_FILE
-    if (-not (Read-DuetMessage $promoFile) -or $global:DUET_MESSAGE_SESSION -ne $SessionId -or $global:DUET_MESSAGE_TERM -ne $newTerm `
-        -or $global:DUET_MESSAGE_RECIPIENT -ne $Requested -or $global:DUET_MESSAGE_ORIGIN -ne 'SYSTEM' `
-        -or $global:DUET_MESSAGE_DEDUPE -ne "promotion-$newTerm" -or $global:DUET_MESSAGE_HANDOFF_MODE -ne 'MANUAL' `
-        -or $global:DUET_MESSAGE_PRIOR_TERM -ne $ExpectedTerm -or $global:DUET_MESSAGE_PRIOR_LEADER -ne $ExpectedLeader) { return 4 }
-    if (-not (Write-DuetAtomicMultiline -Path ($promoFile + '.promotion_term') -Value $newTerm) `
-        -or -not (Write-DuetLeaderState -DuetDir $DuetDir -Term $newTerm -Leader $Requested)) { return 1 }
-    $global:DUET_PROMOTION_FILE = $promoFile; $global:DUET_PROMOTED_LEADER = $Requested; $global:DUET_PROMOTED_TERM = $newTerm
-    return 0
-  }
-  finally { Unlock-DuetRelease $lock | Out-Null }
-}
-
-# =============================================================================
 # Anchors (durable brief blocks in AGENTS.md / CLAUDE.md)
 # =============================================================================
 
@@ -943,11 +846,7 @@ function Remove-DuetAnchorFile {
   if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Write-DuetError "duet: refusing to edit symlinked instruction file: $Path"; return $false }
   try { $text = [System.IO.File]::ReadAllText($Path) } catch { return $false }
   $updated = [regex]::Replace($text, "(?s)\r?\n?<!-- DUET:BEGIN.*?<!-- DUET:END -->\r?\n?", "")
-  if ($updated.Trim().Length -eq 0) {
-    try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { return $false }
-    return (-not (Test-Path -LiteralPath $Path))
-  }
-  elseif ($updated -ne $text) { return (Write-DuetAtomicMultiline -Path $Path -Value $updated.TrimEnd("`r", "`n")) }
+  if ($updated -ne $text) { return (Write-DuetAtomicMultiline -Path $Path -Value $updated.TrimEnd("`r", "`n")) }
   return $true
 }
 function Remove-DuetSessionAnchors {
@@ -1086,56 +985,14 @@ function Stop-DuetSpawnedPanes {
   return $allOk
 }
 
-# Reap a previous session on re-init: close admission (.ended), stop the daemon,
-# strip anchors, kill spawned panes. Never kills the caller pane. Panes are
-# resolved with the PREDECESSOR'S psmux identity (its session/namespace/pid),
-# not the caller's.
-function Invoke-DuetReapSession {
-  param([string]$DuetDir, [string]$Workdir, [string]$ExemptPaneId, [string]$ExemptPanePid,
-    [string]$PsmuxSession, [string]$PsmuxServerPid, [string]$PsmuxNamespace, [string]$PsmuxRegistry)
-  if (-not $DuetDir) { return $true }
-  if (Test-Path -LiteralPath $DuetDir) {
-    $adm = Join-Path $DuetDir '.admission.lock'
-    if (-not (Lock-DuetAcquire $adm 200)) { return $false }
-    $admissionWriteOk = $false; $admissionUnlockOk = $false
-    try { Write-DuetUtf8NoBom -Path (Join-Path $DuetDir '.ended') -Value ''; $admissionWriteOk = $true }
-    catch { $admissionWriteOk = $false }
-    finally { $admissionUnlockOk = Unlock-DuetRelease $adm }
-    if (-not $admissionWriteOk -or -not $admissionUnlockOk) { return $false }
-  }
-  if (-not (Stop-DuetDaemon -DuetDir $DuetDir -Loops 20)) { return $false }
-  $daemonLock = Join-Path $DuetDir '.daemon.lock'
-  if (-not (Lock-DuetAcquire $daemonLock 22)) { return $false }
-  $daemonUnlockOk = $false
-  try { Remove-Item -LiteralPath (Join-Path $DuetDir 'daemon.pid') -Force -ErrorAction SilentlyContinue }
-  finally { $daemonUnlockOk = Unlock-DuetRelease $daemonLock }
-  if (-not $daemonUnlockOk) { return $false }
-  $roster = Join-Path $DuetDir 'roster.tsv'
-  if (-not (Test-Path -LiteralPath $roster -PathType Leaf)) { return $false }
-  if (Test-Path -LiteralPath $roster) {
-    $savedS = $global:DUET_PSMUX_SESSION; $savedSp = $global:DUET_PSMUX_SERVER_PID
-    $savedNs = $global:DUET_PSMUX_NAMESPACE; $savedReg = $global:DUET_PSMUX_REGISTRY
-    if ($PsmuxSession) {
-      $global:DUET_PSMUX_SESSION = $PsmuxSession; $global:DUET_PSMUX_SERVER_PID = $PsmuxServerPid
-      $global:DUET_PSMUX_NAMESPACE = $PsmuxNamespace; $global:DUET_PSMUX_REGISTRY = $PsmuxRegistry
-    }
-    try { if (-not (Stop-DuetSpawnedPanes -RosterPath $roster -ExemptPaneId $ExemptPaneId -ExemptPanePid $ExemptPanePid)) { return $false } }
-    finally {
-      $global:DUET_PSMUX_SESSION = $savedS; $global:DUET_PSMUX_SERVER_PID = $savedSp
-      $global:DUET_PSMUX_NAMESPACE = $savedNs; $global:DUET_PSMUX_REGISTRY = $savedReg
-    }
-  }
-  return (Remove-DuetSessionAnchors -Workdir $Workdir)
-}
-
 # =============================================================================
-# Atomic message queue  (A1 / A2)  -- byte-identical DUETv1 wire format
+# Atomic message queue -- byte-identical DUETv4 wire format
 # =============================================================================
 
 function Get-DuetNextSequence {
   param([string]$Box)
   $counter = Join-Path $Box '.counter'
-  $subs = @('', 'delivered', 'failed', 'quarantine', 'superseded')
+  $subs = @('', 'delivered', 'rejected')
   [uint64]$current = 0
   $txt = Get-DuetFileText $counter
   if ($null -ne $txt) {
@@ -1172,47 +1029,14 @@ function Get-DuetNextSequence {
   return $true
 }
 
-function Get-DuetNextMessageOrder {
-  param([string]$DuetDir)
-  $file = Join-Path $DuetDir '.message-order'
-  [uint64]$current = 0
-  $txt = Get-DuetFileText $file
-  if ($null -ne $txt) {
-    $t = $txt.Trim()
-    $parsed = ConvertFrom-DuetDecimal $t
-    if ($null -eq $parsed) { Write-DuetError "duet: corrupt global message order"; return $false }
-    $current = $parsed
-  }
-  if ($current -ge 9999999999) { Write-DuetError "duet: message-order exhausted (D10 cap)"; return $false }
-  [uint64]$next = $current + 1
-  if (-not (Write-DuetAtomicMultiline -Path $file -Value "$next")) { return $false }
-  $global:DUET_MESSAGE_ORDER_ALLOC = '{0:D10}' -f $next
-  return $true
-}
-
-function Find-DuetDedupeMessage {
-  param([string]$Box, [string]$Key)
-  $global:DUET_DEDUPE_FILE = ''; $global:DUET_DEDUPE_ID = ''
-  if (-not $Key) { return $false }
-  foreach ($sub in @('', 'delivered', 'failed', 'quarantine', 'superseded')) {
-    $d = if ($sub) { Join-Path $Box $sub } else { $Box }
-    if (-not (Test-Path -LiteralPath $d)) { continue }
-    foreach ($f in @(Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[NI]-.*\.msg$' })) {
-      if ((Get-DuetFirstLineValue -Path $f.FullName -Key 'dedupe') -eq $Key) {
-        $id = Get-DuetFirstLineValue -Path $f.FullName -Key 'id'
-        if ($id) { $global:DUET_DEDUPE_FILE = $f.FullName; $global:DUET_DEDUPE_ID = $id; return $true }
-      }
-    }
-  }
-  return $false
-}
-
 function Add-DuetTranscript {
-  param([string]$DuetDir, [string]$Id, [string]$Sender, [string]$Recipient, [string]$Term, [string]$Mode, [AllowEmptyString()][string]$Body)
+  param([string]$DuetDir, [string]$Id, [string]$Sender, [string]$Recipient,
+    [string]$Mode, [AllowEmptyString()][string]$Body)
   $lock = Join-Path $DuetDir '.transcript.lock'
   if (-not (Lock-DuetAcquire $lock 1200)) { return $false }
   try {
-    $entry = "`n----- {0}  id={1}  term={2}  {3} -> {4}  ({5}) -----`n{6}`n" -f (Get-DuetUtcStamp), $Id, $Term, $Sender, $Recipient, $Mode, $Body
+    $entry = "`n----- {0}  id={1}  {2} -> {3}  ({4}) -----`n{5}`n" -f
+      (Get-DuetUtcStamp), $Id, $Sender, $Recipient, $Mode, $Body
     Write-DuetUtf8NoBom -Path (Join-Path $DuetDir 'transcript.md') -Value $entry -Append
     return $true
   } finally { Unlock-DuetRelease $lock | Out-Null }
@@ -1224,85 +1048,77 @@ function Add-DuetTranscript {
 function Add-DuetMessage {
   param(
     [string]$DuetDir, [string]$SessionId, [string]$Queue, [string]$Sender,
-    [string]$Recipient, [string]$Term, [string]$Mode, [string]$Origin,
-    [string]$LeaderAtSend, [AllowEmptyString()][string]$Body, [string]$Dedupe = '',
-    [string]$HandoffMode = '', [string]$PriorTerm = '', [string]$PriorLeader = '',
-    [switch]$Internal
+    [string]$Recipient, [string]$Mode, [AllowEmptyString()][string]$Body
   )
   $global:DUET_ENQUEUED_ID = ''; $global:DUET_ENQUEUED_FILE = ''
   if ($Queue -notmatch '^[A-Za-z0-9_-]+$') { Write-DuetError "duet: invalid queue '$Queue'"; return $false }
   $prefix = switch ($Mode) { 'NORMAL' { 'N' } 'INTERRUPT' { 'I' } default { '' } }
   if (-not $prefix) { Write-DuetError "duet: invalid mode '$Mode'"; return $false }
-  if (@('LEADER', 'WORKER', 'SYSTEM') -notcontains $Origin) { Write-DuetError "duet: invalid origin role '$Origin'"; return $false }
-  if ($null -eq (ConvertFrom-DuetDecimal $Term)) { Write-DuetError "duet: invalid term '$Term'"; return $false }
-  foreach ($meta in @($SessionId, $Sender, $Recipient, $LeaderAtSend)) {
+  foreach ($meta in @($SessionId, $Sender, $Recipient)) {
     if (-not $meta -or $meta -notmatch '^[A-Za-z0-9_-]+$') { Write-DuetError "duet: invalid message metadata"; return $false }
   }
-  if ($Dedupe -match "[\t\r\n]") { Write-DuetError "duet: invalid dedupe key"; return $false }
-  if ($HandoffMode -or $PriorTerm -or $PriorLeader) {
-    $priorNumber = ConvertFrom-DuetDecimal $PriorTerm
-    $termNumber = ConvertFrom-DuetDecimal $Term
-    if ($HandoffMode -ne 'MANUAL' -or $Queue -ne 'promotions' -or $Sender -ne 'duet-system' `
-        -or $Origin -ne 'SYSTEM' -or $LeaderAtSend -ne $Recipient -or $Dedupe -ne "promotion-$Term" `
-        -or $PriorLeader -notmatch '^[A-Za-z0-9_-]+$' -or $PriorLeader -eq $Recipient `
-        -or $null -eq $priorNumber -or $null -eq $termNumber -or $priorNumber -ge 9999999999 `
-        -or $termNumber -ne ($priorNumber + 1)) {
-      Write-DuetError "duet: invalid manual handoff envelope"
-      return $false
-    }
+  $rosterPath = Join-Path $DuetDir 'roster.tsv'
+  if (-not (Test-DuetRosterHasName -RosterPath $rosterPath -Name $Queue)) {
+    Write-DuetError "duet: queue '$Queue' is not a roster member"; return $false
   }
-
+  if ($Recipient -ne 'all' -and $Recipient -ne $Queue) {
+    Write-DuetError "duet: recipient '$Recipient' does not match queue '$Queue'"; return $false
+  }
+  if (-not (Test-DuetRosterHasName -RosterPath $rosterPath -Name $Sender)) {
+    Write-DuetError "duet: sender '$Sender' is not a roster member"; return $false
+  }
+  if ($Body.Contains([char]0)) { Write-DuetError 'duet: message body contains NUL'; return $false }
+  if (Test-Path -LiteralPath (Join-Path $DuetDir '.ended')) {
+    Write-DuetError 'duet: session has ended; message was not queued.'; return $false
+  }
+  if (-not (Test-DuetDaemonAlive -DuetDir $DuetDir -SessionId $SessionId)) {
+    Write-DuetError 'duet: delivery daemon is not alive; message was not queued.'; return $false
+  }
   $box = Join-Path (Join-Path $DuetDir 'inbox') $Queue
-  foreach ($sub in @('delivered', 'failed', 'quarantine', 'superseded')) {
+  foreach ($sub in @('delivered', 'rejected')) {
     $d = Join-Path $box $sub
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
   }
-  $admission = Join-Path $DuetDir '.admission.lock'
-  if (-not (Lock-DuetAcquire $admission 1200)) { return $false }
+  $attempts = 1200
+  $configuredAttempts = 0
+  if ($env:DUET_ENQUEUE_LOCK_ATTEMPTS -and
+      [int]::TryParse($env:DUET_ENQUEUE_LOCK_ATTEMPTS, [ref]$configuredAttempts) -and
+      $configuredAttempts -gt 0) {
+    $attempts = $configuredAttempts
+  }
+  $enqLock = Join-Path $box '.enqueue.lock'
+  if (-not (Lock-DuetAcquire $enqLock $attempts)) { return $false }
   try {
-    if (Test-Path -LiteralPath (Join-Path $DuetDir '.ended')) { Write-DuetError "duet: session is ended; message was not queued."; return $false }
-    if ((Test-Path -LiteralPath (Join-Path $DuetDir '.draining')) -and -not ($Internal -and $Origin -eq 'SYSTEM')) {
-      Write-DuetError "duet: session is draining; message was not queued."; return $false
+    if (Test-Path -LiteralPath (Join-Path $DuetDir '.ended')) {
+      Write-DuetError 'duet: session has ended; message was not queued.'; return $false
     }
-    if (-not (Test-DuetDaemonAlive -DuetDir $DuetDir -SessionId $SessionId)) {
-      Write-DuetError "duet: delivery daemon is not alive; message was not queued."; return $false
+    if (-not (Get-DuetNextSequence -Box $box)) { return $false }
+    $seq = $global:DUET_SEQUENCE
+    $id = "m-$SessionId-$Queue-$seq"
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Body))
+    $content = "DUETv4`n" +
+      "id`t$id`n" +
+      "session`t$SessionId`n" +
+      "mode`t$Mode`n" +
+      "sender`t$Sender`n" +
+      "recipient`t$Recipient`n" +
+      "body64`t$encoded`n"
+    $tmp = New-DuetTempFile -Dir $box
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tmp, $content, $enc)
+    if (-not (Add-DuetTranscript -DuetDir $DuetDir -Id $id -Sender $Sender -Recipient $Recipient -Mode $Mode -Body $Body)) {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+      return $false
     }
-    $enqLock = Join-Path $box '.enqueue.lock'
-    if (-not (Lock-DuetAcquire $enqLock 1200)) { return $false }
-    try {
-      if ($Dedupe -and (Find-DuetDedupeMessage -Box $box -Key $Dedupe)) {
-        $global:DUET_ENQUEUED_ID = $global:DUET_DEDUPE_ID
-        $global:DUET_ENQUEUED_FILE = $global:DUET_DEDUPE_FILE
-        return $true
-      }
-      if (-not (Get-DuetNextMessageOrder -DuetDir $DuetDir)) { return $false }
-      if (-not (Get-DuetNextSequence -Box $box)) { return $false }
-      $seq = $global:DUET_SEQUENCE
-      $id = "m-$SessionId-$Queue-$seq"
-      $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Body))
-      $handoffContent = ''
-      if ($HandoffMode) {
-        $handoffContent = "handoff_mode`t$HandoffMode`n" + "prior_term`t$PriorTerm`n" + "prior_leader`t$PriorLeader`n"
-      }
-      $content = "DUETv1`n" +
-      "id`t$id`n" + "session`t$SessionId`n" + "order`t$($global:DUET_MESSAGE_ORDER_ALLOC)`n" +
-      "mode`t$Mode`n" + "sender`t$Sender`n" + "recipient`t$Recipient`n" + "term`t$Term`n" +
-      "origin`t$Origin`n" + "leader_at_send`t$LeaderAtSend`n" + "dedupe`t$Dedupe`n" + $handoffContent + "body64`t$encoded`n"
-      $tmp = New-DuetTempFile -Dir $box
-      $enc = New-Object System.Text.UTF8Encoding($false)
-      [System.IO.File]::WriteAllText($tmp, $content, $enc)
-      if (-not (Add-DuetTranscript -DuetDir $DuetDir -Id $id -Sender $Sender -Recipient $Recipient -Term $Term -Mode $Mode -Body $Body)) {
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; return $false
-      }
-      $final = Join-Path $box "$prefix-$seq.msg"
-      if (-not (Move-DuetFileNoReplace -Source $tmp -Destination $final)) {
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; return $false
-      }
-      $global:DUET_ENQUEUED_ID = $id
-      $global:DUET_ENQUEUED_FILE = $final
-      return $true
-    } finally { Unlock-DuetRelease $enqLock | Out-Null }
-  } finally { Unlock-DuetRelease $admission | Out-Null }
+    $final = Join-Path $box "$prefix-$seq.msg"
+    if (-not (Move-DuetFileNoReplace -Source $tmp -Destination $final)) {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+      return $false
+    }
+    $global:DUET_ENQUEUED_ID = $id
+    $global:DUET_ENQUEUED_FILE = $final
+    return $true
+  } finally { Unlock-DuetRelease $enqLock | Out-Null }
 }
 
 function Read-DuetMessage {
@@ -1310,18 +1126,15 @@ function Read-DuetMessage {
   # in any metadata value (incl. CR), and invalid-UTF8 bodies. Matches bash's
   # first-wins-by-refusing-duplicates so two tools never disagree on an envelope.
   param([string]$File)
-  $known = @('id', 'session', 'order', 'mode', 'sender', 'recipient', 'term', 'origin', 'leader_at_send', 'dedupe',
-    'handoff_mode', 'prior_term', 'prior_leader', 'body64')
-  foreach ($g in @('DUET_MESSAGE_ID', 'DUET_MESSAGE_SESSION', 'DUET_MESSAGE_ORDER', 'DUET_MESSAGE_MODE',
-      'DUET_MESSAGE_SENDER', 'DUET_MESSAGE_RECIPIENT', 'DUET_MESSAGE_TERM', 'DUET_MESSAGE_ORIGIN',
-      'DUET_MESSAGE_LEADER_AT_SEND', 'DUET_MESSAGE_DEDUPE', 'DUET_MESSAGE_HANDOFF_MODE',
-      'DUET_MESSAGE_PRIOR_TERM', 'DUET_MESSAGE_PRIOR_LEADER', 'DUET_MESSAGE_BODY')) {
+  $known = @('id', 'session', 'mode', 'sender', 'recipient', 'body64')
+  foreach ($g in @('DUET_MESSAGE_ID', 'DUET_MESSAGE_SESSION', 'DUET_MESSAGE_MODE',
+      'DUET_MESSAGE_SENDER', 'DUET_MESSAGE_RECIPIENT', 'DUET_MESSAGE_BODY')) {
     Set-Variable -Name $g -Scope Global -Value ''
   }
   $text = Get-DuetFileText $File
   if ($null -eq $text) { return $false }
   $lines = $text -split "`n"
-  if ($lines.Count -lt 1 -or ($lines[0].TrimEnd("`r")) -ne 'DUETv1') { return $false }
+  if ($lines.Count -lt 1 -or ($lines[0].TrimEnd("`r")) -ne 'DUETv4') { return $false }
   $fields = @{}; $seen = @{}
   for ($i = 1; $i -lt $lines.Count; $i++) {
     $line = $lines[$i]
@@ -1335,53 +1148,29 @@ function Read-DuetMessage {
     if ($k -ne 'body64' -and $v -match "[\x00-\x1f\x7f]") { return $false }   # control chars incl. CR
     $fields[$k] = $v
   }
-  foreach ($req in @('id', 'session', 'order', 'mode', 'sender', 'recipient', 'term', 'origin', 'leader_at_send', 'dedupe', 'body64')) {
+  foreach ($req in @('id', 'session', 'mode', 'sender', 'recipient', 'body64')) {
     if (-not $seen.ContainsKey($req)) { return $false }
   }
   $global:DUET_MESSAGE_ID = $fields['id']
   $global:DUET_MESSAGE_SESSION = $fields['session']
-  $global:DUET_MESSAGE_ORDER = $fields['order']
   $global:DUET_MESSAGE_MODE = $fields['mode']
   $global:DUET_MESSAGE_SENDER = $fields['sender']
   $global:DUET_MESSAGE_RECIPIENT = $fields['recipient']
-  $global:DUET_MESSAGE_TERM = $fields['term']
-  $global:DUET_MESSAGE_ORIGIN = $fields['origin']
-  if ($seen.ContainsKey('leader_at_send')) { $global:DUET_MESSAGE_LEADER_AT_SEND = $fields['leader_at_send'] }
-  if ($seen.ContainsKey('dedupe')) { $global:DUET_MESSAGE_DEDUPE = $fields['dedupe'] }
-  if ($seen.ContainsKey('handoff_mode')) { $global:DUET_MESSAGE_HANDOFF_MODE = $fields['handoff_mode'] }
-  if ($seen.ContainsKey('prior_term')) { $global:DUET_MESSAGE_PRIOR_TERM = $fields['prior_term'] }
-  if ($seen.ContainsKey('prior_leader')) { $global:DUET_MESSAGE_PRIOR_LEADER = $fields['prior_leader'] }
   if ($seen.ContainsKey('body64')) {
     $strict = New-Object System.Text.UTF8Encoding($false, $true)   # throw on invalid bytes
     try { $global:DUET_MESSAGE_BODY = $strict.GetString([Convert]::FromBase64String($fields['body64'])) } catch { return $false }
+    if ($global:DUET_MESSAGE_BODY.Contains([char]0)) { return $false }
   }
   if ($global:DUET_MESSAGE_ID -notmatch '^[A-Za-z0-9_-]+$' -or $global:DUET_MESSAGE_SESSION -notmatch '^[A-Za-z0-9_-]+$' `
-      -or $global:DUET_MESSAGE_SENDER -notmatch '^[A-Za-z0-9_-]+$' -or $global:DUET_MESSAGE_RECIPIENT -notmatch '^[A-Za-z0-9_-]+$' `
-      -or $global:DUET_MESSAGE_LEADER_AT_SEND -notmatch '^[A-Za-z0-9_-]+$') { return $false }
-  if ($null -eq (ConvertFrom-DuetDecimal $global:DUET_MESSAGE_ORDER -AllowLeadingZeros)) { return $false }
+      -or $global:DUET_MESSAGE_SENDER -notmatch '^[A-Za-z0-9_-]+$' -or $global:DUET_MESSAGE_RECIPIENT -notmatch '^[A-Za-z0-9_-]+$') { return $false }
   if (@('NORMAL', 'INTERRUPT') -notcontains $global:DUET_MESSAGE_MODE) { return $false }
-  if (@('LEADER', 'WORKER', 'SYSTEM') -notcontains $global:DUET_MESSAGE_ORIGIN) { return $false }
-  $termNumber = ConvertFrom-DuetDecimal $global:DUET_MESSAGE_TERM
-  if ($null -eq $termNumber) { return $false }
-  $manualFields = @('handoff_mode', 'prior_term', 'prior_leader')
-  $manualCount = @($manualFields | Where-Object { $seen.ContainsKey($_) }).Count
-  if ($manualCount -ne 0) {
-    $priorNumber = ConvertFrom-DuetDecimal $global:DUET_MESSAGE_PRIOR_TERM
-    if ($manualCount -ne 3 -or $global:DUET_MESSAGE_HANDOFF_MODE -ne 'MANUAL' `
-        -or $global:DUET_MESSAGE_SENDER -ne 'duet-system' -or $global:DUET_MESSAGE_ORIGIN -ne 'SYSTEM' `
-        -or $global:DUET_MESSAGE_LEADER_AT_SEND -ne $global:DUET_MESSAGE_RECIPIENT `
-        -or $global:DUET_MESSAGE_DEDUPE -ne "promotion-$($global:DUET_MESSAGE_TERM)" `
-        -or $global:DUET_MESSAGE_PRIOR_LEADER -notmatch '^[A-Za-z0-9_-]+$' `
-        -or $global:DUET_MESSAGE_PRIOR_LEADER -eq $global:DUET_MESSAGE_RECIPIENT `
-        -or $null -eq $priorNumber -or $priorNumber -ge 9999999999 `
-        -or $termNumber -ne ($priorNumber + 1)) { return $false }
-  }
   return $true
 }
 
 function Build-DuetPayload {
-  return ("[DUET session={0} id={1} term={2} from={3}]`n{4}`n[DUET session={0} id={1} end]" -f `
-      $global:DUET_MESSAGE_SESSION, $global:DUET_MESSAGE_ID, $global:DUET_MESSAGE_TERM, $global:DUET_MESSAGE_SENDER, $global:DUET_MESSAGE_BODY)
+  return ("[DUET session={0} id={1} from={2} to={3}]`n{4}`n[DUET session={0} id={1} end]" -f `
+      $global:DUET_MESSAGE_SESSION, $global:DUET_MESSAGE_ID, $global:DUET_MESSAGE_SENDER,
+      $global:DUET_MESSAGE_RECIPIENT, $global:DUET_MESSAGE_BODY)
 }
 
 function Get-DuetPendingCount {
@@ -1391,44 +1180,6 @@ function Get-DuetPendingCount {
   if (-not (Test-Path -LiteralPath $inbox)) { return 0 }
   foreach ($box in @(Get-ChildItem -LiteralPath $inbox -Directory -ErrorAction SilentlyContinue)) {
     $count += @(Get-ChildItem -LiteralPath $box.FullName -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[NI]-.*\.msg$' }).Count
-  }
-  return $count
-}
-
-# Un-discharged notice/fanout obligations that must clear before end teardown.
-function Get-DuetNoticeObligationCount {
-  param([string]$DuetDir)
-  $count = 0
-  $inbox = Join-Path $DuetDir 'inbox'
-  if (-not (Test-Path -LiteralPath $inbox)) { return 0 }
-  foreach ($box in @(Get-ChildItem -LiteralPath $inbox -Directory -ErrorAction SilentlyContinue)) {
-    if ($box.Name -ne 'leader' -and $box.Name -ne 'promotions') {
-      $failedDir = Join-Path $box.FullName 'failed'
-      if (Test-Path -LiteralPath $failedDir) {
-        foreach ($f in @(Get-ChildItem -LiteralPath $failedDir -Filter '*.msg' -File -ErrorAction SilentlyContinue)) {
-          if (-not (Test-Path -LiteralPath ($f.FullName + '.noticed'))) { $count++ }
-        }
-      }
-    }
-    $qDir = Join-Path $box.FullName 'quarantine'
-    if (Test-Path -LiteralPath $qDir) {
-      foreach ($f in @(Get-ChildItem -LiteralPath $qDir -Filter '*.msg' -File -ErrorAction SilentlyContinue)) {
-        if (Test-Path -LiteralPath ($f.FullName + '.noticed')) { continue }
-        $reason = Get-DuetFileText ($f.FullName + '.reason')
-        if ($reason) { $reason = $reason.Trim() }
-        if (@('foreign-session', 'missing-session', 'foreign-message-id') -contains $reason) { $count++ }
-      }
-    }
-  }
-  $promoBox = Join-Path $inbox 'promotions'
-  foreach ($sub in @('delivered', 'quarantine')) {
-    $d = Join-Path $promoBox $sub
-    if (-not (Test-Path -LiteralPath $d)) { continue }
-    foreach ($f in @(Get-ChildItem -LiteralPath $d -Filter '*.msg' -File -ErrorAction SilentlyContinue)) {
-      if (-not (Test-Path -LiteralPath ($f.FullName + '.promotion_term'))) { continue }
-      if (Test-Path -LiteralPath ($f.FullName + '.fanout_done')) { continue }
-      $count++
-    }
   }
   return $count
 }
@@ -1536,14 +1287,51 @@ function Get-DuetClaudeComposerMarker {
 }
 
 function Get-DuetPaneMarker {
-  param([string]$Session, [string]$ServerPid, [string]$PaneId, [string]$PanePid)
+  param([string]$Session, [string]$ServerPid, [string]$PaneId, [string]$PanePid,
+    [string]$Harness = '')
   $cap = Invoke-DuetPaneCapture -Session $Session -ServerPid $ServerPid -PaneId $PaneId -PanePid $PanePid
   if (-not $cap.Ok) { return [pscustomobject]@{ Ok = $false; Alive = $cap.Alive; Marker = '' } }
   $lines = @($cap.Lines)
-  $legacyLine = ''; $legacyComposer = $false
-  foreach ($l in @($lines | Select-Object -Last 6)) {
+  $legacyLine = ''; $legacyComposer = $false; $framedClaudeMarker = ''
+  # psmux may retain several blank physical rows below a TUI's status bar.
+  # Scope the legacy active-composer pair over nonblank tail rows so those
+  # blanks cannot hide a visible marker + "paste again" hint.
+  foreach ($l in @($lines | Where-Object { $_ -match '\S' } | Select-Object -Last 10)) {
     if (Get-DuetClaudeComposerMarker $l) { $legacyLine = $l }
     if ($l -match '(?i)paste again to expand') { $legacyComposer = $true }
+  }
+  # Claude can leave the terminal cursor on its status row while a collapsed
+  # paste occupies the composer. In that state cursor-row capture misses the
+  # marker, but the active composer remains uniquely framed by its two bottom
+  # horizontal rules. Limit this fallback to the physical tail and require the
+  # nearest nonblank rows on both sides to be those rules; a marker appearing
+  # only in transcript scrollback is never enough.
+  if (-not $Harness -or $Harness -eq 'claude') {
+    $tailStart = [Math]::Max(0, $lines.Count - 12)
+    for ($lineIndex = $tailStart; $lineIndex -lt $lines.Count; $lineIndex++) {
+      $candidate = Get-DuetClaudeComposerMarker $lines[$lineIndex]
+      if (-not $candidate) { continue }
+      $before = $lineIndex - 1
+      while ($before -ge $tailStart -and $lines[$before] -notmatch '\S') { $before-- }
+      $after = $lineIndex + 1
+      while ($after -lt $lines.Count -and $lines[$after] -notmatch '\S') { $after++ }
+      if ($before -lt $tailStart -or $after -ge $lines.Count) { continue }
+      $beforeBars = ($lines[$before] -replace '[^\u2500\u2501\u2550-]', '').Length
+      $afterBars = ($lines[$after] -replace '[^\u2500\u2501\u2550-]', '').Length
+      if ($beforeBars -ge 8 -and $afterBars -ge 8) {
+        $framedClaudeMarker = $candidate
+      }
+    }
+  }
+  if ((!$Harness -or $Harness -eq 'claude') -and $legacyComposer -and $legacyLine) {
+    return [pscustomobject]@{
+      Ok = $true
+      Alive = $true
+      Marker = (Get-DuetClaudeComposerMarker $legacyLine)
+    }
+  }
+  if ($framedClaudeMarker) {
+    return [pscustomobject]@{ Ok = $true; Alive = $true; Marker = $framedClaudeMarker }
   }
   $geometry = Invoke-DuetPaneGeometry -Session $Session -ServerPid $ServerPid -PaneId $PaneId -PanePid $PanePid
   if (-not $geometry.Ok) { return [pscustomobject]@{ Ok = $false; Alive = $geometry.Alive; Marker = '' } }
@@ -1568,14 +1356,20 @@ function Get-DuetPaneMarker {
     return [pscustomobject]@{ Ok = $false; Alive = $true; Marker = '' }
   }
   $rowline = $row.Line
-  $claudeMarker = Get-DuetClaudeComposerMarker $rowline
-  if ($claudeMarker) { return [pscustomobject]@{ Ok = $true; Alive = $true; Marker = $claudeMarker } }
-  if ($legacyComposer -and $legacyLine) {
-    return [pscustomobject]@{ Ok = $true; Alive = $true; Marker = (Get-DuetClaudeComposerMarker $legacyLine) }
+  $claudeMarker = if (-not $Harness -or $Harness -eq 'claude') {
+    Get-DuetClaudeComposerMarker $rowline
+  } else { '' }
+  if ($claudeMarker) {
+    return [pscustomobject]@{ Ok = $true; Alive = $true; Marker = $claudeMarker }
   }
-  if ($rowline -match '(?i)\[Pasted Content [0-9]+ chars\]') {
-    $m = Get-DuetAlnum $rowline
+  if ((!$Harness -or $Harness -eq 'codex') -and $rowline -match '(?i)\[Pasted Content [0-9]+ chars\]') {
+    $m = Get-DuetAlnum $Matches[0]
     if ($m) { return [pscustomobject]@{ Ok = $true; Alive = $true; Marker = ('codex' + $m) } }
+  }
+  if ((!$Harness -or $Harness -eq 'kimi') -and
+      $rowline -match '(?i)\[paste #[0-9]+ \+[0-9]+ lines\]') {
+    $m = Get-DuetAlnum $Matches[0]
+    if ($m) { return [pscustomobject]@{ Ok = $true; Alive = $true; Marker = ('kimi' + $m) } }
   }
   return [pscustomobject]@{ Ok = $true; Alive = $true; Marker = '' }
 }
@@ -1701,8 +1495,17 @@ function Send-DuetControlPaste {
 }
 
 function New-DuetSendResult {
-  param([int]$Code, [string]$EnterToken = '', [bool]$Collapsed = $false, [string]$LandingObserved = '', [bool]$ComposerClear = $false)
-  return [pscustomobject]@{ Code = $Code; EnterToken = $EnterToken; Collapsed = $Collapsed; LandingObserved = $LandingObserved; ComposerClear = $ComposerClear }
+  param([int]$Code, [string]$EnterToken = '', [bool]$Collapsed = $false,
+    [string]$LandingObserved = '', [bool]$ComposerClear = $false,
+    [string]$WireOutcome = '')
+  return [pscustomobject]@{
+    Code = $Code
+    EnterToken = $EnterToken
+    Collapsed = $Collapsed
+    LandingObserved = $LandingObserved
+    ComposerClear = $ComposerClear
+    WireOutcome = $WireOutcome
+  }
 }
 
 # Paste, confirm it landed (probe or collapsed marker), Enter, confirm the
@@ -1718,43 +1521,19 @@ function Send-DuetVerified {
   if (-not $entry.Alive) { Write-DuetError "duet: target pane $PaneId is gone; not sending."; return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
 
   if ($Interrupt) {
-    if ($Harness -eq 'claude') {
-      $interruptKey = Send-DuetPaneKey @fence -Keys @('C-c')
-      if (-not $interruptKey.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-      if (-not $interruptKey.Ok) { return (New-DuetSendResult -Code $global:DUET_SEND_NOT_LANDED) }
-      $idle = $false
-      for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Milliseconds 100
-        $cap = Invoke-DuetPaneCapture @fence
-        if (-not $cap.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-        if ($cap.Ok) {
-          $tail = (@($cap.Lines | Select-Object -Last 12) -join "`n")
-          if ($tail -notmatch '(?i)esc to interrupt|running [0-9]+ shell command|\([0-9]+s[^)]*(tokens|thinking)') { $idle = $true; break }
-        }
-      }
-      if (-not $idle) { return (New-DuetSendResult -Code $global:DUET_SEND_NOT_LANDED) }
-    }
-    else {
-      $cap = Invoke-DuetPaneCapture @fence
-      if (-not $cap.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-      if (-not $cap.Ok) { return (New-DuetSendResult -Code $global:DUET_SEND_NOT_LANDED) }
-      if ($cap.Ok) {
-        $tail = (@($cap.Lines | Select-Object -Last 6) -join "`n")
-        if ($tail -match '(?i)esc to interrupt|esc to cancel|ctrl\+c to|working|thinking|generating|running|streaming') {
-          $interruptKey = Send-DuetPaneKey @fence -Keys @('Escape')
-          if (-not $interruptKey.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-          if (-not $interruptKey.Ok) { return (New-DuetSendResult -Code $global:DUET_SEND_NOT_LANDED) }
-          Start-Sleep -Milliseconds 400
-        }
-      }
-    }
+    $interruptKey = Send-DuetPaneKey @fence -Keys @('Escape')
+    if (-not $interruptKey.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
+    if (-not $interruptKey.Ok) { return (New-DuetSendResult -Code $global:DUET_SEND_NOT_LANDED) }
+    # Full-screen Windows TUIs redraw through psmux more slowly than tmux's
+    # POSIX path. Give cancellation a bounded settle before reading/pasting.
+    Start-Sleep -Milliseconds $(if ($Harness -eq 'claude') { 1000 } else { 600 })
   }
 
   $probe = Get-DuetProbe $Payload
   if (-not $probe) { Write-DuetError "duet: refusing to send an empty/unprobeable payload to $PaneId"; return (New-DuetSendResult -Code $global:DUET_SEND_NOT_LANDED) }
 
   # A clean composer must be POSITIVELY confirmed (successful read) before paste.
-  $mb = Get-DuetPaneMarker @fence
+  $mb = Get-DuetPaneMarker @fence -Harness $Harness
   if (-not $mb.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
   if (-not $mb.Ok) { Write-DuetError "duet: could not read composer state of $PaneId; not pasting."; return (New-DuetSendResult -Code $global:DUET_SEND_NOT_LANDED) }
   if ($mb.Marker) { Write-DuetError "duet: target pane $PaneId already has a collapsed composer; not pasting."; return (New-DuetSendResult -Code $global:DUET_SEND_NOT_LANDED) }
@@ -1762,12 +1541,13 @@ function Send-DuetVerified {
 
   $pasteOutcome = Send-DuetControlPaste -Session $Session -PaneId $PaneId -PanePid $PanePid -ServerPid $ServerPid -Registry $Registry -Payload $Payload
   if ($pasteOutcome -eq $global:DUET_PASTE_UNCERTAIN) {
-    # Bytes may already occupy the composer -- NEVER repaste. The daemon's
-    # enter-only continuation verifies visually and submits without re-pasting.
-    Write-DuetError "duet: paste wire write to pane $PaneId is unverified; will not repaste."
-    return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED)
+    # Bytes may already occupy the composer -- NEVER repaste. Continue only
+    # through the normal visual landing proof below; if the exact probe/owned
+    # marker appears, an Enter-only continuation is safe and still requires a
+    # successful read proving that the composer cleared.
+    Write-DuetError "duet: paste acknowledgment from pane $PaneId is uncertain; verifying visible landing without repaste."
   }
-  if ($pasteOutcome -ne $global:DUET_PASTE_WIRE_SENT) {
+  elseif ($pasteOutcome -ne $global:DUET_PASTE_WIRE_SENT) {
     # PREWRITE_FAILED: provably nothing was sent. DEAD only when confirmed dead.
     $pr = Resolve-DuetPaneResolution @fence
     if ($pr.Known -and -not $pr.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
@@ -1780,10 +1560,14 @@ function Send-DuetVerified {
     Start-Sleep -Milliseconds 100
     $ta = Get-DuetTailAlnumT @fence -Lines 12
     if ($ta.Ok -and (Test-DuetPresent $ta.Text $probe)) { $landingKind = 'probe'; $landingToken = $probe; break }
-    $mk = Get-DuetPaneMarker @fence
+    $mk = Get-DuetPaneMarker @fence -Harness $Harness
     if ($mk.Ok -and $mk.Marker -and $mk.Marker -ne $markerBefore) { $landingKind = 'marker'; $landingToken = $mk.Marker; $enterToken = $mk.Marker; $collapsed = $true; break }
   }
-  if (-not $landingKind) { Write-DuetError "duet: paste succeeded but landing is unverified in pane $PaneId"; return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
+  if (-not $landingKind) {
+    Write-DuetError "duet: paste succeeded but landing is unverified in pane $PaneId"
+    return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED `
+        -WireOutcome $pasteOutcome)
+  }
   $landingObserved = $landingKind
 
   # Enter, then confirm submission ONLY via a successful read showing absence.
@@ -1799,7 +1583,7 @@ function Send-DuetVerified {
         if ($ta.Ok -and -not (Test-DuetPresent $ta.Text $landingToken)) { return (New-DuetSendResult -Code 0 -LandingObserved $landingObserved) }
       }
       else {
-        $mk = Get-DuetPaneMarker @fence
+        $mk = Get-DuetPaneMarker @fence -Harness $Harness
         if (-not $mk.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED -EnterToken $enterToken -Collapsed $collapsed -LandingObserved $landingObserved) }
         if ($mk.Ok) {
           if (-not $mk.Marker) { return (New-DuetSendResult -Code 0 -EnterToken $enterToken -Collapsed $collapsed -LandingObserved $landingObserved) }
@@ -1809,112 +1593,14 @@ function Send-DuetVerified {
       }
     }
   }
-  $mfinal = Get-DuetPaneMarker @fence
+  $mfinal = Get-DuetPaneMarker @fence -Harness $Harness
   if ($Harness -eq 'codex' -and $landingKind -eq 'marker' -and $mfinal.Ok -and (Test-DuetCodexMarkerOwned $mfinal.Marker $landingToken)) {
     Write-DuetError "duet: Codex composer retained an owned collapsed paste after Enter."
-    return (New-DuetSendResult -Code $global:DUET_SEND_COMPOSER_REFUSED -EnterToken $enterToken -Collapsed $collapsed -LandingObserved 'marker')
+    return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED -EnterToken $enterToken -Collapsed $collapsed -LandingObserved 'marker')
   }
   Write-DuetError "duet: payload landed in pane $PaneId but submission is unverified."
-  return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED -EnterToken $enterToken -Collapsed $collapsed -LandingObserved $landingObserved)
-}
-
-# Enter-only continuation for a payload that may already occupy the composer.
-# NEVER pastes. ComposerClear distinguishes an unverifiable-but-absent payload
-# from one whose probe/marker still visibly owns the composer.
-function Send-DuetEnterOnly {
-  param([string]$PaneId, [string]$PanePid, [AllowEmptyString()][string]$Payload, [string]$MarkerToken, [string]$Harness,
-    [string]$Session = $global:DUET_PSMUX_SESSION, [string]$ServerPid = $global:DUET_PSMUX_SERVER_PID)
-  $fence = @{ Session = $Session; ServerPid = $ServerPid; PaneId = $PaneId; PanePid = $PanePid }
-  $entry = Resolve-DuetPaneResolution @fence
-  if (-not $entry.Known) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }   # continuation: bytes may already have landed
-  if (-not $entry.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-  $probe = Get-DuetProbe $Payload
-  if (-not $probe) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
-  $kind = ''
-  $ta = Get-DuetTailAlnumT @fence -Lines 12
-  if (-not $ta.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-  if ($ta.Ok -and (Test-DuetPresent $ta.Text $probe)) { $kind = 'probe' }
-  else {
-    $mk = Get-DuetPaneMarker @fence
-    if (-not $mk.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-    if ($mk.Ok -and $MarkerToken -and ($mk.Marker -eq $MarkerToken -or ($Harness -eq 'codex' -and (Test-DuetCodexMarkerOwned $mk.Marker $MarkerToken)))) {
-      $kind = 'marker'; $MarkerToken = $mk.Marker
-    }
-    elseif ($ta.Ok -and $mk.Ok) {
-      # Both reads succeeded and neither the probe nor the owned marker is
-      # present: the uncertain payload no longer owns the composer (safe).
-      return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED -ComposerClear $true)
-    }
-    else {
-      # A read failed -> UNKNOWN, not "clear".
-      return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED)
-    }
-  }
-  $landingObserved = $kind; $enterToken = if ($kind -eq 'marker') { $MarkerToken } else { '' }
-  for ($e = 0; $e -lt 3; $e++) {
-    $k = Send-DuetPaneKey @fence -Keys @('Enter')
-    if (-not $k.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-    if (-not $k.Ok) { continue }
-    for ($i = 0; $i -lt 12; $i++) {
-      Start-Sleep -Milliseconds 200
-      if ($kind -eq 'probe') {
-        $ta = Get-DuetTailAlnumT @fence -Lines 4
-        if (-not $ta.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-        if ($ta.Ok -and -not (Test-DuetPresent $ta.Text $probe)) { return (New-DuetSendResult -Code 0 -ComposerClear $true -LandingObserved $landingObserved) }
-      }
-      else {
-        $mk = Get-DuetPaneMarker @fence
-        if (-not $mk.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-        if ($mk.Ok) {
-          if (-not $mk.Marker) { return (New-DuetSendResult -Code 0 -ComposerClear $true -LandingObserved $landingObserved) }
-          if ($Harness -eq 'codex' -and (Test-DuetCodexMarkerOwned $mk.Marker $MarkerToken)) { $MarkerToken = $mk.Marker; $enterToken = $mk.Marker }
-          elseif ($mk.Marker -ne $MarkerToken) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED -EnterToken $enterToken -LandingObserved $landingObserved) }
-        }
-      }
-    }
-  }
-  $mfinal = Get-DuetPaneMarker @fence
-  if ($Harness -eq 'codex' -and $kind -eq 'marker' -and $mfinal.Ok -and (Test-DuetCodexMarkerOwned $mfinal.Marker $MarkerToken)) {
-    return (New-DuetSendResult -Code $global:DUET_SEND_COMPOSER_REFUSED -EnterToken $enterToken -LandingObserved $landingObserved)
-  }
-  return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED -EnterToken $enterToken -LandingObserved $landingObserved)
-}
-
-# Clear a composer only while the durable Codex marker still owns the cursor row.
-# Escape then Ctrl-U is the observed recovery sequence; a missing/foreign marker
-# is never touched. Every read/keystroke re-resolves the tuple; a failed read is
-# UNKNOWN (keep polling), never treated as "cleared", and no stale tuple is keyed.
-function Clear-DuetRefusedComposer {
-  param([string]$PaneId, [string]$PanePid, [string]$MarkerToken,
-    [string]$Session = $global:DUET_PSMUX_SESSION, [string]$ServerPid = $global:DUET_PSMUX_SERVER_PID)
-  $fence = @{ Session = $Session; ServerPid = $ServerPid; PaneId = $PaneId; PanePid = $PanePid }
-  if ($MarkerToken -notmatch '^codex(PastedContent[0-9]+chars)+$') { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
-  $mk = Get-DuetPaneMarker @fence
-  if (-not $mk.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-  if (-not $mk.Ok) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
-  if (-not $mk.Marker) { return (New-DuetSendResult -Code 0 -ComposerClear $true) }
-  if (-not (Test-DuetCodexMarkerOwned $mk.Marker $MarkerToken)) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
-  $k = Send-DuetPaneKey @fence -Keys @('Escape')
-  if (-not $k.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-  if (-not $k.Ok) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
-  Start-Sleep -Milliseconds 100
-  $mk = Get-DuetPaneMarker @fence
-  if (-not $mk.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-  if (-not $mk.Ok) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
-  if (-not $mk.Marker) { return (New-DuetSendResult -Code 0 -ComposerClear $true) }
-  if (-not (Test-DuetCodexMarkerOwned $mk.Marker $MarkerToken)) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
-  $k = Send-DuetPaneKey @fence -Keys @('C-u')
-  if (-not $k.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-  if (-not $k.Ok) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
-  for ($i = 0; $i -lt 20; $i++) {
-    Start-Sleep -Milliseconds 100
-    $mk = Get-DuetPaneMarker @fence
-    if (-not $mk.Alive) { return (New-DuetSendResult -Code $global:DUET_SEND_DEAD) }
-    if (-not $mk.Ok) { continue }
-    if (-not $mk.Marker) { return (New-DuetSendResult -Code 0 -ComposerClear $true) }
-    if (-not (Test-DuetCodexMarkerOwned $mk.Marker $MarkerToken)) { return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED) }
-  }
-  return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED)
+  return (New-DuetSendResult -Code $global:DUET_SEND_LANDED_UNVERIFIED -EnterToken $enterToken `
+      -Collapsed $collapsed -LandingObserved $landingObserved -WireOutcome $pasteOutcome)
 }
 
 Write-Verbose "duet-common.ps1 loaded"

@@ -20,6 +20,8 @@ Write-DuetUtf8NoBom -Path $fake -Value @'
   "self=$env:DUET_SELF",
   "config=$env:DUET_CONFIG",
   "session=$env:DUET_SESSION",
+  "codex_home=$env:CODEX_HOME",
+  "kimi_home=$env:KIMI_CODE_HOME",
   "args=$($args -join [char]31)"
 ), (New-Object Text.UTF8Encoding($false)))
 '@
@@ -28,7 +30,8 @@ function Resolve-DuetExecutable { param([string]$Name) return $fake }
 $saved = @{}
 foreach ($name in @('DUET_CLAUDE_PERMISSION_FLAG', 'DUET_CLAUDE_MODEL', 'DUET_CODEX_SANDBOX',
     'DUET_CODEX_APPROVAL', 'DUET_CODEX_MODEL', 'DUET_CODEX_REASONING_EFFORT',
-    'DUET_CODEX_SKIP_PRETRUST', 'DUET_KIMI_MODE_FLAG', 'DUET_KIMI_MODEL', 'DUET_CAPTURE')) {
+    'DUET_CODEX_SKIP_PRETRUST', 'DUET_KIMI_MODE_FLAG', 'DUET_KIMI_MODEL', 'DUET_CAPTURE',
+    'CODEX_HOME', 'KIMI_CODE_HOME')) {
   $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 $originalLocation = (Get-Location).Path
@@ -43,6 +46,10 @@ try {
   $env:DUET_CODEX_SKIP_PRETRUST = '1'
   $env:DUET_KIMI_MODE_FLAG = '--auto'
   $env:DUET_KIMI_MODEL = 'kimi model & three'
+  $expectedCodexHome = Join-Path $scratch "codex home & O'Brien"
+  $expectedKimiHome = Join-Path $scratch "kimi home & O'Brien"
+  $env:CODEX_HOME = $expectedCodexHome
+  $env:KIMI_CODE_HOME = $expectedKimiHome
 
   $cases = @(
     [pscustomobject]@{ Harness = 'claude'; Name = 'claude-1'; Required = @('--dangerously-skip-permissions', '--model', 'claude model & one', '--add-dir', $duetDir, '--name', 'claude-1') },
@@ -65,6 +72,10 @@ try {
     Check $parseOk "$($case.Harness) launch command parses with spaces, ampersands, and apostrophes"
     $capture = Join-Path $scratch ("capture-{0}.txt" -f $case.Harness)
     $env:DUET_CAPTURE = $capture
+    # A long-running psmux backend can have an older environment than init.
+    # The launch command must carry harness-home overrides explicitly.
+    $env:CODEX_HOME = $null
+    $env:KIMI_CODE_HOME = $null
     & $block | Out-Null
     $lines = [IO.File]::ReadAllLines($capture)
     $argLine = @($lines | Where-Object { $_.StartsWith('args=') })[0].Substring(5)
@@ -72,6 +83,16 @@ try {
     Check (($lines -contains "cwd=$workdir") -and ($lines -contains "self=$($case.Name)") -and
       ($lines -contains "config=$(Join-Path $duetDir 'duet.env')") -and ($lines -contains 'session=session-1')) "$($case.Harness) launch command preserves cwd and duet identity environment"
     Check (($actualArgs -join [char]31) -eq ($case.Required -join [char]31)) "$($case.Harness) launch command preserves every argument boundary"
+    if ($case.Harness -eq 'codex') {
+      Check ($lines -contains "codex_home=$expectedCodexHome") `
+        'codex launch carries CODEX_HOME across a stale psmux environment'
+    }
+    if ($case.Harness -eq 'kimi') {
+      Check ($lines -contains "kimi_home=$expectedKimiHome") `
+        'kimi launch carries KIMI_CODE_HOME across a stale psmux environment'
+    }
+    $env:CODEX_HOME = $expectedCodexHome
+    $env:KIMI_CODE_HOME = $expectedKimiHome
     Set-Location -LiteralPath $originalLocation
   }
 }
