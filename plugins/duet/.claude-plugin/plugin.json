@@ -1,6 +1,6 @@
 {
   "name": "duet",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Run Claude, Codex, and Kimi as a visible leaderless mesh with reliable queued delivery in tmux or psmux on macOS, Linux, and Windows.",
   "author": {
     "name": "Jonathan Rosado",

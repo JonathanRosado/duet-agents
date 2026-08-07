@@ -117,8 +117,11 @@ function codexSkillDirRaw() {
 }
 
 function kimiSkillDirRaw() {
-  const kimiHome = process.env.KIMI_CODE_HOME || path.join(home(), '.kimi-code');
-  return process.env.DUET_AGENTS_KIMI_SKILL_DIR || path.join(kimiHome, 'skills', 'duet');
+  return process.env.DUET_AGENTS_KIMI_SKILL_DIR || path.join(kimiHomeRaw(), 'skills', 'duet');
+}
+
+function kimiHomeRaw() {
+  return process.env.KIMI_CODE_HOME || path.join(home(), '.kimi-code');
 }
 
 function hasMarker(dir, marker) {
@@ -326,6 +329,28 @@ function runClaude(args) {
   return res.status === 0;
 }
 
+function updateKimiSessionHook(action, runtime) {
+  const helper = path.join(runtime || PLUGIN_SRC, 'scripts', 'duet-native-register.js');
+  if (!fs.existsSync(helper)) {
+    throw new Error(`kimi: native-session hook helper is missing at '${helper}'`);
+  }
+  const res = spawnSync(
+    process.execPath,
+    [helper, action === 'install' ? 'install-kimi-hook' : 'uninstall-kimi-hook'],
+    {
+      env: { ...process.env, KIMI_CODE_HOME: kimiHomeRaw() },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  );
+  if (res.status !== 0) {
+    const detail = String(res.stderr || res.stdout || '').trim().split('\n')[0];
+    throw new Error(
+      `kimi: could not ${action} the owned SessionStart hook${detail ? `: ${detail}` : ''}`
+    );
+  }
+}
+
 function parseArgs(argv) {
   const selected = { claude: false, codex: false, kimi: false };
   let command = null;
@@ -414,7 +439,15 @@ function main() {
 
   if (command === 'uninstall') {
     if (selected.codex) removeSkill(codexSkillDirRaw(), 'codex', notes, failures);
-    if (selected.kimi) removeSkill(kimiSkillDirRaw(), 'kimi', notes, failures);
+    if (selected.kimi) {
+      try {
+        updateKimiSessionHook('uninstall');
+        notes.push('kimi: removed the owned native-session registration hook');
+      } catch (err) {
+        failures.push(err.message);
+      }
+      removeSkill(kimiSkillDirRaw(), 'kimi', notes, failures);
+    }
     if (selected.codex || selected.kimi) {
       let runtimeDisplay;
       try {
@@ -465,6 +498,7 @@ function main() {
     selected[name] = false;
   }
 
+  let runtime = null;
   if (selected.codex || selected.kimi) {
     try {
       const destinations = [{ label: 'runtime directory', dir: safeDestination(runtimeDirRaw(), 'runtime directory') }];
@@ -472,15 +506,25 @@ function main() {
       if (selected.kimi) destinations.push({ label: 'kimi skill directory', dir: safeDestination(kimiSkillDirRaw(), 'kimi skill directory') });
       assertNoOverlap(destinations);
       assertShellSafeForRender(destinations[0].dir); // fail before staging anything
-      installRuntime(notes);
-      if (selected.codex) {
+      runtime = installRuntime(notes);
+    } catch (err) {
+      failures.push(err.message);
+    }
+  }
+  if (runtime && selected.codex) {
+    try {
         notes.push(`codex skill written to ${renderSkillInto(codexSkillDirRaw())}`);
         succeeded.codex = true;
-      }
-      if (selected.kimi) {
+    } catch (err) {
+      failures.push(`codex: ${err.message}`);
+    }
+  }
+  if (runtime && selected.kimi) {
+    try {
+        updateKimiSessionHook('install', runtime);
+        notes.push('kimi: installed the inert SessionStart registration hook');
         notes.push(`kimi skill written to ${renderSkillInto(kimiSkillDirRaw())}`);
         succeeded.kimi = true;
-      }
     } catch (err) {
       failures.push(err.message);
     }

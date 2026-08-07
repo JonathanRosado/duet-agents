@@ -13,8 +13,9 @@ and initiate a session. Installing adds a `duet` command to each selected CLI,
 which creates the panes, a durable brief, per-recipient message queues, and one
 delivery daemon.
 
-> **Platform status (0.6.0):** the v4 leaderless mesh ships on
-> **macOS/Linux (Bash + tmux)** and **Windows (PowerShell + psmux)**.
+> **Platform status (0.7.0):** the v4 leaderless mesh ships on
+> **macOS/Linux (Bash + tmux)** and **Windows (PowerShell + psmux)**. Native
+> harness-session pairing/rejoin currently ships on the Bash/tmux path.
 
 ```text
       ┌──────── one delivery daemon (per session) ────────┐
@@ -68,7 +69,8 @@ The transcript is a human-readable activity log, not proof of delivery.
 
 - macOS or Linux with [`tmux`](https://github.com/tmux/tmux), or Windows with
   [psmux](https://github.com/psmux/psmux) and Windows PowerShell.
-- [Node.js](https://nodejs.org) ≥ 16.7 for the npx installer.
+- [Node.js](https://nodejs.org) ≥ 16.7 for the installer and exact native
+  session registration on macOS/Linux.
 - At least one of the supported CLIs on `PATH` and already authenticated —
   [Claude Code](https://claude.com/claude-code) (`claude`),
   [Codex CLI](https://github.com/openai/codex) (`codex`), or
@@ -97,7 +99,10 @@ What each harness gets:
 - **Codex CLI** — the skill `~/.agents/skills/duet`, giving `$duet` (or
   `/skills → duet`).
 - **Kimi CLI** — the skill `$KIMI_CODE_HOME/skills/duet` (default
-  `~/.kimi-code/skills/duet`), giving `/skill:duet`.
+  `~/.kimi-code/skills/duet`), giving `/skill:duet`, plus one ownership-marked
+  `SessionStart` hook in `config.toml`. The hook is inert outside a Duet worker,
+  is validated with `kimi doctor config`, and uninstall removes only Duet's
+  block while preserving foreign config and file mode.
 
 Codex and Kimi share one **versioned, immutable** runtime under
 `~/.duet/plugin/<version>` — the rendered skills point at it, and every duet
@@ -164,14 +169,14 @@ $duet codex kimi            # Codex CLI
 /skill:duet codex kimi      # Kimi CLI
 ```
 
-Roster arguments work the same in every CLI: no arguments means one Codex
-worker, and repeating a harness word launches multiple instances
+Roster arguments work the same in every CLI: no arguments restores the prior
+paired roster or starts one Codex and one Kimi worker, and repeating a harness
+word launches multiple instances
 (`codex codex kimi` = four agents total).
 
-With no arguments, the initiator + one Codex worker default remains. Workers
-get instance names (`codex-1`, `kimi-1`, `claude-1`); the initiator keeps its
-harness's bare name (`claude`, `codex`, or `kimi`). Repeating a harness
-launches multiple instances.
+Workers get instance names (`codex-1`, `kimi-1`, `claude-1`); the initiator
+keeps its harness's bare name (`claude`, `codex`, or `kimi`). One to four
+workers are accepted, including four copies of the same harness.
 
 Any agent addresses any other by exact roster name, or `all` to broadcast to
 every other live, **deliverable** member (itself, and any dead or blocked peer,
@@ -184,6 +189,89 @@ Ending is immediate and has no drain: it stops the daemon and kills the other
 spawned panes (the caller's own pane survives). Because there is no drain, make
 sure no send is in flight and any result you need has been delivered *before*
 you end the session.
+
+## Native session pairing and rejoin (macOS/Linux)
+
+Every run records a **pairing**: which harness-native session each member is
+(Claude `--resume` UUID, `codex resume` UUID, `kimi --session` id), kept at
+`<session>/pairing.tsv`, including the exact native config home where that
+session lives. Capture is authoritative rather than time-based:
+
+- Fresh Claude workers receive an assigned `--session-id`.
+- Each Codex worker gets a pane-scoped inline `SessionStart` hook.
+- Each Kimi worker gets the installed, otherwise inert `SessionStart` hook.
+  Its exact workspace is also pretrusted before launch, so Kimi's startup
+  dialog cannot consume the worker's first Duet boot prompt.
+- Codex/Kimi hook reports are bound to a unique launch nonce, roster name,
+  Duet session, workdir, pane id, and pane process id. Repeated workers may
+  start in any order; an unrelated CLI session cannot be attributed to them.
+- The initiator comes only from its exact argument/environment contract:
+  `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, or Kimi's
+  `${KIMI_SESSION_ID}` skill expansion. Duet never guesses from a newest or
+  recently modified session file.
+
+Only after every worker is ready and exact-live, every id resolves in its
+recorded native home, and the staged TSV matches the immutable roster does
+Duet append the per-member indexes and publish `pairing.complete` strictly
+last. Anything missing, unsupported, or ambiguous leaves the mesh running but
+the pairing unreachable; the next invocation safely starts fresh.
+
+Git repositories get an untracked durable identity at
+`.git/duet-agents-repo-id`, shared by linked worktrees and preserved if the
+whole repository is moved. Complete mappings live under
+`$DUET_STATE_ROOT/pairings/<key>/`: `history` is diagnostic, while
+home-namespaced `by-id` indexes drive lookup.
+
+The skill's normal start command is **rejoin** — there is nothing to decide
+and no id to type:
+
+```bash
+# Claude Code
+DUET_INITIATOR_NATIVE_ID="${CLAUDE_CODE_SESSION_ID:-}" \
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-rejoin.sh"
+
+# Codex CLI / Kimi CLI (the installer renders the absolute runtime path;
+# Kimi expands ${KIMI_SESSION_ID} when the skill loads)
+DUET_INITIATOR_NATIVE_ID="${CODEX_THREAD_ID:-${KIMI_SESSION_ID}}" \
+  bash "/absolute/path/rendered-by-the-installer/scripts/duet-rejoin.sh"
+```
+
+With no harness words, a found mapping restores its whole paired roster
+(stable names, workers resumed via `claude --resume` / `codex resume` /
+`kimi --session`); with no mapping, the same command starts the default fresh
+ensemble (the initiator plus one Codex and one Kimi worker). Explicit harness
+words pin an exact roster: they must match a found mapping exactly, otherwise
+a fresh ensemble with exactly those workers starts.
+
+Lookup is keyed by the invoker's exact native session: every complete pairing
+candidate is the **last** line of its own home-namespaced index. A corrupt,
+foreign, markerless, or interrupted newest entry fails closed instead of
+rolling back. Reciprocal freshness requires the same candidate to be newest
+for every member, preventing a partially superseded set from splitting. The
+invoker's id determines its stable roster name, so a former worker can resume
+first, invoke Duet, become rank zero, and restore every other member in the
+original row order.
+
+Rejoin only proceeds when every native id still resolves on disk and no prior
+run still owns the agents. The fence covers complete, incomplete, and
+polluted-index records: a verified live daemon or exact live pane refuses, and
+on a cleanly ended run only the invoking member's surviving pane may be
+adopted. Every rejoin is a new transport run—new session dir, daemon, inboxes,
+and message-id namespace. Old queues are never replayed; the new brief reports
+their count and the old transcript path. Restored `DUET_*` values are treated
+as stale and cannot authorize a caller without the exact live pane tuple.
+
+Kimi 0.34 currently refuses `--session <id>` from a different workdir. Duet
+checks that before spawning: a pairing containing Kimi safely starts fresh
+after a workdir move, while Claude/Codex-only pairings can rejoin using the
+durable repository identity. Duet never edits Kimi's native session store.
+
+Rejoin is POSIX-only in this version; the Windows/psmux runtime is unchanged
+and the Windows skill says so. During an active mesh, end Duet before using a
+harness command that switches or forks the pane to another native session;
+observable worker switches invalidate the complete marker, and no transport
+state is migrated between native sessions.
+
 
 ## Pin every session operation
 
@@ -256,8 +344,9 @@ DUET_HARNESS_BOOT_RE='regex visible after a successful boot'
 DUET_HARNESS_BRIEF_FILE='AGENTS.md' # or CLAUDE.md
 
 duet_harness_check()   { ...; }                 # fail before panes change if the binary is missing
-duet_harness_pretrust(){ ...; }                 # $1 = workdir; idempotent; suppress trust dialogs
-duet_harness_launch_cmd(){ ...; }               # $1 = workdir, $2 = duet dir, $3 = instance name
+duet_harness_pretrust(){ ...; }                 # $1 = workdir, $2 = native config home
+duet_harness_launch_cmd(){ ...; }               # $1 workdir, $2 duet dir, $3 name, $4 optional assigned id, $5 native home
+duet_harness_resume_cmd(){ ...; }               # same, with $4 = exact native id to resume
 ```
 
 PowerShell adapters return one hashtable:
@@ -334,7 +423,8 @@ plugins/duet/
 ├── .claude-plugin/plugin.json
 ├── briefs/
 │   ├── ENSEMBLE_BRIEF.md             # v4 mesh brief (Bash/tmux)
-│   └── ENSEMBLE_BRIEF.win.md         # v4 mesh brief (PowerShell/psmux)
+│   ├── ENSEMBLE_BRIEF.win.md         # v4 mesh brief (PowerShell/psmux)
+│   └── REJOIN_NOTE.md                # appended to anchors on a rejoin (stale-context warning, old-queue diagnostics)
 ├── harnesses/{claude,codex,kimi}.{sh,ps1}
 ├── skills/duet/SKILL.md              # Claude Code plugin skill (/duet:duet)
 ├── templates/
@@ -342,11 +432,14 @@ plugins/duet/
 │   └── agents-skill.win.md           # Windows v4 variant (.ps1)
 ├── scripts/
 │   ├── duet-{common,init,send,deliverd,end,status,doctor}.{sh,ps1}
+│   ├── duet-pairing.sh               # native session id capture + pairing record store/lookup
+│   ├── duet-native-register.js        # exact SessionStart registration + Kimi hook/pretrust
+│   ├── duet-rejoin.sh                # rebuild the mesh around paired native sessions (POSIX)
 │   ├── duet-resume.sh                # return a blocked recipient to the session
 │   ├── duet-deliverd.lib.ps1         # Windows recipient-scoped delivery core
 │   └── duet-ready.ps1                # authenticated short boot acknowledgment
 └── tests/
-    ├── run-bash-tests.sh             # installer · delivery · mesh · lifecycle
+    ├── run-bash-tests.sh             # installer · delivery · mesh · lifecycle · rejoin
     ├── run-powershell-tests.ps1      # foundation · adapters · queue · daemon · transport · mesh · lifecycle
     ├── v4-real-smoke.sh              # real Bash/tmux TUIs
     └── real-smoke.tests.ps1          # real PowerShell/psmux TUIs
@@ -357,9 +450,13 @@ plugins/duet/
 - Concurrent sessions in one repo use one git worktree each; a single worktree
   should host only one session (they share one `DUET:BEGIN`/`DUET:END` anchor).
 - Codex pretrust adds the same trusted-project entry its own confirmation UI
-  would write to `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). On
-  Windows, a newly launched Claude peer's visible current-folder trust prompt
-  is accepted only after its exact recorded pane tuple is revalidated.
+  would write to `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). Kimi
+  pretrust publishes its path-keyed record under
+  `$KIMI_CODE_HOME/workspace-trust`; this is necessary because Duet starts
+  Kimi workers in `--auto` mode and their first boot prompt must reach the
+  agent, not the trust dialog. On Windows, a newly launched Claude peer's
+  visible current-folder trust prompt is accepted only after its exact
+  recorded pane tuple is revalidated.
 - Durable blocks in `AGENTS.md`/`CLAUDE.md` are delimited by `DUET:BEGIN`/
   `DUET:END`; teardown removes only those blocks.
 - End kills only panes recorded as spawned and always exempts the caller pane,

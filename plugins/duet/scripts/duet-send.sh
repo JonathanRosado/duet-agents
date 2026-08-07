@@ -28,6 +28,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 caller_self="${DUET_SELF:-}"
+caller_session="${DUET_SESSION:-}"
 duet_capture_caller_identity || {
   echo "duet: caller is not an identifiable tmux pane." >&2
   exit 7
@@ -60,8 +61,19 @@ duet_caller_roster_name || {
 }
 sender="$DUET_CALLER_NAME"
 if [ -n "$caller_self" ] && [ "$caller_self" != "$sender" ]; then
-  echo "duet: identity mismatch: caller pane is '$sender' but DUET_SELF is '$caller_self'." >&2
-  exit 7
+  # A harness resumed from an older duet run carries that run's DUET_SELF and
+  # DUET_SESSION in its parent environment, and no child script can update
+  # them. When the ambient session names a DIFFERENT (older) session id, both
+  # values are stale restored transport metadata: the exact pane 4-tuple is
+  # authoritative and the ambient pair is ignored. When the ambient session
+  # is empty or THIS session, a mismatched DUET_SELF is a real identity
+  # error and stays fatal.
+  if [ -n "$caller_session" ] && [ "$caller_session" != "$DUET_SESSION_ID" ]; then
+    echo "duet: ignoring stale DUET_SELF/DUET_SESSION from prior session '$caller_session'; caller pane is '$sender'." >&2
+  else
+    echo "duet: identity mismatch: caller pane is '$sender' but DUET_SELF is '$caller_self'." >&2
+    exit 7
+  fi
 fi
 if [ -n "$from" ] && [ "$from" != "$sender" ]; then
   echo "duet: --from '$from' does not match caller pane identity '$sender'." >&2

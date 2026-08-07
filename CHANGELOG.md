@@ -2,13 +2,65 @@
 
 ## Unreleased
 
-Fixes the delivery defect that silently stopped peers — most visibly Kimi —
-from receiving messages, and removes the policy that turned one bad observation
-into a peer's permanent removal from the session. Bash/tmux path only. The
-Windows/PowerShell v4 path shipped in 0.6.0 already separates an unreadable
-composer from an empty one, but still fences a recipient on its first ambiguous
-observation, still tolerates a redrawn placeholder for Codex alone, and has no
-resume path; tracked in #9.
+## 0.7.0 - 2026-08-07
+
+Adds native harness session pairing and rejoin (Bash/tmux path only; the
+Windows/PowerShell runtime is unchanged and its skill text says rejoin is
+unavailable there), and fixes the delivery defect that silently stopped peers —
+most visibly Kimi — from receiving messages.
+
+Pairing and rejoin:
+
+- Every run records `<session>/pairing.tsv`: each member's harness-native
+  session id with provenance, pane tuple, workdir, durable repo id, and exact
+  native config home. Spawned Claude workers are assigned `--session-id`;
+  Codex and Kimi workers register the exact `SessionStart` id through
+  per-pane nonce/name/session/pid-bound hooks. Repeated Codex, Kimi, or Claude
+  workers (up to the four-worker cap) can start in any order without
+  file-timing attribution. The initiator id comes only from
+  `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, Kimi's
+  `${KIMI_SESSION_ID}` expansion, or an explicit argument—never a newest/mtime
+  guess.
+  `pairing.complete` publishes strictly last — after pairing.tsv and every
+  home-namespaced `by-id` append — and only when every id resolves on disk and
+  every spawned worker passes its exact banner/readiness/pane-pid gate. Staged
+  TSV validation matches the immutable roster before any index changes. An
+  interrupted, malformed, corrupt, or foreign newest record fails closed
+  without rolling back to an older mapping.
+- The skill's normal start command is `duet-rejoin.sh` (no harness words
+  needed): lookup is keyed by the invoker's exact `(harness, native id)` —
+  the last line of that id's append-only `by-id` index, validated as a whole;
+  a corrupt or foreign newest entry fails closed and never rolls back to an
+  older mapping. Reciprocal validation requires the candidate to still be the
+  newest complete record for every member it names, so independent meshes in
+  one repo coexist and a superseded mapping fails closed to a fresh,
+  unpaired ensemble. A no-arg fallback starts the standard fresh
+  `codex kimi` roster; explicit words pin an exact roster instead.
+  The invoker's id determines its stable roster name, even when it was a
+  worker. Prior ownership is fenced across complete, incomplete, and
+  polluted-index runs: a live verified daemon or exact pane tuple refuses, and
+  a cleanly ended run adopts only the invoker's own surviving pane. Every
+  rejoin is a fresh transport run (new session dir, daemon, inboxes,
+  message-id namespace); old queues are never replayed. Native homes are
+  restored per member, restored `DUET_*` values are treated as stale, and a
+  failed resume cannot supersede the last good map.
+- Git repositories receive an untracked `.git/duet-agents-repo-id`, so
+  pairings survive linked worktrees and a plain repository move. Kimi's
+  current cross-workdir resume refusal is detected before launch and safely
+  falls fresh; Duet never mutates Kimi's session store.
+- The installer owns one inert Kimi `SessionStart` hook block, preserves
+  foreign config and file mode, validates changes with `kimi doctor config`,
+  and removes only its block on uninstall. Codex uses a launch-local hook and
+  falls back to an unpaired but otherwise normal worker on older hookless
+  builds. Kimi's exact workspace is pretrusted through an atomic,
+  no-overwrite record before launch so its startup dialog cannot consume the
+  Duet boot prompt. Observable worker session switches invalidate an existing
+  complete pairing. `duet-resume.sh` remains the live-peer unblock operation.
+
+Delivery fixes (Bash/tmux path; the Windows/PowerShell v4 path shipped in 0.6.0
+already separates an unreadable composer from an empty one, but still fences a
+recipient on its first ambiguous observation, still tolerates a redrawn
+placeholder for Codex alone, and has no resume path; tracked in #9):
 
 - The composer probe no longer reports "empty" when it simply could not read the
   cursor row. A pane that is still streaming a response relocates its composer

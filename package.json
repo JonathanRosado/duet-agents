@@ -1,6 +1,6 @@
 {
   "name": "duet-agents",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Run Claude Code, Codex CLI, and Kimi Code CLI as a visible leaderless mesh in tmux or psmux — any agent messages any agent.",
   "license": "MIT",
   "author": {

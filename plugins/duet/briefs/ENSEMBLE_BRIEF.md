@@ -14,6 +14,19 @@ each other directly.
 This brief is rendered into an auto-loaded instruction file so it survives
 context compaction. Session dir: `@DUET_DIR@`. Session id: `@DUET_SESSION@`.
 
+If your native harness session was resumed, its history — and your parent
+process environment — may retain an earlier run's `DUET_SESSION`,
+`DUET_CONFIG`, `DUET_SELF`, session paths, or roster values. Those are stale:
+the session dir/id in THIS block and your exact live pane identity are
+authoritative, and duet's send/end commands tolerate that inherited pair.
+Pin the paths shown here, never the restored ones.
+
+Do not switch this pane to another native harness session (`/new`, `/clear`,
+session picker, or fork) while the mesh is active. End the Duet run first,
+switch sessions, then invoke Duet again; worker lifecycle hooks invalidate a
+published pairing when they can observe such a switch, but no transport state
+is ever migrated between native sessions.
+
 ## Send a message
 Pin this exact session on every command (there is no `~/.duet/current` to fall
 back on). Body on stdin:

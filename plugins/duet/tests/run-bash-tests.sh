@@ -8,6 +8,7 @@ SUITES='installer
 m1-delivery
 m2-mesh
 m3-lifecycle
+m4-rejoin
 v4-real-smoke'
 
 suite_file(){
@@ -16,6 +17,7 @@ suite_file(){
     m1-delivery) printf '%s/m1-delivery.tests.sh' "$TEST_DIR" ;;
     m2-mesh) printf '%s/m2-mesh.tests.sh' "$TEST_DIR" ;;
     m3-lifecycle) printf '%s/m3-lifecycle.tests.sh' "$TEST_DIR" ;;
+    m4-rejoin) printf '%s/m4-rejoin.tests.sh' "$TEST_DIR" ;;
     v4-real-smoke) printf '%s/v4-real-smoke.sh' "$TEST_DIR" ;;
     *) return 1 ;;
   esac

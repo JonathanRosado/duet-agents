@@ -1,0 +1,17 @@
+{
+  "description": "Expose Claude's exact native session id and register Duet worker sessions.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "exec node \"${CLAUDE_PLUGIN_ROOT}/scripts/duet-native-register.js\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -8,6 +8,7 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$TEST_DIR/.." && pwd)"
 SCRIPTS_DIR="$PLUGIN_DIR/scripts"
 INIT_SCRIPT="$SCRIPTS_DIR/duet-init.sh"
+REJOIN_SCRIPT="$SCRIPTS_DIR/duet-rejoin.sh"
 SEND_SCRIPT="$SCRIPTS_DIR/duet-send.sh"
 END_SCRIPT="$SCRIPTS_DIR/duet-end.sh"
 COMMON="$SCRIPTS_DIR/duet-common.sh"
@@ -15,12 +16,14 @@ TMUX_LABEL=duetv4smoke
 TMUX_SESSION=smoke
 REAL_HOME="${HOME:?real HOME is required}"
 REAL_CODEX_HOME="${CODEX_HOME:-$REAL_HOME/.codex}"
+REAL_KIMI_HOME="${KIMI_CODE_HOME:-$REAL_HOME/.kimi-code}"
 TMP_BASE="${TMPDIR:-/tmp}"
 TMP_BASE="${TMP_BASE%/}"
 TMP_BASE="$(cd "$TMP_BASE" && pwd -P)" || exit 1
 DUET_STATE_ROOT="$(mktemp -d "$TMP_BASE/duetv4-state.XXXXXX")" || exit 1
 WORKDIR="$(mktemp -d "$TMP_BASE/duetv4-work.XXXXXX")" || exit 1
 SMOKE_CODEX_HOME="$DUET_STATE_ROOT/codex-home"
+SMOKE_KIMI_HOME="$DUET_STATE_ROOT/kimi-home"
 LOG_DIR="$DUET_STATE_ROOT/gate-logs"
 CONFIG=""
 DUET_DIR=""
@@ -58,6 +61,13 @@ cleanup(){
     ) >/dev/null 2>&1 || true
   fi
   tmux_smoke kill-server >/dev/null 2>&1 || true
+  # Authentication copied into the private test home is never retained with
+  # failure diagnostics.
+  for secret_dir in "$SMOKE_KIMI_HOME/credentials" "$SMOKE_KIMI_HOME/oauth"; do
+    case "$secret_dir" in
+      "$DUET_STATE_ROOT"/kimi-home/*) rm -rf -- "$secret_dir" ;;
+    esac
+  done
   if [ -n "$SUCCESS" ] && [ "$status" -eq 0 ]; then
     case "$DUET_STATE_ROOT" in
       "$TMP_BASE"/duetv4-state.*) rm -rf -- "$DUET_STATE_ROOT" ;;
@@ -239,7 +249,7 @@ claude_busy_cancelled(){
   ! claude_has_marked_process
 }
 
-for required in tmux claude codex kimi git base64 awk sed grep mktemp; do
+for required in tmux claude codex kimi git base64 awk sed grep mktemp node; do
   command -v "$required" >/dev/null 2>&1 \
     || die "required command unavailable: $required"
 done
@@ -252,14 +262,14 @@ KIMI_VERSION="$(kimi --version 2>/dev/null || true)"
 # unrunnable the moment Kimi moved on (0.29.x -> 0.31.1). Report an unfamiliar
 # version instead of refusing to run.
 case "$KIMI_VERSION" in
-  0.29.*|0.30.*|0.31.*) : ;;
+  0.29.*|0.30.*|0.31.*|0.32.*|0.33.*|0.34.*) : ;;
   *) say "note: Kimi $KIMI_VERSION is outside the versions this suite has been exercised against" ;;
 esac
 if tmux_smoke list-sessions >/dev/null 2>&1; then
   die "isolated tmux label $TMUX_LABEL is already in use"
 fi
 
-mkdir -p "$SMOKE_CODEX_HOME" "$LOG_DIR"
+mkdir -p "$SMOKE_CODEX_HOME" "$SMOKE_KIMI_HOME" "$LOG_DIR"
 for file in auth.json config.toml models_cache.json version.json; do
   [ ! -f "$REAL_CODEX_HOME/$file" ] \
     || cp -p "$REAL_CODEX_HOME/$file" "$SMOKE_CODEX_HOME/$file" \
@@ -269,13 +279,36 @@ done
   || die "Codex auth unavailable at $REAL_CODEX_HOME/auth.json"
 [ -f "$SMOKE_CODEX_HOME/config.toml" ] \
   || : > "$SMOKE_CODEX_HOME/config.toml"
+for file in config.toml device_id tui.toml workspaces.json; do
+  [ ! -f "$REAL_KIMI_HOME/$file" ] \
+    || cp -p "$REAL_KIMI_HOME/$file" "$SMOKE_KIMI_HOME/$file" \
+    || die "could not stage Kimi $file"
+done
+for directory in credentials oauth; do
+  [ ! -d "$REAL_KIMI_HOME/$directory" ] \
+    || cp -pR "$REAL_KIMI_HOME/$directory" "$SMOKE_KIMI_HOME/$directory" \
+    || die "could not stage Kimi $directory"
+done
+[ -f "$SMOKE_KIMI_HOME/config.toml" ] \
+  || die "Kimi config unavailable at $REAL_KIMI_HOME/config.toml"
 git -C "$WORKDIR" init -q || die "could not initialize temporary workdir"
+SMOKE_CLAUDE_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
 
 say "isolated tmux=$TMUX_LABEL state=$DUET_STATE_ROOT work=$WORKDIR"
 say "versions: Claude $(claude --version), Codex $(codex --version), Kimi $KIMI_VERSION"
+say "seeding the exact Claude initiator session with one Haiku turn"
+if ! run_timed 120 "$LOG_DIR/claude-seed.log" run_in_workdir "$WORKDIR" env \
+    HOME="$REAL_HOME" \
+    claude --model haiku --dangerously-skip-permissions \
+      --session-id "$SMOKE_CLAUDE_ID" -p \
+      'Reply with exactly: duet smoke initiator seeded'; then
+  sed 's/^/[claude-seed] /' "$LOG_DIR/claude-seed.log" >&2 2>/dev/null || true
+  die "could not seed the Claude initiator session"
+fi
 
-printf -v CLAUDE_COMMAND 'exec %q --model %q --dangerously-skip-permissions' \
-  "$(command -v claude)" haiku
+printf -v CLAUDE_COMMAND \
+  'exec %q --model %q --dangerously-skip-permissions --resume %q' \
+  "$(command -v claude)" haiku "$SMOKE_CLAUDE_ID"
 tmux_smoke -f /dev/null new-session -d -s "$TMUX_SESSION" \
   -c "$WORKDIR" "$CLAUDE_COMMAND" \
   || die "could not start isolated Claude pane"
@@ -293,12 +326,15 @@ wait_until 75 "Claude ready after trust" claude_ready
 say "launching Codex and Kimi workers through duet-init"
 if ! run_timed 360 "$LOG_DIR/init.log" run_in_workdir "$WORKDIR" env \
     HOME="$REAL_HOME" CODEX_HOME="$SMOKE_CODEX_HOME" \
+    KIMI_CODE_HOME="$SMOKE_KIMI_HOME" \
     TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$CLAUDE_PANE" \
     DUET_SELF=claude \
     DUET_STATE_ROOT="$DUET_STATE_ROOT" \
     DUET_CLAUDE_MODEL=haiku \
+    DUET_CODEX_MODEL=gpt-5.6-luna \
     DUET_CODEX_REASONING_EFFORT=low \
     DUET_KIMI_MODEL=kimi-code/kimi-for-coding \
+    DUET_INITIATOR_NATIVE_ID="$SMOKE_CLAUDE_ID" \
     DUET_BOOT_TIMEOUT=90 DUET_READY_TIMEOUT=240 \
     bash "$INIT_SCRIPT" --initiator claude codex kimi; then
   sed 's/^/[init] /' "$LOG_DIR/init.log" >&2 2>/dev/null || true
@@ -312,11 +348,26 @@ SESSION_ID="$(basename "$DUET_DIR")"
 CONFIG="$DUET_DIR/duet.env"
 [ -f "$CONFIG" ] || die "session config missing"
 [ ! -f "$DUET_DIR/.unhealthy" ] || die "session became unhealthy during boot"
+[ -f "$DUET_DIR/pairing.complete" ] || die "native pairing did not complete"
+CODEX_NATIVE_ID="$(awk -F '\t' '$1=="codex-1" { print $3; exit }' \
+  "$DUET_DIR/pairing.tsv")"
+KIMI_NATIVE_ID="$(awk -F '\t' '$1=="kimi-1" { print $3; exit }' \
+  "$DUET_DIR/pairing.tsv")"
+[ -n "$CODEX_NATIVE_ID" ] && [ -n "$KIMI_NATIVE_ID" ] \
+  || die "native pairing ids are incomplete"
+awk -F '\t' '
+  $1=="codex-1" && $4=="hook" { c=1 }
+  $1=="kimi-1" && $4=="hook" { k=1 }
+  END { exit !(c && k) }
+' "$DUET_DIR/pairing.tsv" || die "real workers were not captured by exact hooks"
 CODEX_PANE="$(awk -F '\t' '$1 == "codex-1" { print $3; exit }' \
   "$DUET_DIR/roster.tsv")"
 KIMI_PANE="$(awk -F '\t' '$1 == "kimi-1" { print $3; exit }' \
   "$DUET_DIR/roster.tsv")"
 [ -n "$CODEX_PANE" ] && [ -n "$KIMI_PANE" ] || die "worker roster incomplete"
+if pane_has "$KIMI_PANE" 'Trust this folder?'; then
+  die "Kimi workspace pretrust did not suppress its startup dialog"
+fi
 
 say "proving live Codex -> Claude delivery"
 FANIN_TOKEN="M1-CODEX-CLAUDE-$PPID-${RANDOM:-0}"
@@ -478,6 +529,50 @@ if ! run_timed 120 "$LOG_DIR/end.log" env HOME="$REAL_HOME" \
   die "duet-end failed"
 fi
 [ ! -f "$DUET_DIR/daemon.pid" ] || die "daemon survived end"
+
+say "rejoining the exact Codex and Kimi native sessions"
+if ! run_timed 360 "$LOG_DIR/rejoin.log" run_in_workdir "$WORKDIR" env \
+    HOME="$REAL_HOME" CODEX_HOME="$SMOKE_CODEX_HOME" \
+    KIMI_CODE_HOME="$SMOKE_KIMI_HOME" \
+    TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$CLAUDE_PANE" \
+    DUET_SELF=claude DUET_STATE_ROOT="$DUET_STATE_ROOT" \
+    DUET_INITIATOR_NATIVE_ID="$SMOKE_CLAUDE_ID" \
+    DUET_CLAUDE_MODEL=haiku \
+    DUET_CODEX_MODEL=gpt-5.6-luna \
+    DUET_CODEX_REASONING_EFFORT=low \
+    DUET_KIMI_MODEL=kimi-code/kimi-for-coding \
+    DUET_BOOT_TIMEOUT=90 DUET_READY_TIMEOUT=240 \
+    bash "$REJOIN_SCRIPT" --initiator claude; then
+  sed 's/^/[rejoin] /' "$LOG_DIR/rejoin.log" >&2 2>/dev/null || true
+  die "duet-rejoin failed"
+fi
+cat "$LOG_DIR/rejoin.log"
+REJOIN_DIR="$(sed -n 's/^duet: session //p' "$LOG_DIR/rejoin.log" | tail -n 1)"
+case "$REJOIN_DIR" in "$DUET_STATE_ROOT"/*) :;; *) die "invalid rejoin path";; esac
+[ -f "$REJOIN_DIR/pairing.complete" ] || die "rejoined pairing did not complete"
+[ "$(awk -F '\t' '$1=="codex-1" { print $3; exit }' \
+    "$REJOIN_DIR/pairing.tsv")" = "$CODEX_NATIVE_ID" ] \
+  || die "Codex rejoin changed the native session id"
+[ "$(awk -F '\t' '$1=="kimi-1" { print $3; exit }' \
+    "$REJOIN_DIR/pairing.tsv")" = "$KIMI_NATIVE_ID" ] \
+  || die "Kimi rejoin changed the native session id"
+awk -F '\t' '
+  $1=="codex-1" && $4=="hook" { c=1 }
+  $1=="kimi-1" && $4=="hook" { k=1 }
+  END { exit !(c && k) }
+' "$REJOIN_DIR/pairing.tsv" || die "rejoined workers lacked exact hook provenance"
+DUET_DIR="$REJOIN_DIR"
+CONFIG="$DUET_DIR/duet.env"
+SESSION_ID="$(basename "$DUET_DIR")"
+if ! run_timed 120 "$LOG_DIR/rejoin-end.log" env HOME="$REAL_HOME" \
+    TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$CLAUDE_PANE" \
+    DUET_SELF=claude DUET_CONFIG="$CONFIG" \
+    bash "$END_SCRIPT"; then
+  sed 's/^/[rejoin-end] /' "$LOG_DIR/rejoin-end.log" >&2 2>/dev/null || true
+  die "rejoined duet-end failed"
+fi
+[ ! -f "$DUET_DIR/daemon.pid" ] || die "rejoined daemon survived end"
+say "PASS exact real Codex+Kimi native sessions resumed"
 
 SUCCESS=1
 TOTAL_ELAPSED=$(( $(date +%s) - STARTED_AT ))

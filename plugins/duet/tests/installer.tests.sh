@@ -38,10 +38,15 @@ mkdir -p "$FAKE_HOME" "$FAKEBIN"
 # whatever happens to be installed on the developer machine. (The stale-home
 # cases below deliberately use a node-only PATH to prove the skip/failure
 # behavior when no harness CLI exists.)
-for cli in codex kimi; do
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKEBIN/$cli"
-  chmod +x "$FAKEBIN/$cli"
-done
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKEBIN/codex"
+chmod +x "$FAKEBIN/codex"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'if [ "${1:-}" = doctor ] && [ "${DUET_FAKE_KIMI_DOCTOR_REJECT:-}" = 1 ]; then' \
+  '  echo "fake doctor rejection" >&2' \
+  '  exit 1' \
+  'fi' \
+  'exit 0' > "$FAKEBIN/kimi"
+chmod +x "$FAKEBIN/kimi"
 
 PLUGIN_HOME="$ROOT/plugin-runtime"
 CODEX_SKILL_DIR="$ROOT/codex-skills/duet"
@@ -76,6 +81,17 @@ run_installer(){
 
 CODEX_SKILL="$CODEX_SKILL_DIR/SKILL.md"
 KIMI_SKILL="$KIMI_SKILL_DIR/SKILL.md"
+KIMI_CONFIG="$FAKE_HOME/.kimi-code/config.toml"
+
+# A foreign Kimi hook/config is preserved byte-for-byte around Duet's one
+# ownership-marked, otherwise inert SessionStart hook.
+mkdir -p "$(dirname "$KIMI_CONFIG")"
+printf '%s\n' \
+  'model = "foreign-model"' \
+  '[[hooks]]' \
+  'event = "BeforeAgent"' \
+  'command = "foreign-command"' > "$KIMI_CONFIG"
+chmod 640 "$KIMI_CONFIG"
 
 # --- unknown argument / command is a usage error
 run_installer install --bogus >/dev/null 2>&1 \
@@ -95,14 +111,30 @@ run_installer install --codex --kimi >"$ROOT/install.log" 2>&1 \
 [ -f "$KIMI_SKILL" ] || die "kimi skill not written"
 [ -f "$CODEX_SKILL_DIR/.duet-skill" ] || die "codex skill ownership marker missing"
 [ -f "$KIMI_SKILL_DIR/.duet-skill" ] || die "kimi skill ownership marker missing"
+grep -qF 'command = "foreign-command"' "$KIMI_CONFIG" \
+  || die "Kimi hook install removed foreign config"
+[ "$(grep -c '^# DUET-AGENTS:BEGIN kimi-session-hook$' "$KIMI_CONFIG")" -eq 1 ] \
+  || die "Kimi hook install did not publish exactly one owned block"
+[ "$(grep -c '^# DUET-AGENTS:END kimi-session-hook$' "$KIMI_CONFIG")" -eq 1 ] \
+  || die "Kimi hook install did not close exactly one owned block"
+KIMI_MODE="$(stat -f %Lp "$KIMI_CONFIG" 2>/dev/null || stat -c %a "$KIMI_CONFIG")"
+[ "$KIMI_MODE" = 640 ] || die "Kimi hook install changed config mode to $KIMI_MODE"
 
 for skill in "$CODEX_SKILL" "$KIMI_SKILL"; do
   tr -d '\r' < "$skill" | grep -q '^name: duet$' \
     || die "skill frontmatter missing name"
   tr -d '\r' < "$skill" | grep -q '^description: ' \
     || die "skill frontmatter missing description"
-  grep -qF "$PLUGIN_HOME/scripts/duet-init.sh" "$skill" \
-    || die "skill does not reference the staged runtime path"
+  grep -qF "$PLUGIN_HOME/scripts/duet-rejoin.sh" "$skill" \
+    || die "skill does not use rejoin as the normal start command"
+  grep -qE 'scripts/duet-rejoin\.sh"[[:space:]]*$' "$skill" \
+    || die "skill's normal start command is not the no-arg rejoin form"
+  grep -q '<your native session id>' "$skill" \
+    && die "skill still contains a manual native-id placeholder"
+  grep -qF '${KIMI_SESSION_ID}' "$skill" \
+    || die "skill lost the automatic Kimi session-id expansion"
+  grep -qF 'CODEX_THREAD_ID' "$skill" \
+    || die "skill lost the automatic Codex session-id route"
   grep -q '@DUET_PLUGIN_DIR@' "$skill" \
     && die "skill still contains an unrendered placeholder"
   grep -q 'CLAUDE_PLUGIN_ROOT' "$skill" \
@@ -153,7 +185,7 @@ APOS="$ROOT/it's/runtime"
 run_installer DUET_PLUGIN_HOME="$APOS" \
   install --codex >"$ROOT/apos.log" 2>&1 \
   || { cat "$ROOT/apos.log" >&2; die "apostrophe path install failed"; }
-grep -qF "$APOS/scripts/duet-init.sh" "$CODEX_SKILL" \
+grep -qF "$APOS/scripts/duet-rejoin.sh" "$CODEX_SKILL" \
   || die "skill does not reference the apostrophe runtime path"
 
 # --- a stale config home without its CLI is skipped, not a success
@@ -186,6 +218,37 @@ run_installer update --codex --kimi >"$ROOT/update.log" 2>&1 \
 grep -q 'sentinel' "$PLUGIN_HOME/scripts/duet-init.sh" \
   || die "update mutated the pinned runtime"
 grep -q 'reused unchanged' "$ROOT/update.log" || die "update did not report runtime reuse"
+[ "$(grep -c '^# DUET-AGENTS:BEGIN kimi-session-hook$' "$KIMI_CONFIG")" -eq 1 ] \
+  || die "Kimi hook update was not idempotent"
+
+# --- a rejected Kimi candidate rolls back without touching the original
+REJECT_HOME="$ROOT/reject-kimi"
+REJECT_SKILL="$ROOT/reject-kimi-skill/duet"
+mkdir -p "$REJECT_HOME"
+printf 'foreign = true\n' > "$REJECT_HOME/config.toml"
+REJECT_BEFORE="$(cksum "$REJECT_HOME/config.toml")"
+run_installer KIMI_CODE_HOME="$REJECT_HOME" \
+  DUET_AGENTS_KIMI_SKILL_DIR="$REJECT_SKILL" \
+  DUET_FAKE_KIMI_DOCTOR_REJECT=1 install --kimi \
+  >"$ROOT/kimi-doctor-reject.log" 2>&1 \
+  && die "Kimi hook install ignored doctor rejection"
+[ "$(cksum "$REJECT_HOME/config.toml")" = "$REJECT_BEFORE" ] \
+  || die "Kimi doctor rejection changed the original config"
+[ ! -e "$REJECT_SKILL" ] || die "Kimi skill was written after hook validation failed"
+
+# --- unmatched ownership markers fail without rewriting foreign config
+BROKEN_HOME="$ROOT/broken-kimi"
+BROKEN_SKILL="$ROOT/broken-kimi-skill/duet"
+mkdir -p "$BROKEN_HOME"
+printf '%s\n' 'foreign = true' '# DUET-AGENTS:BEGIN kimi-session-hook' \
+  > "$BROKEN_HOME/config.toml"
+BROKEN_BEFORE="$(cksum "$BROKEN_HOME/config.toml")"
+run_installer KIMI_CODE_HOME="$BROKEN_HOME" \
+  DUET_AGENTS_KIMI_SKILL_DIR="$BROKEN_SKILL" install --kimi \
+  >"$ROOT/kimi-marker-reject.log" 2>&1 \
+  && die "unmatched Kimi hook ownership marker was accepted"
+[ "$(cksum "$BROKEN_HOME/config.toml")" = "$BROKEN_BEFORE" ] \
+  || die "unmatched-marker rejection changed the Kimi config"
 
 # --- an older owned version under an exact override is likewise never replaced
 printf 'version=0.0.0-test\n' > "$PLUGIN_HOME/.duet-runtime"
@@ -207,7 +270,7 @@ grep -q 'TMUX' "$CODEX_SKILL" \
   || die "win32 skill precondition does not check the psmux TMUX variables"
 DUET_AGENTS_FORCE_PLATFORM= run_installer install --codex >/dev/null 2>&1 \
   || die "could not restore posix skill after win32 check"
-grep -q 'duet-init\.sh' "$CODEX_SKILL" || die "posix skill not restored"
+grep -q 'duet-rejoin\.sh' "$CODEX_SKILL" || die "posix skill not restored"
 
 # --- default (versioned) layout lands under ~/.duet/plugin/<version>
 run_installer DUET_PLUGIN_HOME= \
@@ -215,7 +278,7 @@ run_installer DUET_PLUGIN_HOME= \
   || { cat "$ROOT/versioned.log" >&2; die "versioned install failed"; }
 [ -f "$FAKE_HOME/.duet/plugin/$VERSION/.duet-runtime" ] \
   || die "versioned runtime missing at ~/.duet/plugin/$VERSION"
-grep -qF "$FAKE_HOME/.duet/plugin/$VERSION/scripts/duet-init.sh" "$CODEX_SKILL" \
+grep -qF "$FAKE_HOME/.duet/plugin/$VERSION/scripts/duet-rejoin.sh" "$CODEX_SKILL" \
   || die "skill does not reference the versioned runtime"
 
 # --- selective uninstall: codex leaves kimi's skill and the runtime
@@ -225,6 +288,8 @@ run_installer uninstall --codex >"$ROOT/uninstall-codex.log" 2>&1 \
 [ ! -e "$CODEX_SKILL" ] || die "codex skill left behind"
 [ -f "$KIMI_SKILL" ] || die "uninstall --codex removed kimi's skill"
 [ -f "$PLUGIN_HOME/.duet-runtime" ] || die "uninstall removed the immutable runtime"
+grep -q '^# DUET-AGENTS:BEGIN kimi-session-hook$' "$KIMI_CONFIG" \
+  || die "uninstall --codex removed Kimi's owned hook"
 
 # --- uninstall leaves foreign content and session state alone, keeps runtimes
 mkdir -p "$FAKE_HOME/.duet/20990101-000000-aaaaaa"
@@ -233,6 +298,12 @@ run_installer uninstall --kimi >"$ROOT/uninstall-kimi.log" 2>&1 \
   || { cat "$ROOT/uninstall-kimi.log" >&2; die "uninstall --kimi failed"; }
 [ ! -e "$KIMI_SKILL" ] || die "kimi skill left behind"
 [ -f "$PLUGIN_HOME/.duet-runtime" ] || die "uninstall removed the immutable runtime"
+[ "$(grep -c '^# DUET-AGENTS:BEGIN kimi-session-hook$' "$KIMI_CONFIG" || true)" -eq 0 ] \
+  || die "uninstall --kimi left the owned Kimi hook behind"
+grep -qF 'command = "foreign-command"' "$KIMI_CONFIG" \
+  || die "uninstall --kimi removed foreign Kimi config"
+KIMI_MODE_AFTER="$(stat -f %Lp "$KIMI_CONFIG" 2>/dev/null || stat -c %a "$KIMI_CONFIG")"
+[ "$KIMI_MODE_AFTER" = 640 ] || die "Kimi hook uninstall changed config mode"
 [ -f "$FAKE_HOME/.duet/20990101-000000-aaaaaa/duet.env" ] \
   || die "uninstall touched session state"
 [ -f "$FAKE_HOME/.duet/plugin/$VERSION/.duet-runtime" ] \

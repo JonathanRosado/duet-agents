@@ -19,9 +19,13 @@ and speak to the user.
 
 The invocation arguments are: $ARGUMENTS
 
-Treat them only as one to four whitespace-separated words from `codex`, `kimi`,
-and `claude`. Reject options and shell syntax. An empty list means `codex`.
-Every requested CLI must already be installed and authenticated.
+Treat them only as zero to four whitespace-separated words from `codex`,
+`kimi`, and `claude`. Reject options and shell syntax. An empty list is the
+normal case: the start command takes no harness words, restores a previously
+paired roster when one matches, and otherwise starts the default fresh
+ensemble (you plus one Codex and one Kimi worker). Explicit words pin an exact
+roster instead. Every requested CLI must already be installed and
+authenticated.
 
 Use the Windows path when running on Windows/PowerShell with psmux; otherwise
 use Bash/tmux. If the matching `TMUX`/`TMUX_PANE` environment is absent, tell
@@ -30,15 +34,32 @@ again.
 
 ## 1. Start and pin
 
-macOS/Linux:
+macOS/Linux — the normal start command is `duet-rejoin.sh` with **no harness
+words**: when a complete pairing for this repo names your current native
+session it restores that whole paired roster (stable names, resumed worker
+contexts); otherwise it starts the default fresh ensemble (you plus one Codex
+and one Kimi worker). Pass your current native session id through
+(`CLAUDE_CODE_SESSION_ID` is exported to your tool environment; leave the
+expansion exactly as written — never substitute a guessed id):
 
-    bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-init.sh" codex kimi
+    DUET_INITIATOR_NATIVE_ID="${CLAUDE_CODE_SESSION_ID:-}" \
+      bash "${CLAUDE_PLUGIN_ROOT}/scripts/duet-rejoin.sh"
 
-Windows:
+Only when the human explicitly requested a roster, append those harness words
+(for example `…duet-rejoin.sh codex codex kimi`); explicit words must match a
+found mapping's roster exactly, otherwise a fresh ensemble with exactly those
+workers starts.
+
+Rejoin refuses only when the previous run still owns live panes; then end that
+session (`duet-end.sh` with its pinned config) and run the same command again.
+End the active Duet run before using `/new`, `/clear`, a session picker, or
+fork to switch this pane's native harness session.
+
+Windows (no rejoin support in this version):
 
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:CLAUDE_PLUGIN_ROOT\scripts\duet-init.ps1" codex kimi
 
-Init renders the mesh brief into `AGENTS.md` and `CLAUDE.md`, launches peers,
+Start renders the mesh brief into `AGENTS.md` and `CLAUDE.md`, launches peers,
 starts one delivery daemon, and waits for readiness. Report any readiness
 failure.
 

@@ -190,10 +190,14 @@ if printf x | env TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$CODEX_PANE" \
     bash "$SEND" kimi-1 --from kimi-1 >/dev/null 2>&1; then
   fail "caller pane spoofed --from"
 fi
+# A wrong DUET_SELF naming the CURRENT session stays refused; only a
+# DUET_SELF/DUET_SESSION pair from a DIFFERENT, older session is tolerated as
+# stale restored metadata.
 if printf x | env TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$CODEX_PANE" \
-    DUET_SELF=kimi-1 DUET_CONFIG="$CONFIG" DUET_SESSION=m2-session \
+    DUET_SELF=kimi-1 DUET_CONFIG="$CONFIG" \
+    DUET_SESSION="$(basename "$(dirname "$CONFIG")")" \
     bash "$SEND" kimi-1 >/dev/null 2>&1; then
-  fail "mismatched DUET_SELF was accepted"
+  fail "mismatched DUET_SELF for the current session was accepted"
 fi
 if printf x | env TMUX="$SOCKET,$SERVER_PID,0" TMUX_PANE="$CODEX_PANE" \
     DUET_SELF=codex-1 DUET_CONFIG="$CONFIG" DUET_SESSION=m2-session \

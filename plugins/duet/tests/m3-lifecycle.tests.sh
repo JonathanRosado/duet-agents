@@ -191,6 +191,37 @@ test_pane_exit_during_teardown(){
   printf 'PASS teardown tolerates exit race but rejects a still-live victim\n'
 }
 
+# A recorded daemon whose cleanup artifacts disappear on schedule must stop
+# cleanly even when its recorded pid outlives the artifacts (a recycled,
+# unrelated, TERM-proof process stands in for the pid-reuse window).
+test_stop_daemon_recycled_pid(){
+  local dir sid cfg mock_pid rc=0
+  dir="$(mktemp -d "$ROOT/stopd-XXXXXX")"
+  sid="$(basename "$dir")"
+  cfg="$dir/duet.env"
+  : > "$cfg"
+  : > "$dir/.ended"
+  bash -c 'trap "" TERM; while :; do sleep 5; done' \
+    "duet-deliverd.sh" --session "$cfg" --session-id "$sid" &
+  mock_pid=$!
+  printf '%s\n' "$mock_pid" > "$dir/daemon.pid"
+  mkdir "$dir/.daemon.lock"
+  printf '%s\t%s\n' "$mock_pid" faketoken > "$dir/.daemon.lock/owner"
+  # Cleanup completes late; the recorded pid stays alive throughout.
+  ( sleep 1; rm -f "$dir/daemon.pid"; rm -f "$dir/.daemon.lock/owner"; \
+    rmdir "$dir/.daemon.lock" ) &
+  (
+    # shellcheck disable=SC1090
+    . "$COMMON"
+    duet_stop_daemon "$dir" 30
+  ) || rc=$?
+  kill -9 "$mock_pid" 2>/dev/null || true
+  wait "$mock_pid" 2>/dev/null || true
+  [ "$rc" -eq 0 ] \
+    || die "stop_daemon failed although ownership artifacts completed cleanup"
+  printf 'PASS stop_daemon trusts artifact cleanup over a recyclable pid\n'
+}
+
 command -v tmux >/dev/null 2>&1 || {
   printf 'SKIP: tmux is not installed\n'
   exit 0
@@ -207,6 +238,7 @@ fi
 mkdir -p "$STATE_ROOT" "$REPO" "$ROOT/worktrees" "$FAKEBIN" \
   "$ACCEPT_A" "$ACCEPT_B"
 test_pane_exit_during_teardown
+test_stop_daemon_recycled_pid
 for harness in claude codex kimi; do
   ln -s "$FIXTURE" "$FAKEBIN/$harness"
 done

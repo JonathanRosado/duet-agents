@@ -13,6 +13,7 @@ usage(){
 [ "$#" -eq 0 ] || { usage; exit 2; }
 
 caller_self="${DUET_SELF:-}"
+caller_session="${DUET_SESSION:-}"
 duet_capture_caller_identity || {
   echo "duet: caller is not an identifiable tmux pane." >&2
   exit 7
@@ -39,8 +40,16 @@ duet_caller_roster_name || {
   exit 7
 }
 if [ -n "$caller_self" ] && [ "$caller_self" != "$DUET_CALLER_NAME" ]; then
-  echo "duet: identity mismatch: caller pane is '$DUET_CALLER_NAME' but DUET_SELF is '$caller_self'." >&2
-  exit 7
+  # Same stale-restored-metadata policy as duet-send.sh: an ambient
+  # DUET_SELF/DUET_SESSION pair naming a DIFFERENT, older session is ignored
+  # in favor of the exact pane-derived identity; a mismatch within THIS
+  # session (or with no ambient session) stays fatal.
+  if [ -n "$caller_session" ] && [ "$caller_session" != "$DUET_SESSION_ID" ]; then
+    echo "duet: ignoring stale DUET_SELF/DUET_SESSION from prior session '$caller_session'; caller pane is '$DUET_CALLER_NAME'." >&2
+  else
+    echo "duet: identity mismatch: caller pane is '$DUET_CALLER_NAME' but DUET_SELF is '$caller_self'." >&2
+    exit 7
+  fi
 fi
 
 if ! : > "$DUET_DIR/.ended"; then

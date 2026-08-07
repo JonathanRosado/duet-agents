@@ -19,28 +19,52 @@ an enforced one; a peer may message you or any other peer at any time.
 - **macOS/Linux** (Bash + tmux). If `$TMUX` is empty, tell the user to relaunch
   your CLI inside tmux (for example `tmux new-session codex` or
   `tmux new-session kimi`), then invoke duet again.
-- Take the worker roster from the user's invocation: a whitespace-separated list
-  of the harness words `codex`, `kimi`, `claude` (one to four workers). Reject
-  options, shell syntax, or more than four words; do not interpolate unvalidated
-  argument text into a shell command. No arguments means `codex`. Each requested
-  CLI must already be installed and authenticated.
-- Examples: no arguments = you + one Codex worker; `codex kimi` = three agents
-  total; `codex codex kimi` = four.
+- Take the worker roster from the user's invocation: zero to four
+  whitespace-separated harness words `codex`, `kimi`, `claude`. Reject
+  options, shell syntax, or more than four words; do not interpolate
+  unvalidated argument text into a shell command. No words is the normal
+  case: the start command restores a previously paired roster when one
+  matches, and otherwise starts the default fresh ensemble (you plus one
+  Codex and one Kimi worker). Explicit words pin an exact roster instead.
+  Each requested CLI must already be installed and authenticated.
+- Examples: no words = paired roster, or a fresh you + codex-1 + kimi-1;
+  `codex kimi` = exactly those two workers; `codex codex kimi` = four agents
+  total.
 
 ## 1. Start and pin the session
-Pass the validated harness words to init (omit them for the Codex default):
+The normal start command is `duet-rejoin.sh` with **no harness words**: when a
+complete pairing for this repo names your current native session it restores
+that whole paired roster (stable names, workers resumed via their harness's
+native resume); otherwise it starts the default fresh ensemble (you plus one
+Codex and one Kimi worker). Run it exactly as written — the shell expansion
+needs no substitution by you:
 
-    bash "@DUET_PLUGIN_DIR@/scripts/duet-init.sh" codex kimi
+    DUET_INITIATOR_NATIVE_ID="${CODEX_THREAD_ID:-${KIMI_SESSION_ID}}" \
+      bash "@DUET_PLUGIN_DIR@/scripts/duet-rejoin.sh"
 
-Init infers which harness you are from the pane's foreground process. If it
-reports it cannot infer the invoking harness, rerun with an explicit flag, for
-example `duet-init.sh --initiator codex codex kimi`.
+(On Codex the id comes from `$CODEX_THREAD_ID`. On Kimi the
+`${KIMI_SESSION_ID}` token is expanded to your live session id when this skill
+loads, and `$CODEX_THREAD_ID` is unset — the same command serves both. Never
+hand-write an id into this command.)
 
-Init renders the mesh brief into `AGENTS.md` and `CLAUDE.md`, launches the worker
+Only when the human explicitly requested a roster, append those harness words
+(for example `…duet-rejoin.sh codex codex kimi`); explicit words must match a
+found mapping's roster exactly, otherwise a fresh ensemble with exactly those
+workers starts.
+
+Rejoin refuses only when a previous run still owns live panes or its daemon is
+alive; then end that session (`duet-end.sh` with its pinned config) and run
+the same command again.
+End the active Duet run before using `/new`, `/clear`, a session picker, or
+fork to switch this pane's native harness session.
+
+Start renders the mesh brief into `AGENTS.md` and `CLAUDE.md`, launches the worker
 panes, starts the one delivery daemon, and waits for every worker's readiness
-marker. Report the roster and any readiness failure to the user.
+marker. Report the roster and any readiness failure to the user. If start
+reports it cannot infer the invoking harness, rerun with an explicit flag, for
+example `duet-rejoin.sh --initiator codex codex kimi`.
 
-From init's `duet: session <absolute-directory>` line, retain the pinned config:
+From the `duet: session <absolute-directory>` line, retain the pinned config:
 
     /absolute/session/directory/duet.env
 

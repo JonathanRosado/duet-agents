@@ -40,6 +40,10 @@ Every mutation reads that exact path from `DUET_CONFIG`; diagnostics take it in
 `-Session`. There is no current pointer or session-id fallback. Multiple
 sessions use separate git worktrees so their instruction anchors do not collide.
 
+Native session pairing/rejoin is **not available on Windows** in this version —
+it ships on macOS/Linux (Bash/tmux) only. If the human asks to resume a previous
+mesh, say so and start a fresh ensemble instead.
+
 ## 2. Coordinate and message
 
 Send directly to an exact roster name or broadcast to `all`. The pane already

@@ -612,22 +612,53 @@ duet_stop_daemon(){
       sleep 0.1
     done
   fi
+  # The daemon removes daemon.pid just before releasing .daemon.lock as its
+  # last cleanup steps. If both are already gone, the recorded daemon finished
+  # cleanup — a still-killable pid at this point can only be a recycled
+  # unrelated process, which must not fail or be signaled.
+  if [ ! -e "$pid_path" ] && [ ! -L "$pid_path" ] \
+      && [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+    return 0
+  fi
+  if [ ! -e "$pid_path" ] && [ ! -L "$pid_path" ]; then
+    # The pid file is already gone: the daemon is inside its final cleanup
+    # gap (lock release and process exit follow immediately). Wait only for
+    # the lock in this window — the recorded pid may already be recycled, so
+    # it must never be inspected or signaled here.
+    for i in $(seq 1 "$loops"); do
+      if [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+        return 0
+      fi
+      sleep 0.1
+    done
+    echo "duet: daemon exited without completing lock cleanup." >&2
+    return 1
+  fi
   if kill -0 "$pid" 2>/dev/null; then
     owner="$(duet_lock_owner_read "$lock_path")"
     owner_pid="${owner%%$'\t'*}"
     if [ "$owner_pid" != "$pid" ] \
         || ! duet_daemon_process_matches "$pid" "$config_path" "$session_id"; then
-      echo "duet: daemon identity is inconsistent; refusing to signal pid $pid." >&2
-      return 1
+      if [ ! -e "$pid_path" ] && [ ! -L "$pid_path" ]; then
+        # Cleanup began while identity was being read; the pid may already be
+        # recycled. Do not signal it — the artifact wait below finishes the
+        # stop instead.
+        :
+      else
+        echo "duet: daemon identity is inconsistent; refusing to signal pid $pid." >&2
+        return 1
+      fi
+    else
+      kill -TERM "$pid" 2>/dev/null || true
     fi
-    kill -TERM "$pid" 2>/dev/null || true
   fi
 
   # Cleanup removes daemon.pid just before releasing .daemon.lock. Wait for
-  # both artifacts as well as process exit so end cannot race that tiny gap.
+  # both artifacts: their absence alone means the recorded daemon completed
+  # cleanup. The recorded pid is never inspected again here — a recycled
+  # unrelated process must not turn a clean stop into a false failure.
   for i in $(seq 1 "$loops"); do
-    if ! kill -0 "$pid" 2>/dev/null \
-        && [ ! -e "$pid_path" ] && [ ! -L "$pid_path" ] \
+    if [ ! -e "$pid_path" ] && [ ! -L "$pid_path" ] \
         && [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
       return 0
     fi
